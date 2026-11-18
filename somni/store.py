@@ -207,6 +207,7 @@ class SomniMemory:
     @classmethod
     def create(cls, workspace, subject_id, lineage_id, attempt_id, limits=None):
         memory = cls(workspace, subject_id)
+        limits = _validate_limits(limits) if limits else None
         if memory.store.exists() or os.path.lexists(memory.store):
             raise MemoryError(f"create-only store already exists: {memory.store}")
         memory.store.mkdir(mode=0o700)
@@ -218,7 +219,7 @@ class SomniMemory:
             "attempt_id": _safe_id(attempt_id, "attempt id"),
         }
         if limits:
-            manifest["limits"] = _validate_limits(limits)
+            manifest["limits"] = limits
         state = {
             "schema": SCHEMA, "phase": "closed", "transcript_count": 0,
             "transcript_head": ZERO_HASH, "note_events": 0, "notes_head": ZERO_HASH,
