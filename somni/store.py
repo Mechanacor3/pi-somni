@@ -412,8 +412,11 @@ class SomniMemory:
         if not isinstance(body, str) or not body.strip() or len(body.encode("utf-8")) > MAX_PAGE_BYTES:
             raise MemoryError(f"page body must be 1-{MAX_PAGE_BYTES} bytes")
         refs = op["claims"]
-        if not isinstance(refs, list) or not 1 <= len(refs) <= 64 or len(set(refs)) != len(refs):
-            raise MemoryError("a page must cite 1-64 distinct claims")
+        if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
+            raise MemoryError("page claims must be a list of claim ids")
+        refs = list(dict.fromkeys(refs + CLAIM_CITE.findall(body)))  # inline [nXXXXXX] citations count too
+        if len(refs) > 64:
+            raise MemoryError("a page may cite at most 64 claims")
         for ref in refs:
             if not isinstance(ref, str) or ref not in simulated_claims or simulated_claims[ref]["state"] != "active":
                 raise MemoryError(f"page cites {ref!r}, which is not an active claim")
@@ -423,9 +426,8 @@ class SomniMemory:
         links = sorted(set(links) | set(WIKILINK.findall(body)))
         if len(links) > 32:
             raise MemoryError("a page may link to at most 32 other pages")
-        for cited in CLAIM_CITE.findall(body):
-            if cited not in refs:
-                raise MemoryError(f"page body cites [{cited}] but does not list it in claims")
+        if not refs and not links:
+            raise MemoryError("a page must cite at least one claim, or link other pages (a navigation page)")
         for link in links:
             if link == slug or link not in simulated_pages:
                 raise MemoryError(f"page links to {link!r}, which does not exist (write linked pages first)")

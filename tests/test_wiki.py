@@ -36,14 +36,18 @@ class WikiTest(unittest.TestCase):
             self.m.dream({"schema": 1, "operations": [dangling]})
         with self.assertRaisesRegex(SomniError, "not an active claim"):
             self.m.dream({"schema": 1, "operations": [self.page("x", "body", ["n000099"])]})
-        with self.assertRaisesRegex(SomniError, "does not list it"):
-            self.m.dream({"schema": 1, "operations": [self.page("x", "uses [n000002]", ["n000001"])]})
+        with self.assertRaisesRegex(SomniError, "at least one claim, or link"):
+            self.m.dream({"schema": 1, "operations": [self.page("x", "no sources", [])]})
         record = self.m.dream({"schema": 1, "operations": [
             self.page("consent", "Get an explicit yes before any write [n000002].", ["n000002"]),
             self.page("cancellations", "Preview the fee first [n000001], then follow [[consent]].", ["n000001"])]})
         self.assertEqual(record["page_operations"], 2)
         m = SomniMemory(self.ws, "s").load()
         self.assertEqual(m.pages["cancellations"]["links"], ["consent"])
+        m.dream({"schema": 1, "operations": [self.page("overview", "Start at [[cancellations]]; consent rules [n000002].", [])]})
+        m = SomniMemory(self.ws, "s").load()
+        self.assertEqual(m.pages["overview"]["claims"], ["n000002"])  # inline citation merged
+        self.assertEqual(m.pages["overview"]["links"], ["cancellations"])
         self.assertEqual(m.recall_pages("how do I cancel", 1)[0]["slug"], "cancellations")
         with self.assertRaisesRegex(SomniError, "still link"):
             m.dream({"schema": 1, "operations": [{"op": "drop_page", "slug": "consent", "reason": "merge"}]})
