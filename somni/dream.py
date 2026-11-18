@@ -179,3 +179,50 @@ def fill_gaps(memory, complete, *, goal, log=print):
     log(f"fill-gaps: {[a.get('accepted') for a in trace['attempts']]} accepted; {len(memory.pages)} pages")
     trace["fill_gaps"] = True
     return trace
+
+
+def refocus(memory, complete, *, goal, failures, log=print):
+    """Focus memory on a goal (the essay's loop): reflect on failures, revise the instructions.
+
+    `failures` is a short text describing what went wrong in past sessions (for example the
+    requirements a reviewer said were missed).  The model reflects and returns revised wiki
+    instructions; the caller then rebuilds the wiki with them.  Returns (instructions, trace).
+    """
+    memory.load()
+    prompt = (f"GOAL for this memory: {goal}\n\nREFLECT ON FAILURES. Past sessions failed in the ways listed below, "
+              "even though the memory existed. Diagnose what the memory should say, emphasise or warn about so these "
+              "failures do not recur, then write revised instructions for rebuilding the wiki. Return JSON "
+              '{"diagnosis": "...", "instructions": "concrete guidance for which pages to write and what they must contain"}.\n\n'
+              f"## Current pages\n{render_pages(memory, body_chars=300)}\n\n## Failures\n{failures[:24000]}\n")
+    trace = {"refocus": True}
+    try:
+        value = json.loads(complete("You improve an agent's long-term memory. Return only a JSON object.", prompt))
+        instructions = str(value.get("instructions", ""))[:4000]
+        trace["diagnosis"] = str(value.get("diagnosis", ""))[:2000]
+    except Exception as exc:  # a refused call or bad JSON leaves the goal unchanged
+        trace["error"] = str(exc)[:300]
+        instructions = ""
+    trace["instructions"] = instructions
+    log(f"refocus: {'new instructions' if instructions else 'unchanged'}")
+    return instructions, trace
+
+
+def rewrite_wiki(memory, complete, *, goal, instructions, max_passes=4, log=print):
+    """Rewrite existing pages (same slugs) and add new ones under revised instructions."""
+    traces = []
+    for number in range(max_passes):
+        memory.load()
+        active = sorted((c for c in memory.claims.values() if c["state"] == "active"), key=lambda c: (-c["salience"], c["id"]))
+        claims = "\n".join(f"[{c['id']}] (salience {c['salience']}) {c['text']}" for c in active[:160])
+        prompt = (f"GOAL for this memory: {goal}\n\nREVISED INSTRUCTIONS (from reflecting on failures): {instructions}\n\n"
+                  f"REWRITE THE WIKI pass {number + 1}/{max_passes}. {PAGE_GUIDE} Rewrite the pages that the instructions "
+                  "say are missing or misleading (reuse the slug to replace a page) and add pages for uncovered subjects. "
+                  "At most 6 page operations.\n\n"
+                  f"## Pages\n{render_pages(memory, body_chars=600)}\n\n## Active claims\n{claims}\n")
+        trace = dream_pass(memory, [], complete, prompt_override=prompt, max_ops=10)
+        trace["rewrite_pass"] = number + 1
+        traces.append(trace)
+        log(f"rewrite pass {number + 1}: {[a.get('accepted') for a in trace['attempts']]} accepted")
+        if not any(a.get("accepted") for a in trace["attempts"]):
+            break
+    return traces

@@ -101,6 +101,31 @@ class EpisodeSearchTest(unittest.TestCase):
             self.assertEqual(sb._rank(list(eps), docs, "checked bag")[0], "2-bag")
 
 
+class FeedbackTest(unittest.TestCase):
+    def test_feedback_text_lists_missed_requirements(self):
+        sys.path.insert(0, str(ROOT))
+        from adapters.state_bench import somni_state_bench as sb
+        text = sb.feedback_text("7-x", {"task_completion_pass": 0, "state_requirements_met": 0, "state_requirements_reasoning": "fee wrong",
+                                        "task_requirements_details": [{"kind": "must", "requirement": "Preview first", "passed": False, "reasoning": "skipped"},
+                                                                      {"kind": "must", "requirement": "Be polite", "passed": True}]})
+        self.assertIn("outcome FAIL", text)
+        self.assertIn("missed [must] Preview first -- reviewer: skipped", text)
+        self.assertNotIn("Be polite", text)
+        self.assertIn("final database state was wrong: fee wrong", text)
+
+    def test_refocus_returns_instructions_and_survives_refusal(self):
+        from somni import dream as dm
+        with tempfile.TemporaryDirectory() as tmp:
+            m = SomniMemory.create(pathlib.Path(tmp), "s", "l", "a")
+            ins, trace = dm.refocus(m, lambda s, p: '{"diagnosis": "d", "instructions": "write a cheaper-path page"}', goal="g", failures="x", log=lambda *_: None)
+            self.assertEqual(ins, "write a cheaper-path page")
+            def refuse(s, p):
+                raise RuntimeError("flagged")
+            ins, trace = dm.refocus(m, refuse, goal="g", failures="x", log=lambda *_: None)
+            self.assertEqual(ins, "")
+            self.assertIn("flagged", trace["error"])
+
+
 class WikiDreamingTest(unittest.TestCase):
     def test_build_wiki_fill_gaps_and_page_retrieval(self):
         sys.path.insert(0, str(ROOT))

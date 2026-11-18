@@ -34,7 +34,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from somni.dream import build_wiki, dream_pass, fill_gaps  # noqa: E402
+from somni.dream import build_wiki, dream_pass, fill_gaps, refocus, rewrite_wiki  # noqa: E402
 from somni.store import SomniError, SomniMemory, _bm25, _terms  # noqa: E402
 
 SUBJECT = "state-bench-learner"
@@ -198,6 +198,71 @@ def build_wiki_from(source, workspace, complete, *, goal=WIKI_GOAL, log=print):
     return summary
 
 
+FEEDBACK_FOCUS = ("mistakes: what the agent did wrong or failed to do according to the FEEDBACK record, what it "
+                  "should have done instead, and the general lesson (cite the FEEDBACK record and the transcript)")
+
+
+def feedback_text(task_id, scored):
+    """One FEEDBACK observation from a scored trajectory: outcome plus each failed requirement."""
+    lines = [f"FEEDBACK for episode {task_id}: outcome {'PASS' if scored.get('task_completion_pass') else 'FAIL'}."]
+    for req in scored.get("task_requirements_details") or []:
+        if not req.get("passed"):
+            lines.append(f"- missed [{req.get('kind')}] {req.get('requirement', '')[:300]} -- reviewer: {str(req.get('reasoning', ''))[:300]}")
+    if scored.get("state_requirements_met") == 0:
+        lines.append(f"- final database state was wrong: {str(scored.get('state_requirements_reasoning', ''))[:400]}")
+    return _clip("\n".join(lines))
+
+
+def build_feedback_from(source, workspace, scored_dir, complete, *, goal=WIKI_GOAL, log=print):
+    """Focus memory on the goal using feedback from the agent's own scored TRAIN episodes.
+
+    Records each scored train episode and its FEEDBACK into the transcript, dreams cited
+    claims about the failed ones, reflects on the failures to revise the wiki instructions,
+    rewrites the wiki, and fills gaps.
+    """
+    source, workspace = pathlib.Path(source), pathlib.Path(workspace)
+    if workspace.exists():
+        raise FileExistsError(f"{workspace} exists")
+    shutil.copytree(source / "somni-v1", workspace / "somni-v1")
+    memory = SomniMemory(workspace, SUBJECT).load()
+    memory.set_phase("open")
+    failed, summary_lines = [], []
+    for path in sorted(pathlib.Path(scored_dir).glob("*.json")):
+        scored = json.loads(path.read_text())
+        if scored.get("task_completion_pass") is None:
+            continue
+        items = trajectory_records(f"review-{path.stem}", scored.get("conversation") or [])
+        items.insert(-1, ("ordinary_observation", feedback_text(path.stem, scored)))
+        ids = memory.record_many(items)
+        if not scored.get("task_completion_pass"):
+            failed.append((path.stem, ids[0], ids[-1]))
+            summary_lines.append(feedback_text(path.stem, scored))
+    memory.set_phase("closed")
+    memory.load()
+    log(f"recorded {len(failed)} failed review episodes")
+    by_id = {r["id"]: i for i, r in enumerate(memory.transcript)}
+    passes = []
+    for start in range(0, len(failed), 2):
+        group = failed[start:start + 2]
+        window = memory.transcript[by_id[group[0][1]]: by_id[group[-1][2]] + 1]
+        trace = dream_pass(memory, window, complete, focus=FEEDBACK_FOCUS)
+        trace["review_episodes"] = [g[0] for g in group]
+        passes.append(trace)
+        memory.load()
+    instructions, reflect = refocus(memory, complete, goal=goal, failures="\n".join(summary_lines), log=log)
+    passes.append(reflect)
+    if instructions:
+        passes.extend(rewrite_wiki(memory, complete, goal=goal, instructions=instructions, log=log))
+    passes.extend(build_wiki(memory, complete, goal=goal, max_passes=3, log=log))
+    passes.append(fill_gaps(memory, complete, goal=goal, log=log))
+    memory.load()
+    memory.write_vault()
+    summary = {"source": str(source), "scored_dir": str(scored_dir), "failed_episodes": len(failed), "goal": goal,
+               "instructions": instructions, "metrics": memory.metrics(), "passes": passes}
+    (workspace / "build-feedback-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    return summary
+
+
 class SomniLearnings:
     """Mixin for a STATE-Bench StateBenchAgent subclass (read-only retrieval).
 
@@ -326,11 +391,25 @@ def main(argv=None):
     w.add_argument("--workspace", required=True)
     w.add_argument("--model", default="gpt-6-luna")
     w.add_argument("--reasoning-effort", default="medium")
+    f = sub.add_parser("build-feedback", help="refocus a wiki store on the agent's own scored TRAIN episodes")
+    f.add_argument("--from", dest="source", required=True)
+    f.add_argument("--workspace", required=True)
+    f.add_argument("--scored-dir", required=True, help="scored trajectories of TRAIN tasks only")
+    f.add_argument("--model", default="gpt-6-luna")
+    f.add_argument("--reasoning-effort", default="medium")
     r = sub.add_parser("recall")
     r.add_argument("--workspace", required=True)
     r.add_argument("query")
     r.add_argument("--top-k", type=int, default=3)
     args = ap.parse_args(argv)
+    if args.command == "build-feedback":
+        from somni.llm import openai_completer
+        complete = openai_completer(args.model, reasoning_effort=args.reasoning_effort)
+        summary = build_feedback_from(args.source, args.workspace, args.scored_dir, complete)
+        summary["model"], summary["model_usage"] = args.model, complete.usage.as_dict()
+        (pathlib.Path(args.workspace) / "build-feedback-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        print(json.dumps({k: v for k, v in summary.items() if k != "passes"}, indent=2))
+        return 0
     if args.command == "build-wiki":
         from somni.llm import openai_completer
         complete = openai_completer(args.model, reasoning_effort=args.reasoning_effort)
