@@ -51,9 +51,18 @@ def _clip(text, limit=RECORD_BYTES):
     return data[: limit - 16].decode("utf-8", "ignore") + " …[truncated]"
 
 
-def trajectory_records(task_id, conversation):
-    """Map one STATE-Bench conversation to (source, text) transcript items."""
+def trajectory_records(task_id, conversation, episode=None):
+    """Map one STATE-Bench conversation to (source, text) transcript items.
+
+    `episode` (optional) is per-episode metadata the agent saw, e.g. {"now": ...};
+    it is recorded as an observation right after the episode starts.
+    """
     items = [("ordinary_observation", f"[episode {task_id}] begins")]
+    if episode and episode.get("now"):
+        items.append(("ordinary_observation", f"[episode {task_id}] Today's date: {episode['now']}"))
+    for key, value in sorted((episode or {}).items()):
+        if key != "now":
+            items.append(("ordinary_observation", f"[episode {task_id}] {key}: {value}"))
     for message in conversation:
         role, content = message.get("role"), (message.get("content") or "").strip()
         if role == "system":
@@ -73,7 +82,7 @@ def trajectory_records(task_id, conversation):
     return items
 
 
-def build(train_dir, workspace, complete, *, per_pass=3, consolidate=True, log=print, limit=None):
+def build(train_dir, workspace, complete, *, per_pass=3, consolidate=True, log=print, limit=None, episode_meta=None):
     """Create a Somni store from train trajectories and dream over it.  Returns a summary."""
     train_dir, workspace = pathlib.Path(train_dir), pathlib.Path(workspace)
     files = sorted(train_dir.glob("*.json"), key=lambda p: (int(p.stem.split("-")[0]) if p.stem.split("-")[0].isdigit() else 0, p.stem))
@@ -85,7 +94,7 @@ def build(train_dir, workspace, complete, *, per_pass=3, consolidate=True, log=p
     spans = []
     for path in files:
         conversation = json.loads(path.read_text()).get("conversation") or []
-        ids = memory.record_many(trajectory_records(path.stem, conversation))
+        ids = memory.record_many(trajectory_records(path.stem, conversation, _episode_for(path.stem, episode_meta)))
         spans.append((path.stem, ids[0], ids[-1]))
     memory.set_phase("closed")
     memory.load()
@@ -107,7 +116,7 @@ def build(train_dir, workspace, complete, *, per_pass=3, consolidate=True, log=p
     if consolidate:
         passes.extend(_consolidate(memory, complete, log))
     memory.load()
-    summary = {"trajectories": len(files), "metrics": memory.metrics(), "passes": passes}
+    summary = {"trajectories": len(files), "episode_meta": bool(episode_meta), "metrics": memory.metrics(), "passes": passes}
     (workspace / "build-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     return summary
 
@@ -134,6 +143,33 @@ def _consolidate(memory, complete, log, rounds=2):
         log(f"consolidation {round_number + 1}: {[a.get('accepted') for a in trace['attempts']]} accepted, "
             f"{sum(c['state'] == 'active' for c in memory.claims.values())} active claims")
     return traces
+
+
+def train_episode_meta(task_dir, split_file, fields=("now",)):
+    """Episode metadata for TRAIN tasks only: {task_id: {field: value}}.
+
+    STATE-Bench redacts "Today's date" in the shipped train trajectories, but each
+    train task file records the episode's `now`, which a live agent would see. Only
+    ids listed in the split file's train split are read; anything else is refused,
+    so no test task can leak into learning.
+    """
+    split = json.loads(pathlib.Path(split_file).read_text())["splits"]
+    train, test = set(split["train"]), set(split.get("test", []))
+    meta = {}
+    for task_id in sorted(train - test):
+        path = pathlib.Path(task_dir) / f"{task_id}.json"
+        if path.exists():
+            task = json.loads(path.read_text())
+            meta[task_id] = {f: task[f] for f in fields if f in task}
+    return meta
+
+
+def _episode_for(task_id, episode_meta):
+    if episode_meta is None:
+        return None
+    if task_id not in episode_meta:
+        raise ValueError(f"no train-split episode metadata for {task_id}; refusing to guess")
+    return episode_meta[task_id]
 
 
 class SomniLearnings:
@@ -173,6 +209,8 @@ def main(argv=None):
     b.add_argument("--reasoning-effort", default="medium")
     b.add_argument("--per-pass", type=int, default=3)
     b.add_argument("--limit", type=int, default=None, help="only the first N trajectories (smoke tests)")
+    b.add_argument("--task-dir", help="STATE-Bench domain tasks/ dir: add each TRAIN episode's `now` (needs --split-file)")
+    b.add_argument("--split-file", help="STATE-Bench splits/train_test.json; only its train ids are read")
     r = sub.add_parser("recall")
     r.add_argument("--workspace", required=True)
     r.add_argument("query")
@@ -181,7 +219,8 @@ def main(argv=None):
     if args.command == "build":
         from somni.llm import openai_completer
         complete = openai_completer(args.model, reasoning_effort=args.reasoning_effort)
-        summary = build(args.train_dir, args.workspace, complete, per_pass=args.per_pass, limit=args.limit)
+        meta = train_episode_meta(args.task_dir, args.split_file) if args.task_dir else None
+        summary = build(args.train_dir, args.workspace, complete, per_pass=args.per_pass, limit=args.limit, episode_meta=meta)
         summary["model_usage"] = complete.usage.as_dict()
         print(json.dumps({k: v for k, v in summary.items() if k != "passes"}, indent=2))
         trace_path = pathlib.Path(args.workspace) / "build-trace.json"

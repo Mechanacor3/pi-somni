@@ -78,6 +78,12 @@ OPENAI_API_KEY=... python3 -m adapters.state_bench.somni_state_bench build \
   --train-dir STATE-Bench/datasets/train_task_trajectories/travel --workspace learnings/somni/travel
 ```
 
+STATE-Bench redacts "Today's date" in its shipped train trajectories, although an agent at work
+would see it. Add `--task-dir STATE-Bench/state_bench/domains/<domain>/tasks --split-file
+STATE-Bench/state_bench/domains/<domain>/splits/train_test.json` to restore each **train**
+episode's date (`now`) from its task file. Only ids in the official train split are read, and
+only the `now` field; a trajectory without train metadata is refused rather than guessed.
+
 ```python
 from state_bench.agents.state_bench import StateBenchAgent
 from adapters.state_bench.somni_state_bench import SomniLearnings
