@@ -77,6 +77,9 @@ class FeatureTest(unittest.TestCase):
         trace = dm.dream_pass(self.memory, self.memory.load().transcript, complete)
         self.assertEqual([a["accepted"] for a in trace["attempts"]], [0, 1])
         self.assertIn("rejected", calls[1])
+        def refuse(system, prompt):
+            raise RuntimeError("HTTP 400: prompt flagged")
+        self.assertIn("model_error", dm.dream_pass(self.memory.load(), self.memory.transcript, refuse)["attempts"][0])
         trace = dm.dream_pass(self.memory.load(), self.memory.transcript, lambda s, p: "not json")
         self.assertEqual(trace["attempts"][-1]["accepted"], 0)
 

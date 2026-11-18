@@ -85,7 +85,11 @@ def dream_pass(memory, records, complete, *, focus=DEFAULT_FOCUS, max_ops=12, re
     system = SYSTEM.replace("{max_ops}", str(max_ops))
     trace = {"window": [records[0]["id"], records[-1]["id"]] if records else None, "attempts": []}
     for attempt in range(retries + 1):
-        raw = complete(system, prompt)
+        try:
+            raw = complete(system, prompt)
+        except Exception as exc:  # a refused or failed model call skips this pass, not the build
+            trace["attempts"].append({"accepted": 0, "model_error": str(exc)[:300]})
+            return trace
         try:
             proposal = _parse(raw)
             if isinstance(proposal, dict) and isinstance(proposal.get("operations"), list):
