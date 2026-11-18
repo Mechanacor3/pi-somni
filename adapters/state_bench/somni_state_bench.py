@@ -306,6 +306,31 @@ class SomniWikiLearnings(SomniLearnings):
             return []
 
 
+class SomniLayeredLearnings(SomniWikiLearnings):
+    """All three upper layers, as the essay describes them.
+
+    1. Injected context: the promoted, always-loaded memory (the store's index of page titles
+       and its highest-salience claims), returned first so the agent never has to search for it.
+    2. Representations: the best-matching content pages; navigation-only pages are skipped.
+    3. Claims, if there are fewer pages than slots.
+    """
+
+    inject_bytes = 3_000
+
+    def retrieve_learnings(self, query: str, top_k: int = 3) -> list[str]:
+        try:
+            memory = self._somni_memory()
+            out = ["# Always-loaded memory (promoted)\n" + memory.inject(self.inject_bytes).split("\n", 2)[-1]]
+            pages = [p for p in memory.recall_pages(query[:2000], limit=top_k + 4) if p["claims"]][: top_k - 1]
+            out += [f"# {p['title']}\n{p['body']}\n(Somni wiki page `{p['slug']}`, built from {len(p['claims'])} cited claims)"
+                    for p in pages]
+            if len(out) < top_k:
+                out += [f"{c['text']} (memory {c['id']}; {c['status']})" for c in memory.recall(query[:2000], limit=top_k - len(out))]
+            return out[:top_k]
+        except SomniError:
+            return []
+
+
 EPISODE = re.compile(r"^\[episode ([^\]]+)\] begins$")
 
 

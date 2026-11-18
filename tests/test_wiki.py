@@ -145,7 +145,7 @@ class WikiDreamingTest(unittest.TestCase):
                 calls.append(prompt)
                 if "BUILD THE WIKI" in prompt:
                     return '{"operations": [{"op": "page", "slug": "cancellations", "title": "Cancellations", "body": "Always preview the fee first [n000001]. Then confirm [n000002].", "claims": ["n000001", "n000002", "n000003", "n000004"]}]}'
-                return '{"operations": [{"op": "page", "slug": "overview", "title": "Overview", "body": "Start with [[cancellations]].", "claims": ["n000001"]}, {"op": "promote", "claim_id": "n000001", "salience": 5}]}'
+                return '{"operations": [{"op": "page", "slug": "overview", "title": "Overview", "body": "Start with [[cancellations]].", "claims": []}, {"op": "promote", "claim_id": "n000001", "salience": 5}]}'
             out = pathlib.Path(tmp) / "out" / "travel"
             summary = sb.build_wiki_from(src, out, complete, log=lambda *_: None)
             self.assertEqual(summary["metrics"]["wiki_pages"], 2)
@@ -169,6 +169,16 @@ class WikiDreamingTest(unittest.TestCase):
 
                 class runtime_context:
                     domain = "travel"
+            class Layered(sb.SomniLayeredLearnings):
+                somni_root = str(pathlib.Path(tmp) / "out")
+
+                class runtime_context:
+                    domain = "travel"
+            layered = Layered().retrieve_learnings("how to cancel and what fee", 3)
+            self.assertTrue(layered[0].startswith("# Always-loaded memory"))
+            self.assertIn("page `cancellations`", layered[0])
+            self.assertTrue(layered[1].startswith("# Cancellations"))
+            self.assertFalse(any(x.startswith("# Overview") for x in layered))  # navigation pages are skipped
             m3 = SomniMemory(out, sb.SUBJECT).load()
             self.assertEqual(sb.episodes(m3), {})  # this toy store has no episode markers
             hits = SearchAgent().retrieve_learnings("how to cancel and what fee", 3)
