@@ -35,6 +35,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from somni.dream import brief, build_wiki, dream_pass, fill_gaps, refocus, rewrite_wiki  # noqa: E402
+from somni.llm import openai_completer  # noqa: E402
 from somni.store import SomniError, SomniMemory, _bm25, _terms  # noqa: E402
 
 SUBJECT = "state-bench-learner"
@@ -367,7 +368,6 @@ class SomniBriefingLearnings(SomniWikiLearnings):
 
     def _complete(self):
         if SomniBriefingLearnings._completer is None:
-            from somni.llm import openai_completer
             SomniBriefingLearnings._completer = openai_completer(self.brief_model, reasoning_effort="low")
         return SomniBriefingLearnings._completer
 
