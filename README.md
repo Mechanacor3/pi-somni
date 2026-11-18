@@ -30,6 +30,10 @@ The design follows Anthropic's engineering essay
 (see [Background and credits](#background-and-credits)). Somni is a small, independent
 interpretation of it, not Anthropic's implementation.
 
+**Measured:** on STATE-Bench, Somni (wiki + search) raised an agent's pooled task completion from
+57.6% to 62.2% (+4.7 points, +9.3 in travel) and improved judged conversation quality. See
+[Results](#results).
+
 ## Install
 
 Requires Pi 1.0+ and `python3` (3.10 or newer, standard library only) on `PATH`.
@@ -180,7 +184,53 @@ Evaluation uses [STATE-Bench](https://github.com/microsoft/STATE-Bench) (MIT) an
 
 ## Results
 
-STATE-Bench pilot results will be added here.
+Evaluated on the [STATE-Bench](https://github.com/microsoft/STATE-Bench) Agent Learning Track
+(v0.8.1, 50 held-out test tasks per domain, three runs per condition). Learnings were built from
+the shipped train trajectories only.
+
+`gpt-6-luna` played agent, user simulator and judge. That is **unofficial**: the protocol locks
+the simulator and judge to GPT-5.4, so compare these numbers with each other, not with the
+leaderboard. Δ is percentage points of pass@1 against the same agent without memory, paired by
+task, with 95% bootstrap intervals.
+
+| Configuration | Travel | Customer support | Shopping | Pooled |
+|---|---:|---:|---:|---:|
+| No memory (pass@1) | 56.7% | 62.7% | 53.3% | 57.6% |
+| **Somni wiki + search** (recommended) | **+9.3** [+1.3, +17.3] | +1.3 [−9.3, +12.0] | +3.3 [−4.0, +10.7] | **+4.7** [−0.4, +9.8] |
+| Somni claims only | +8.0 [−0.7, +16.7] | +1.3 [−8.0, +10.0] | +4.7 [−0.7, +10.7] | +4.7 [+0.2, +9.1] |
+| Somni wiki (pages only) | +6.7 | +1.3 | +3.3 | +3.8 |
+| Somni wiki refocused on train feedback | +4.0 | +3.3 | +2.7 | +3.3 |
+
+- **Completion:** the recommended setup raises pooled pass@1 from 57.6% to 62.2%. That's about
+  8% relative, and it fixes 11% of the baseline's failures. The gain is largest in travel, small
+  in shopping, and not detectable in customer support.
+- **Conversation quality:** the judge's 1–5 UX score improves in travel (+0.23 [+0.04, +0.45])
+  and customer support (+0.68 [+0.37, +0.99]). Claims-only memory gets about half of that.
+- **Cost:** about 2× the baseline's agent tokens per task, because whole pages are retrieved.
+  Claims only costs about 1.4×. The one-time build used about 130 model calls (≈1.5M tokens)
+  for all three domains.
+- **Not detected:** in customer support, memory made the agent better at the conversational
+  requirements (asking, confirming, explaining) but sometimes over-cautious. Its final-state
+  accuracy dropped slightly, so completion stayed flat.
+- **What didn't help:** recording the episode date. Dreaming only over failures also made the
+  agent over-cautious, consistent with the essay's warning about a "record only failures" rule.
+
+Full methodology, every condition tried, and per-run numbers:
+[`state-bench-eval/results`](https://github.com/Mechanacor3/state-bench-eval) (private).
+
+### Recommended setup
+
+1. **Build claims:** `build` over your trajectories, dreaming in windows of about three episodes.
+2. **Build the wiki:** `build-wiki` gathers the claims into linked pages, then `fill_gaps` merges
+   them, adds an overview and promotes key claims. Open `somni-v1/vault/` in Obsidian to review
+   what was learned.
+3. **Retrieve:** use `SomniWikiSearchLearnings`, which returns the two best pages plus the most
+   similar past case.
+4. **In Pi:** recording, `/somni-dream` and `/somni-wiki` do the same online. `somni_recall`
+   returns pages, then claims.
+
+`SomniLayeredLearnings`, `SomniBriefingLearnings` and `build-feedback --balanced` are
+implemented and tested, but were not fully evaluated: the evaluation budget ran out.
 
 ## License
 
