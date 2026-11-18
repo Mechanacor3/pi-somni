@@ -79,6 +79,28 @@ class WikiTest(unittest.TestCase):
         self.assertEqual(SomniMemory(self.ws, "s").load().pages, {})
 
 
+class EpisodeSearchTest(unittest.TestCase):
+    def test_episode_digest_and_ranking(self):
+        sys.path.insert(0, str(ROOT))
+        from adapters.state_bench import somni_state_bench as sb
+        with tempfile.TemporaryDirectory() as tmp:
+            m = SomniMemory.create(pathlib.Path(tmp), sb.SUBJECT, "l", "a")
+            m.set_phase("open")
+            for tid, req, tool in (("1-cancel", "Cancel my flight BK-1", "cancel_booking"), ("2-bag", "Add a checked bag", "add_bag")):
+                m.record_many(sb.trajectory_records(tid, [{"role": "user", "content": req},
+                    {"role": "assistant", "content": "Done.", "tool_calls": [{"name": tool, "arguments": {"id": 1}, "result": {"ok": True}}]}]))
+            m.set_phase("closed")
+            m = m.load()
+            eps = sb.episodes(m)
+            self.assertEqual(sorted(eps), ["1-cancel", "2-bag"])
+            digest = sb.episode_digest("1-cancel", eps["1-cancel"])
+            self.assertIn("USER: Cancel my flight", digest)
+            self.assertIn('- cancel_booking({"id": 1})', digest)
+            self.assertIn("Final answer: Done.", digest)
+            docs = [sb._terms_for(" ".join(r["text"] for r in eps[k])) for k in eps]
+            self.assertEqual(sb._rank(list(eps), docs, "checked bag")[0], "2-bag")
+
+
 class WikiDreamingTest(unittest.TestCase):
     def test_build_wiki_fill_gaps_and_page_retrieval(self):
         sys.path.insert(0, str(ROOT))
@@ -116,6 +138,17 @@ class WikiDreamingTest(unittest.TestCase):
                 class runtime_context:
                     domain = "travel"
             got = Agent().retrieve_learnings("how to cancel and what fee", 3)
+
+            class SearchAgent(sb.SomniWikiSearchLearnings):
+                somni_root = str(pathlib.Path(tmp) / "out")
+
+                class runtime_context:
+                    domain = "travel"
+            m3 = SomniMemory(out, sb.SUBJECT).load()
+            self.assertEqual(sb.episodes(m3), {})  # this toy store has no episode markers
+            hits = SearchAgent().retrieve_learnings("how to cancel and what fee", 3)
+            self.assertTrue(hits[0].startswith("# Cancellations"))
+            self.assertLessEqual(len(hits), 3)
             self.assertTrue(got[0].startswith("# Cancellations"))
             self.assertEqual(len(got), 3)
 

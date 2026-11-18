@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 import time
@@ -34,7 +35,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from somni.dream import build_wiki, dream_pass, fill_gaps  # noqa: E402
-from somni.store import SomniError, SomniMemory  # noqa: E402
+from somni.store import SomniError, SomniMemory, _bm25, _terms  # noqa: E402
 
 SUBJECT = "state-bench-learner"
 LIMITS = {"max_transcript_records": 65_536, "max_claims": 2_048, "max_record_bytes": 16_384}
@@ -238,6 +239,74 @@ class SomniWikiLearnings(SomniLearnings):
             return out
         except SomniError:
             return []
+
+
+EPISODE = re.compile(r"^\[episode ([^\]]+)\] begins$")
+
+
+def episodes(memory):
+    """Split the transcript into {episode_id: [records]} using the adapter's episode markers."""
+    out, current = {}, None
+    for record in memory.transcript:
+        match = EPISODE.match(record["text"])
+        if match:
+            current = match.group(1)
+            out[current] = []
+        if current is not None:
+            out[current].append(record)
+    return out
+
+
+def episode_digest(task_id, records, limit=3_000):
+    """A compact case: the request, the tool calls in order (with arguments), and the final answer."""
+    lines = [f"Similar past case ({task_id}):"]
+    users = [r["text"] for r in records if r["text"].startswith("USER: ")]
+    if users:
+        lines.append(users[0][:500])
+    for r in records:
+        if r["source"] == "tool_result" and r["text"].startswith("TOOL "):
+            lines.append("- " + r["text"].split(" -> ", 1)[0][5:][:220])
+    agents = [r["text"] for r in records if r["source"] == "agent_output"]
+    if agents:
+        lines.append("Final answer: " + agents[-1][7:][:700])
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class SomniWikiSearchLearnings(SomniWikiLearnings):
+    """The essay's best configuration: wiki pages plus transcript search.
+
+    Returns the top (top_k - 1) wiki pages and one digest of the most similar past episode,
+    found by BM25 over whole episodes in the transcript.
+    """
+
+    def retrieve_learnings(self, query: str, top_k: int = 3) -> list[str]:
+        pages = SomniWikiLearnings.retrieve_learnings(self, query, max(1, top_k - 1))[: max(1, top_k - 1)]
+        try:
+            memory = self._somni_memory()
+            key = id(memory)
+            if SomniWikiSearchLearnings._episode_cache.get("key") != key:
+                eps = episodes(memory)
+                SomniWikiSearchLearnings._episode_cache = {"key": key, "eps": eps, "docs": {
+                    k: _terms_for(" ".join(r["text"] for r in v)) for k, v in eps.items()}}
+            cache = SomniWikiSearchLearnings._episode_cache
+            ids = list(cache["eps"])
+            ranked = _rank(ids, [cache["docs"][i] for i in ids], query)
+            if ranked:
+                pages.append(episode_digest(ranked[0], cache["eps"][ranked[0]]))
+        except SomniError:
+            pass
+        return pages[:top_k]
+
+    _episode_cache = {}
+
+
+def _terms_for(text):
+    return _terms(text)
+
+
+def _rank(ids, docs, query):
+    return [item for _, item in _bm25(docs, ids, query)]
 
 
 def main(argv=None):

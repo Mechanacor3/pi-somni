@@ -898,6 +898,8 @@ that the their then this to was were when which while will with you your i me my
 
 
 def _bm25(docs, items, query):
+    if not docs:
+        return []
     q_terms = set(_terms(query))
     avg = (sum(len(d) for d in docs) / len(docs)) or 1.0
     df = {}
