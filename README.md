@@ -8,13 +8,22 @@ and consolidates them offline ("dreaming"):
 2. **Claims**: short notes the agent writes. Every claim cites transcript records. A
    `verified` claim must quote an exact excerpt of each record it cites, and the store checks
    the quote character for character. `uncertain` is the honest default for interpretations.
-3. **Dreams**: offline passes that add, correct (supersede) or retract claims, each bound to
-   the transcript head it reviewed. History is never deleted: corrections and retractions keep
-   their lineage.
+3. **Wiki**: pages that gather what is known about one subject. Pages are markdown that cite
+   claims inline (`[n000012]`) and link other pages with `[[slug]]` wikilinks. Every link must
+   resolve, and every cited claim must be active.
+4. **Dreams**: offline passes that correct, add, retract or promote claims and write or merge
+   pages, each bound to the transcript head it reviewed. History is never deleted: corrections
+   and retractions keep their lineage.
 
-At the start of each run Somni injects a small, salience-ordered index of active claims
-(at most 8 KiB, never the whole transcript). Retrieval ranks claims for a query with a
-deterministic lexical (BM25) score weighted by salience.
+After every dream Somni renders the wiki as an **Obsidian-style vault** in
+`somni-v1/vault/`. Each page is one note with YAML frontmatter, *See also* and *Backlinks*
+sections, and an *Evidence* list. `index.md` is the map of content, and `claims.md` shows
+every claim with its exact transcript quotes. Open the folder in Obsidian, or read it on GitHub.
+The vault is a view; edits there are not read back.
+
+At the start of each run Somni injects a small index: page titles first, then claims by salience
+(at most 8 KiB, never the whole transcript). Retrieval ranks pages and claims with a
+deterministic lexical (BM25, lightly stemmed) score.
 
 The design follows Anthropic's engineering essay
 [*The components of agent memory*](https://www.anthropic.com/research/components-of-agent-memory)
@@ -37,12 +46,14 @@ In a session Somni records automatically, and adds these tools:
 
 | Tool | Purpose |
 |---|---|
-| `somni_recall` | Claims most relevant to a query |
+| `somni_recall` | Wiki pages, then claims, most relevant to a query |
 | `somni_search` | Exact phrase search over the transcript (to find evidence IDs) |
 | `somni_note` | Add a cited claim while working |
 | `somni_dream` | Submit a consolidation pass (only during `/somni-dream`) |
 
-Run `/somni-dream [focus]` to consolidate recent transcript into claims. Somni closes the
+Run `/somni-dream [focus]` to consolidate recent transcript into claims, and
+`/somni-wiki [goal]` to gather claims that are not yet on a page into linked wiki pages.
+`/somni-dream` works as follows. Somni closes the
 recording session, asks the model for one pass, and reopens recording when the pass settles.
 Invalid operations (for example, a quote that does not match) are rejected one by one and
 listed in the pass record.
@@ -120,11 +131,20 @@ Somni implements the memory hierarchy described by Lance Martin in
 |---|---|
 | Transcripts as a searchable event log at the base | `transcript.jsonl` and `somni_search` |
 | Memory notes written by the agent, which judges salience | Claims with salience 1–5 (`somni_note`) |
-| Richer representations that link notes (wikis) | Claim `links` and supersession lineage |
-| Small injected context loaded every session | The bounded salience-ordered index from `inject` |
-| "Dreaming": offline consolidation that corrects notes, builds representations and promotes notes | Dream passes (`dream`, `/somni-dream`) that add, correct and retract claims |
+| Representations: pages that gather one subject and link to notes and each other (wikis) | `wiki.jsonl` pages with `[[slug]]` links and `[nXXXXXX]` citations, rendered as an Obsidian vault |
+| Small injected context loaded every session (an index) | The bounded index from `inject`: page titles, then claims by salience |
+| Dreaming corrects memory against the transcript | `correct` / `retract` operations (`/somni-dream`, `somni/dream.py dream_pass`) |
+| Dreaming builds new representations | `build_wiki` / `/somni-wiki`: claims gathered into pages, iterated until nearly all are covered |
+| Dreaming promotes notes up the hierarchy | `promote` raises a claim's salience into the injected index without changing its id |
+| Dreaming focuses memory on a goal | Every wiki pass is steered by an explicit `goal` |
+| Dreaming fills gaps | `fill_gaps`: merge duplicate pages, repair pages whose claims went stale, add an overview page |
+
+The essay reports that a wiki combined with search beat either alone. Somni's retrieval follows
+that: pages first, then claims.
 
 What Somni adds:
+- **No dangling links.** A link must point to a page that already exists. The essay lists links
+  to not-yet-created pages as a failure mode.
 - **Checked evidence.** Every claim must cite transcript records, and `verified` claims must quote
   them exactly, which the store checks. History is hash-chained and append-only.
 - **Hard size bounds** on every layer.

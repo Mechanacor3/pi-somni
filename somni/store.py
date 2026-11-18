@@ -10,11 +10,20 @@ Layers (all under `<workspace>/somni-v1/`):
                     saw (observations, tool results) and said (its own output).
   notes.jsonl       agent-authored claims.  Every claim cites transcript records;
                     `verified` claims quote an exact excerpt of each cited record.
+  wiki.jsonl        pages that gather what is known about one subject (the essay's
+                    "representations"): markdown written by dreaming, each citing the
+                    active claims it rests on and linking (with [[slug]] wikilinks)
+                    only to pages that exist.
+  vault/            a readable Obsidian-style rendering of the wiki, regenerated after
+                    every dream: one note per page with frontmatter and backlinks,
+                    index.md, and claims.md with each claim's exact evidence quotes.
+                    It is a view; edits there are not read back.
   dreams.jsonl      offline consolidation passes that add, correct (supersede) or
-                    retract claims, each bound to the transcript head it reviewed.
+                    retract claims and write or drop pages, each bound to the
+                    transcript head it reviewed.
 
-`inject` renders a small salience-ordered index for the start of a session and
-`recall` ranks active claims for a query.  The store is stdlib-only, makes no
+`inject` renders a small index for the start of a session (page titles, then
+claims by salience); `recall` ranks claims and `recall_pages` ranks pages for a query.  The store is stdlib-only, makes no
 network calls, and reads nothing outside its workspace.  A trusted adapter must
 append only text the agent itself already saw or produced.
 """
@@ -48,6 +57,12 @@ LIMIT_KEYS = {"max_transcript_records": 65_536, "max_claims": 4_096, "max_record
 DEFAULT_INJECTION_BYTES = 4_096
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CLAIM_ID = re.compile(r"^n[0-9]{6}$")
+PAGE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+MAX_PAGES = 512
+MAX_PAGE_BYTES = 6_144
+WIKILINK = re.compile(r"\[\[([a-z0-9][a-z0-9-]{0,63})(?:\|[^\]\n]{1,160})?\]\]")
+CLAIM_CITE = re.compile(r"\[(n[0-9]{6})\]")
+VAULT_DIR = "vault"
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output"}
 STATUSES = {"verified", "uncertain"}
@@ -276,12 +291,17 @@ class SomniMemory:
         self._check_chain(transcript, "transcript", state["transcript_count"], state["transcript_head"])
         self._check_chain(notes, "notes", state["note_events"], state["notes_head"])
         self._check_chain(dreams, "dreams", state["dream_count"], state["dreams_head"])
+        wiki_path = self.store / "wiki.jsonl"
+        wiki = _read_log(wiki_path) if os.path.lexists(wiki_path) else []
+        self._check_chain(wiki, "wiki", state.get("wiki_events", 0), state.get("wiki_head", ZERO_HASH))
         claims = self._replay_notes(notes, transcript, self._limit("max_claims"))
         expected_next = max([int(key[1:]) for key in claims] + [0]) + 1
         if state.get("next_claim") != expected_next or state.get("phase") not in {"open", "closed"}:
             raise MemoryError("state counters are inconsistent")
         self.manifest, self.state = manifest, state
         self.transcript, self.note_log, self.dreams, self.claims = transcript, notes, dreams, claims
+        self.wiki_log = wiki
+        self.pages = self._replay_wiki(wiki, claims)
         return self
 
     @staticmethod
@@ -340,6 +360,11 @@ class SomniMemory:
                         raise MemoryError("correction replaces a non-active claim")
                     claims[replaced]["state"] = "superseded"
                     claims[replaced]["superseded_by"] = claim["id"]
+            elif op == "promote":
+                claim_id, salience = event.get("claim_id"), event.get("salience")
+                if claim_id not in claims or claims[claim_id]["state"] != "active" or type(salience) is not int or not 1 <= salience <= 5:
+                    raise MemoryError("promotion targets an invalid claim or salience")
+                claims[claim_id]["salience"] = salience
             elif op == "retract":
                 claim_id = event.get("claim_id")
                 if (not isinstance(claim_id, str) or not CLAIM_ID.fullmatch(claim_id)
@@ -353,6 +378,134 @@ class SomniMemory:
             else:
                 raise MemoryError("unknown note event operation")
         return claims
+
+    @staticmethod
+    def _replay_wiki(events, claims):
+        pages = {}
+        for event in events:
+            if event.get("op") == "page":
+                page = event.get("page") or {}
+                if not isinstance(page, dict) or not PAGE_SLUG.fullmatch(str(page.get("slug"))):
+                    raise MemoryError("invalid wiki page event")
+                for ref in page.get("claims", []):
+                    if ref not in claims:
+                        raise MemoryError("wiki page cites an unknown claim")
+                pages[page["slug"]] = page
+            elif event.get("op") == "drop_page":
+                if event.get("slug") not in pages:
+                    raise MemoryError("wiki drop targets an unknown page")
+                del pages[event["slug"]]
+            else:
+                raise MemoryError("unknown wiki event")
+        return pages
+
+    @staticmethod
+    def _validate_page(op, simulated_claims, simulated_pages):
+        allowed = {"op", "slug", "title", "body", "claims", "links"}
+        if set(op) - allowed or not {"slug", "title", "body", "claims"} <= set(op):
+            raise MemoryError("page operation needs slug, title, body, claims (and optional links)")
+        slug, title, body = op["slug"], op["title"], op["body"]
+        if not isinstance(slug, str) or not PAGE_SLUG.fullmatch(slug):
+            raise MemoryError("page slug must match [a-z0-9][a-z0-9-]{0,63}")
+        if not isinstance(title, str) or not title.strip() or len(title) > 160:
+            raise MemoryError("page title must be 1-160 characters")
+        if not isinstance(body, str) or not body.strip() or len(body.encode("utf-8")) > MAX_PAGE_BYTES:
+            raise MemoryError(f"page body must be 1-{MAX_PAGE_BYTES} bytes")
+        refs = op["claims"]
+        if not isinstance(refs, list) or not 1 <= len(refs) <= 64 or len(set(refs)) != len(refs):
+            raise MemoryError("a page must cite 1-64 distinct claims")
+        for ref in refs:
+            if not isinstance(ref, str) or ref not in simulated_claims or simulated_claims[ref]["state"] != "active":
+                raise MemoryError(f"page cites {ref!r}, which is not an active claim")
+        links = op.get("links", [])
+        if not isinstance(links, list) or not all(isinstance(x, str) for x in links):
+            raise MemoryError("page links must be a list of slugs")
+        links = sorted(set(links) | set(WIKILINK.findall(body)))
+        if len(links) > 32:
+            raise MemoryError("a page may link to at most 32 other pages")
+        for cited in CLAIM_CITE.findall(body):
+            if cited not in refs:
+                raise MemoryError(f"page body cites [{cited}] but does not list it in claims")
+        for link in links:
+            if link == slug or link not in simulated_pages:
+                raise MemoryError(f"page links to {link!r}, which does not exist (write linked pages first)")
+        if slug not in simulated_pages and len(simulated_pages) >= MAX_PAGES:
+            raise MemoryError("page limit reached")
+        version = simulated_pages[slug]["version"] + 1 if slug in simulated_pages else 1
+        return {"slug": slug, "title": title.strip(), "body": body.strip(), "claims": refs, "links": links, "version": version}
+
+    def write_vault(self):
+        """Render the wiki as an Obsidian-style vault (deterministic; a view, never read back)."""
+        vault = self.store / VAULT_DIR
+        _no_symlink(vault)
+        vault.mkdir(mode=0o700, exist_ok=True)
+        claims = self.claims
+        backlinks = {}
+        for page in self.pages.values():
+            for link in page["links"]:
+                backlinks.setdefault(link, []).append(page["slug"])
+
+        def body_md(text, refs):
+            text = CLAIM_CITE.sub(lambda m: f"[[claims#{m.group(1)}|{m.group(1)}]]" if m.group(1) in refs else m.group(0), text)
+            return text
+
+        files = {}
+        for slug, page in sorted(self.pages.items()):
+            fm = ["---", f"title: {json.dumps(page['title'], ensure_ascii=False)}", f"version: {page['version']}",
+                  "claims: [" + ", ".join(page["claims"]) + "]", "tags: [somni]", "---", ""]
+            lines = fm + [f"# {page['title']}", "", body_md(page["body"], set(page["claims"])), ""]
+            if page["links"]:
+                lines += ["## See also", ""] + [f"- [[{l}|{self.pages[l]['title']}]]" for l in page["links"] if l in self.pages] + [""]
+            if backlinks.get(slug):
+                lines += ["## Backlinks", ""] + [f"- [[{b}|{self.pages[b]['title']}]]" for b in sorted(backlinks[slug])] + [""]
+            lines += ["## Evidence", ""]
+            for ref in page["claims"]:
+                c = claims.get(ref)
+                state = "" if c and c["state"] == "active" else f" (**{c['state'] if c else 'missing'}**)"
+                lines.append(f"- [[claims#{ref}|{ref}]]{state}: {c['text'] if c else ''}")
+            files[f"{slug}.md"] = "\n".join(lines) + "\n"
+        index = ["---", "title: Index", "tags: [somni, index]", "---", "", "# Index", "",
+                 f"{len(self.pages)} pages, {sum(c['state'] == 'active' for c in claims.values())} active claims. "
+                 "Pages are written by dreaming; every statement traces to [[claims]] and from there to exact transcript quotes.", ""]
+        index += [f"- [[{slug}|{page['title']}]]" for slug, page in sorted(self.pages.items(), key=lambda kv: kv[1]["title"].casefold())]
+        files["index.md"] = "\n".join(index) + "\n"
+        transcript = {r["id"]: r for r in self.transcript}
+        cl = ["---", "title: Claims", "tags: [somni, claims]", "---", "", "# Claims", "",
+              "Each claim cites transcript records; `verified` means every cited record contains the quoted excerpt.", ""]
+        cited_by = {}
+        for slug, page in self.pages.items():
+            for ref in page["claims"]:
+                cited_by.setdefault(ref, []).append(slug)
+        for cid, c in sorted(claims.items()):
+            cl += [f"## {cid}", "", f"{c['text']}", "",
+                   f"- state: {c['state']}; status: {c['status']}; salience: {c['salience']}"]
+            if c.get("replaces"):
+                cl.append(f"- supersedes [[claims#{c['replaces']}|{c['replaces']}]]")
+            if cited_by.get(cid):
+                cl.append("- used by: " + ", ".join(f"[[{s}]]" for s in sorted(cited_by[cid])))
+            for ev in c["evidence"]:
+                rec = transcript.get(ev["ref"], {})
+                quote = ev.get("quote")
+                cl.append(f"- {ev['ref']} ({rec.get('source', '?')}): " + (f"> {quote}" if quote else f"{rec.get('text', '')[:200]}"))
+            cl.append("")
+        files["claims.md"] = "\n".join(cl) + "\n"
+        for existing in vault.glob("*.md"):
+            if existing.name not in files:
+                existing.unlink()
+        for name, text in files.items():
+            target = vault / name
+            if target.exists() and target.read_text(encoding="utf-8") == text:
+                continue
+            fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=vault)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.replace(tmp, target)
+        return sorted(files)
+
+    def stale_pages(self):
+        """Pages citing claims that are no longer active (input for gap-filling)."""
+        return {slug: [c for c in page["claims"] if self.claims[c]["state"] != "active"]
+                for slug, page in self.pages.items() if any(self.claims[c]["state"] != "active" for c in page["claims"])}
 
     @classmethod
     def _validate_claim(cls, claim, transcript, existing):
@@ -480,6 +633,7 @@ class SomniMemory:
                 raise MemoryError("dream pass limit reached; seal the bounded attempt")
             # Validate all operations against a simulation before appending any event.
             simulated = {key: dict(value) for key, value in self.claims.items()}
+            self._sim_pages = {key: dict(value) for key, value in self.pages.items()}
             prepared = []
             rejected = []
             next_claim = self.state["next_claim"]
@@ -494,6 +648,8 @@ class SomniMemory:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected)
         self.load()
+        if self.pages or os.path.isdir(self.store / VAULT_DIR):
+            self.write_vault()
         return self.dreams[-1]
 
     def _prepare_dream_op(self, operation, simulated, prepared, next_claim):
@@ -502,6 +658,32 @@ class SomniMemory:
         op = operation.get("op")
         if not isinstance(op, str):
             raise MemoryError("dream operation type is invalid")
+        if op == "page":
+            page = self._validate_page(operation, simulated, self._sim_pages)
+            prepared.append(("page", page))
+            self._sim_pages[page["slug"]] = page
+            return next_claim
+        if op == "promote":
+            if set(operation) != {"op", "claim_id", "salience"}:
+                raise MemoryError("promote needs exactly claim_id and salience")
+            claim_id, salience = operation["claim_id"], operation["salience"]
+            if claim_id not in simulated or simulated[claim_id]["state"] != "active":
+                raise MemoryError("promote targets an invalid or non-active claim")
+            if type(salience) is not int or not simulated[claim_id]["salience"] < salience <= 5:
+                raise MemoryError("promote must raise salience (up to 5)")
+            prepared.append(("promote", {"claim_id": claim_id, "salience": salience}))
+            simulated[claim_id]["salience"] = salience
+            return next_claim
+        if op == "drop_page":
+            if set(operation) != {"op", "slug", "reason"} or operation.get("slug") not in self._sim_pages:
+                raise MemoryError("drop_page needs an existing slug and a reason")
+            if not isinstance(operation["reason"], str) or not operation["reason"].strip():
+                raise MemoryError("drop_page needs a reason")
+            if any(operation["slug"] in p["links"] for k, p in self._sim_pages.items() if k != operation["slug"]):
+                raise MemoryError("other pages still link to this page; relink them first")
+            prepared.append(("drop_page", {"slug": operation["slug"], "reason": operation["reason"]}))
+            del self._sim_pages[operation["slug"]]
+            return next_claim
         if op in {"add", "correct"}:
             _require_claim_capacity(len(simulated), self._limit("max_claims"))
             allowed = {"op", "text", "status", "evidence", "salience", "links"}
@@ -542,6 +724,17 @@ class SomniMemory:
         return next_claim
 
     def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected):
+        wiki_events = []
+        wiki_seq, wiki_head = self.state.get("wiki_events", 0), self.state.get("wiki_head", ZERO_HASH)
+        for op, body in prepared:
+            if op in ("page", "drop_page"):
+                wiki_seq += 1
+                event = {"schema": SCHEMA, "seq": wiki_seq, "op": op, "prev_sha256": wiki_head,
+                         **({"page": body} if op == "page" else body)}
+                wiki_events.append(event)
+                wiki_head = sha(event)
+        page_ops = len(prepared) - len([1 for op, _ in prepared if op not in ("page", "drop_page")])
+        prepared = [(op, body) for op, body in prepared if op not in ("page", "drop_page")]
         note_events = []
         note_seq = self.state["note_events"]
         notes_head = self.state["notes_head"]
@@ -556,13 +749,26 @@ class SomniMemory:
                  "transcript_head": self.state["transcript_head"], "operation_count": len(prepared),
                  "proposal_sha256": sha(proposal_bytes), "input_bytes": len(proposal_bytes),
                  "input_tokens_estimate": token_estimate(proposal_bytes), "prev_sha256": self.state["dreams_head"]}
+        if wiki_events:
+            dream["page_operations"] = len(wiki_events)
+            dream["operation_count"] += page_ops
         if rejected:
             dream["rejected"] = rejected
         note_bytes = [_encode_log_record(event) for event in note_events]
         dream_bytes = _encode_log_record(dream)
         _preflight_append(self.store / "notes.jsonl", note_bytes)
         _preflight_append(self.store / "dreams.jsonl", [dream_bytes])
-        _append_encoded(self.store / "notes.jsonl", b"".join(note_bytes))
+        wiki_bytes = [_encode_log_record(event) for event in wiki_events]
+        if wiki_bytes:
+            wiki_path = self.store / "wiki.jsonl"
+            if not os.path.lexists(wiki_path):
+                os.close(os.open(wiki_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            _preflight_append(wiki_path, wiki_bytes)
+        if note_bytes:
+            _append_encoded(self.store / "notes.jsonl", b"".join(note_bytes))
+        if wiki_bytes:
+            _append_encoded(self.store / "wiki.jsonl", b"".join(wiki_bytes))
+            self.state["wiki_events"], self.state["wiki_head"] = wiki_seq, wiki_head
         _append_encoded(self.store / "dreams.jsonl", dream_bytes)
         self.state["note_events"] = note_seq
         self.state["notes_head"] = notes_head
@@ -588,24 +794,19 @@ class SomniMemory:
         if not active:
             return []
         docs = [_terms(claim["text"]) for claim in active]
-        q_terms = set(_terms(query))
-        avg = sum(len(d) for d in docs) / len(docs) or 1.0
-        df = {}
-        for d in docs:
-            for term in set(d):
-                df[term] = df.get(term, 0) + 1
-        scored = []
-        for claim, d in zip(active, docs):
-            score = 0.0
-            for term in q_terms:
-                tf = d.count(term)
-                if tf:
-                    idf = math.log(1 + (len(docs) - df[term] + 0.5) / (df[term] + 0.5))
-                    score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * len(d) / avg))
-            if score > 0:
-                scored.append((score * (1 + 0.1 * claim["salience"]), claim))
+        scored = [(score * (1 + 0.1 * claim["salience"]), claim) for score, claim in _bm25(docs, active, query)]
         scored.sort(key=lambda item: (-item[0], -item[1]["salience"], item[1]["id"]))
         return [{**claim, "score": round(score, 4)} for score, claim in scored[:limit]]
+
+    def recall_pages(self, query, limit=3):
+        """Rank wiki pages for ``query`` with BM25 over title and body (title counted twice)."""
+        if not isinstance(query, str) or not query.strip() or not 1 <= limit <= 50:
+            raise MemoryError("invalid recall query or limit")
+        pages = list(self.pages.values())
+        if not pages:
+            return []
+        docs = [_terms(f"{p['title']} {p['title']} {p['body']}") for p in pages]
+        return [{**page, "score": round(score, 4)} for score, page in _bm25(docs, pages, query)[:limit]]
 
     def inject(self, max_bytes=DEFAULT_INJECTION_BYTES):
         if type(max_bytes) is not int or not 256 <= max_bytes <= MAX_INJECTION_BYTES:
@@ -614,6 +815,12 @@ class SomniMemory:
                   "Claims are subject-authored interpretations, not guaranteed truths. "
                   "Use evidence IDs to inspect the immutable subject-visible transcript.\n")
         lines = [header]
+        for page in sorted(self.pages.values(), key=lambda p: p["slug"]):
+            line = f"- page `{page['slug']}`: {page['title']}\n"
+            if len(("".join(lines) + line).encode("utf-8")) > max_bytes // 2:
+                break
+            lines.append(line)
+        page_lines = len(lines) - 1
         active = [claim for claim in self.claims.values() if claim["state"] == "active"]
         active.sort(key=lambda claim: (-claim["salience"], claim["id"]))
         for claim in active:
@@ -622,10 +829,10 @@ class SomniMemory:
             if len(("".join(lines) + line).encode("utf-8")) > max_bytes:
                 break
             lines.append(line)
-        omitted = len(active) - (len(lines) - 1)
+        omitted = len(active) - (len(lines) - 1 - page_lines)
         if omitted:
             suffix = f"- … {omitted} additional active claims omitted; search/report on demand.\n"
-            while len(lines) > 1 and len(("".join(lines) + suffix).encode("utf-8")) > max_bytes:
+            while len(lines) > 1 + page_lines and len(("".join(lines) + suffix).encode("utf-8")) > max_bytes:
                 lines.pop()
                 omitted += 1
                 suffix = f"- … {omitted} additional active claims omitted; search/report on demand.\n"
@@ -646,6 +853,7 @@ class SomniMemory:
             "note_events": len(self.note_log), "active_claims": sum(c["state"] == "active" for c in self.claims.values()),
             "note_bytes": note_bytes, "note_tokens_estimate": token_estimate(b"x" * note_bytes),
             "dream_passes": len(self.dreams), "dream_input_bytes": dream_input,
+            "wiki_pages": len(self.pages), "wiki_links": sum(len(p["links"]) for p in self.pages.values()),
             "dream_input_tokens_estimate": sum(item["input_tokens_estimate"] for item in self.dreams),
             "local_memory_processing_usd": 0,
         }
@@ -669,6 +877,11 @@ class SomniMemory:
                 lines.append(f"  Retraction: {claim['retraction_reason']}")
         if not self.claims:
             lines.append("- No claims.")
+        if self.pages:
+            lines.extend(["", "## Wiki pages", ""])
+            for page in sorted(self.pages.values(), key=lambda p: p["slug"]):
+                lines.append(f"### {page['title']} (`{page['slug']}`, v{page['version']}; claims: {', '.join(page['claims'])})")
+                lines.extend(["", page["body"], ""])
         lines.extend(["", "## Evidence transcript", ""])
         for record in self.transcript:
             lines.append(f"- **{record['id']}** `{record['source']}` — {record['text']}")
@@ -682,8 +895,45 @@ _STOP = frozenset("""a an and are as at be by can do does for from has have if i
 that the their then this to was were when which while will with you your i me my we our they them""".split())
 
 
+def _bm25(docs, items, query):
+    q_terms = set(_terms(query))
+    avg = (sum(len(d) for d in docs) / len(docs)) or 1.0
+    df = {}
+    for d in docs:
+        for term in set(d):
+            df[term] = df.get(term, 0) + 1
+    scored = []
+    for item, d in zip(items, docs):
+        score = 0.0
+        for term in q_terms:
+            tf = d.count(term)
+            if tf:
+                idf = math.log(1 + (len(docs) - df[term] + 0.5) / (df[term] + 0.5))
+                score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * len(d) / avg))
+        if score > 0:
+            scored.append((score, item))
+    scored.sort(key=lambda x: -x[0])
+    return scored
+
+
+_SUFFIXES = ("ations", "ation", "ings", "ing", "edly", "ed", "ies", "es", "s")
+
+
+def _stem(term):
+    """Tiny suffix stripper so cancel/cancelled/cancellation(s) and refund/refunds/refunded match."""
+    for suffix in _SUFFIXES:
+        if term.endswith(suffix) and len(term) - len(suffix) >= 3:
+            term = term[: -len(suffix)] + ("y" if suffix == "ies" else "")
+            break
+    if len(term) > 3 and term[-1] == term[-2] and term[-1] not in "aeiouslz":
+        term = term[:-1]
+    if len(term) > 3 and term.endswith("ll"):
+        term = term[:-1]
+    return term
+
+
 def _terms(text):
-    return [t for t in re.findall(r"[a-z0-9]+", text.casefold()) if t not in _STOP and len(t) > 1]
+    return [_stem(t) for t in re.findall(r"[a-z0-9]+", text.casefold()) if t not in _STOP and len(t) > 1]
 
 
 LayeredMemory = SomniMemory  # backwards-compatible name

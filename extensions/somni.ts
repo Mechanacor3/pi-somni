@@ -17,6 +17,9 @@
  *     search), somni_note (add a cited claim while working).
  *   - /somni-dream [focus]: close the session, let the model propose a dream pass
  *     over recent transcript through the somni_dream tool, then reopen.
+ *   - /somni-wiki [goal]: dreaming that builds representations: the model gathers
+ *     claims not yet on any page into linked wiki pages ([[slug]] links, [nXXXXXX]
+ *     citations). The store renders a readable Obsidian vault in somni-v1/vault/.
  *   - session_shutdown: close the session.
  *
  * Testbed mode (SOMNI_RECORD=0): nothing is recorded automatically; a trusted driver
@@ -92,18 +95,21 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "somni_recall",
 		label: "Somni recall",
-		description: "Recall your memory claims most relevant to a query (each claim cites transcript evidence).",
+		description: "Recall the wiki pages and memory claims most relevant to a query (pages cite claims; claims cite transcript evidence).",
 		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
 		async execute(_id: string, params: { query: string; limit?: number }) {
 			const py = `import sys,json;sys.path.insert(0,${JSON.stringify(dirname(STORE_PY))});import store as s
-m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps(m.recall(sys.argv[3],int(sys.argv[4]))))`;
+m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps(m.recall_pages(sys.argv[3],int(sys.argv[4]))+m.recall(sys.argv[3],int(sys.argv[4]))))`;
 			const out = spawnSync(PYTHON, ["-I", "-c", py, state.workspace, SUBJECT, params.query.slice(0, 2000), String(params.limit ?? 5)], {
 				encoding: "utf8",
 				timeout: 60_000,
 			});
 			if (out.status !== 0) throw new Error(out.stderr.slice(-400));
-			const claims = JSON.parse(out.stdout) as { id: string; text: string; status: string; evidence: unknown[] }[];
-			return { content: asText(claims.map((c) => `${c.id} [${c.status}; ${c.evidence.length} cited] ${c.text}`).join("\n") || "no matching claims"), details: claims };
+			const hits = JSON.parse(out.stdout) as any[];
+			const lines = hits.slice(0, params.limit ?? 5).map((h) =>
+				h.slug ? `# ${h.title} (page ${h.slug})\n${h.body}` : `${h.id} [${h.status}; ${h.evidence.length} cited] ${h.text}`,
+			);
+			return { content: asText(lines.join("\n\n") || "no matching memory"), details: hits };
 		},
 	});
 	pi.registerTool({
@@ -138,8 +144,9 @@ m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps(m.recall(sys.ar
 		name: "somni_dream",
 		label: "Somni dream",
 		description:
-			"Only during /somni-dream: submit one consolidation pass as JSON text " +
-			'{"schema":1,"operations":[...]} with add/correct/retract operations. Invalid operations are rejected individually.',
+			"Only during /somni-dream or /somni-wiki: submit one consolidation pass as JSON text " +
+			'{"schema":1,"operations":[...]} with add/correct/retract/promote claim operations and page/drop_page wiki ' +
+			"operations. Invalid operations are rejected individually.",
 		parameters: Type.Object({ proposal_json: Type.String() }),
 		async execute(_id: string, params: { proposal_json: string }) {
 			if (!state.dreaming) throw new Error("dreaming is only allowed during /somni-dream");
@@ -167,6 +174,31 @@ m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps([{"id":r["id"],
 					recent.map((r: any) => `[${r.id}] (${r.source}) ${r.text}`).join("\n"),
 			);
 			// The dream turn runs after this handler returns; agent_settled reopens recording.
+		},
+	});
+
+	pi.registerCommand("somni-wiki", {
+		description: "Gather claims into linked wiki pages (dreaming that builds representations)",
+		handler: async (args: string) => {
+			const py = `import sys,json;sys.path.insert(0,${JSON.stringify(resolve(dirname(STORE_PY), ".."))})
+from somni import store as s
+from somni.dream import render_pages, _uncovered, PAGE_GUIDE
+m=s.SomniMemory(sys.argv[1],sys.argv[2]).load()
+u=_uncovered(m)[:120]
+print(json.dumps({"pages":render_pages(m),"claims":"\\n".join(f"[{c['id']}] {c['text']}" for c in u),"guide":PAGE_GUIDE,"n":len(u)}))`;
+			const info = JSON.parse(spawnSync(PYTHON, ["-I", "-c", py, state.workspace, SUBJECT], { encoding: "utf8" }).stdout || "{}");
+			if (!info.n) {
+				pi.sendMessage({ customType: "somni-wiki", content: "Every active claim is already on a wiki page.", display: true });
+				return;
+			}
+			setPhase("closed");
+			state.dreaming = true;
+			const goal = args?.trim() || "what will help in future sessions";
+			pi.sendUserMessage(
+				`Wiki pass. Goal: ${goal}. ${info.guide} Gather the claims below into pages and call somni_dream once with ` +
+					`page operations: {"op":"page","slug":"lowercase-hyphenated","title":...,"body":markdown citing [nXXXXXX] and ` +
+					`linking [[slug]],"claims":[...]}. Extend an existing page by reusing its slug.\n\n## Existing pages\n${info.pages}\n\n## Claims not yet on a page\n${info.claims}`,
+			);
 		},
 	});
 

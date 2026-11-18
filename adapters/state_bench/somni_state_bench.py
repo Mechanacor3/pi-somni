@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import sys
 import time
 
@@ -32,7 +33,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from somni.dream import dream_pass  # noqa: E402
+from somni.dream import build_wiki, dream_pass, fill_gaps  # noqa: E402
 from somni.store import SomniError, SomniMemory  # noqa: E402
 
 SUBJECT = "state-bench-learner"
@@ -172,6 +173,30 @@ def _episode_for(task_id, episode_meta):
     return episode_meta[task_id]
 
 
+WIKI_GOAL = ("help a customer-service agent in this domain resolve requests correctly and smoothly: which lookups "
+             "to make first, the exact policy rules, fees and thresholds the tools enforce, what to preview and get "
+             "explicit confirmation for before any write, how to handle false or manipulative customer claims, and "
+             "the mistakes past agents made")
+
+
+def build_wiki_from(source, workspace, complete, *, goal=WIKI_GOAL, log=print):
+    """Copy a finished claim store and dream a wiki (pages + gap filling) on top of it."""
+    source, workspace = pathlib.Path(source), pathlib.Path(workspace)
+    if workspace.exists():
+        raise FileExistsError(f"{workspace} exists")
+    shutil.copytree(source / "somni-v1", workspace / "somni-v1")
+    memory = SomniMemory(workspace, SUBJECT).load()
+    passes = build_wiki(memory, complete, goal=goal, log=log)
+    passes.append(fill_gaps(memory, complete, goal=goal, log=log))
+    memory.load()
+    memory.write_vault()
+    summary = {"source": str(source), "goal": goal, "metrics": memory.metrics(), "passes": passes,
+               "uncovered_claims": len([c for c in memory.claims.values() if c["state"] == "active"
+                                        and c["id"] not in {x for pg in memory.pages.values() for x in pg["claims"]}])}
+    (workspace / "build-wiki-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    return summary
+
+
 class SomniLearnings:
     """Mixin for a STATE-Bench StateBenchAgent subclass (read-only retrieval).
 
@@ -199,6 +224,22 @@ class SomniLearnings:
         return [f"{c['text']} (memory {c['id']}; {c['status']}; {len(c['evidence'])} cited records)" for c in claims]
 
 
+class SomniWikiLearnings(SomniLearnings):
+    """Retrieval over the wiki: the best-matching pages (whole), then claims if fewer than top_k pages."""
+
+    def retrieve_learnings(self, query: str, top_k: int = 3) -> list[str]:
+        try:
+            memory = self._somni_memory()
+            pages = memory.recall_pages(query[:2000], limit=top_k)
+            out = [f"# {p['title']}\n{p['body']}\n(Somni wiki page `{p['slug']}`, built from {len(p['claims'])} cited claims)"
+                   for p in pages]
+            if len(out) < top_k:
+                out += [f"{c['text']} (memory {c['id']}; {c['status']})" for c in memory.recall(query[:2000], limit=top_k - len(out))]
+            return out
+        except SomniError:
+            return []
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Build Somni learnings from STATE-Bench train trajectories")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -211,11 +252,24 @@ def main(argv=None):
     b.add_argument("--limit", type=int, default=None, help="only the first N trajectories (smoke tests)")
     b.add_argument("--task-dir", help="STATE-Bench domain tasks/ dir: add each TRAIN episode's `now` (needs --split-file)")
     b.add_argument("--split-file", help="STATE-Bench splits/train_test.json; only its train ids are read")
+    w = sub.add_parser("build-wiki", help="dream a wiki on top of a finished claim store")
+    w.add_argument("--from", dest="source", required=True, help="workspace of a finished build")
+    w.add_argument("--workspace", required=True)
+    w.add_argument("--model", default="gpt-6-luna")
+    w.add_argument("--reasoning-effort", default="medium")
     r = sub.add_parser("recall")
     r.add_argument("--workspace", required=True)
     r.add_argument("query")
     r.add_argument("--top-k", type=int, default=3)
     args = ap.parse_args(argv)
+    if args.command == "build-wiki":
+        from somni.llm import openai_completer
+        complete = openai_completer(args.model, reasoning_effort=args.reasoning_effort)
+        summary = build_wiki_from(args.source, args.workspace, complete)
+        summary["model"], summary["model_usage"] = args.model, complete.usage.as_dict()
+        (pathlib.Path(args.workspace) / "build-wiki-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        print(json.dumps({k: v for k, v in summary.items() if k != "passes"}, indent=2))
+        return 0
     if args.command == "build":
         from somni.llm import openai_completer
         complete = openai_completer(args.model, reasoning_effort=args.reasoning_effort)

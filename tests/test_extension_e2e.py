@@ -23,6 +23,8 @@ PLANS = {
         {"op": "add", "text": "Bad quote is rejected.", "status": "verified", "salience": 2,
          "evidence": [{"ref": "t000002", "quote": "not in the record"}]}]})})]],
     "Anything else": [],
+    "Wiki pass.": [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
+        {"op": "page", "slug": "fees", "title": "Fees", "body": "Economy fees have a floor [n000001].", "claims": ["n000001"]}]})})]],
 }
 
 
@@ -69,6 +71,16 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(memory.dreams[0]["operation_count"], 1)
         self.assertEqual(memory.dreams[0]["rejected"][0]["index"], 1)
         self.assertEqual(memory.state["phase"], "open")
+        # /somni-wiki gathers uncovered claims into pages; the vault becomes readable markdown.
+        self.pi.prompt("/somni-wiki fees")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        memory = SomniMemory(store, "pi").load()
+        self.assertEqual(sorted(memory.pages), ["fees"])
+        vault = store / "somni-v1" / "vault"
+        self.assertIn("[[claims#n000001|n000001]]", (vault / "fees.md").read_text())
+        self.assertIn("[[fees|Fees]]", (vault / "index.md").read_text())
+        self.pi.prompt("Anything else I should know?")
+        self.assertIn("page `fees`", json.dumps(self.upstream.requests[-1]["messages"][-1]))
         tools = {t["function"]["name"] for t in self.upstream.requests[0]["tools"]}
         self.assertTrue({"somni_recall", "somni_search", "somni_note", "somni_dream", "lookup_fee"} <= tools)
         self.assertTrue(all("not-a-real-key" not in text_of(m.get("content")) for r in self.upstream.requests for m in r["messages"]))
