@@ -388,7 +388,7 @@ class SomniBriefingLearnings(SomniWikiLearnings):
             try:
                 add(input_tokens=after["input_tokens"] - before["input_tokens"],
                     output_tokens=after["output_tokens"] - before["output_tokens"], category="memory_retrieval")
-            except TypeError:
+            except (TypeError, AttributeError):  # usage reporting must never break retrieval
                 pass
         out = [f"# Memory briefing for this situation\n{text}"] if text else []
         out += [f"# {p['title']}\n{p['body']}\n(Somni wiki page `{p['slug']}`)" for p in pages[: max(0, top_k - len(out))]]
