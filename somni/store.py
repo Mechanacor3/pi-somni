@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Somni: bounded, agent-owned layered memory with offline "dreaming".
 
+Follows the hierarchy in "The components of agent memory" (L. Martin, Anthropic
+Engineering, 2026-11-06, https://www.anthropic.com/research/components-of-agent-memory).
+
 Layers (all under `<workspace>/somni-v1/`):
 
   transcript.jsonl  canonical, hash-chained, append-only record of what the agent

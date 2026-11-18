@@ -16,9 +16,10 @@ At the start of each run Somni injects a small, salience-ordered index of active
 (at most 8 KiB, never the whole transcript). Retrieval ranks claims for a query with a
 deterministic lexical (BM25) score weighted by salience.
 
-The design is inspired by the idea of separating raw episodic evidence from consolidated
-semantic memory. It is a small, auditable interpretation, not a reference implementation of
-any particular paper or product.
+The design follows Anthropic's engineering essay
+[*The components of agent memory*](https://www.anthropic.com/research/components-of-agent-memory)
+(see [Background and credits](#background-and-credits)). Somni is a small, independent
+interpretation of it, not Anthropic's implementation.
 
 ## Install
 
@@ -102,6 +103,33 @@ python3 -m unittest discover -s tests -t .
 # Pi end-to-end test (real Pi 1.0.0 in Docker against a scripted fake model):
 docker build -t pi-plugin-e2e:pi-1.0.0 tests/e2e && python3 -m unittest tests.test_extension_e2e
 ```
+
+## Background and credits
+
+Somni implements the memory hierarchy described by Lance Martin in
+[*The components of agent memory*](https://www.anthropic.com/research/components-of-agent-memory)
+(Anthropic Engineering, 6 November 2026), with Somni's equivalent of each layer:
+
+| Essay | Somni |
+|---|---|
+| Transcripts as a searchable event log at the base | `transcript.jsonl` and `somni_search` |
+| Memory notes written by the agent, which judges salience | Claims with salience 1–5 (`somni_note`) |
+| Richer representations that link notes (wikis) | Claim `links` and supersession lineage |
+| Small injected context loaded every session | The bounded salience-ordered index from `inject` |
+| "Dreaming": offline consolidation that corrects notes, builds representations and promotes notes | Dream passes (`dream`, `/somni-dream`) that add, correct and retract claims |
+
+What Somni adds:
+- **Checked evidence.** Every claim must cite transcript records, and `verified` claims must quote
+  them exactly, which the store checks. History is hash-chained and append-only.
+- **Hard size bounds** on every layer.
+- **Partial dream passes** that log their rejected operations.
+- **Deterministic recall.**
+
+These are our design choices, not claims about Anthropic's system. Nothing here is Anthropic
+code. Any errors are ours.
+
+Evaluation uses [STATE-Bench](https://github.com/microsoft/STATE-Bench) (MIT) and runs on
+[Pi](https://pi.dev).
 
 ## Results
 
