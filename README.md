@@ -71,37 +71,58 @@ The store also has a CLI: `python3 somni/store.py --workspace W --subject-id S
 
 ## Offline dreaming over trajectories
 
-`somni/dream.py` runs model-authored dream passes over any window of transcript. It takes any
+`somni/dream.py` holds the model-authored dreaming operations. Each takes any
 `complete(system, prompt) -> json_text` function; `somni/llm.py` supplies one for the OpenAI
-Responses API using only the standard library. Each pass records how many operations were
-accepted and why the others were rejected, so `dreams.jsonl` doubles as the learning trace.
+Responses API using only the standard library. Every pass records what it accepted and why the
+rest was rejected, so `dreams.jsonl` doubles as the learning trace.
+
+| Function | Essay operation | What it does |
+|---|---|---|
+| `dream_pass` | correct memory | Turns a transcript window into cited claims; can correct, retract or promote |
+| `build_wiki` | build new representations | Gathers claims not yet on a page into linked subject pages, until nearly all are covered |
+| `fill_gaps` | fill gaps, promote | Merges duplicate pages, repairs stale ones, writes an overview page, promotes key claims |
+| `refocus` + `rewrite_wiki` | focus on a goal | Reflects on recorded feedback, revises the wiki instructions, and rewrites pages under them |
+| `brief` | (reading the wiki) | At retrieval time, writes a short situation-specific briefing from the index and best pages |
 
 ### STATE-Bench Agent Learning Track
 
-`adapters/state_bench/somni_state_bench.py` records every
-[STATE-Bench](https://github.com/microsoft/STATE-Bench) train trajectory verbatim (user turns,
-assistant text, and one record per tool call). It then dreams over windows of three
-trajectories, runs a consolidation pass, and exposes `SomniLearnings.retrieve_learnings` for a
-`StateBenchAgent` subclass.
+`adapters/state_bench/somni_state_bench.py` has three subcommands:
+- **`build`** records every [STATE-Bench](https://github.com/microsoft/STATE-Bench) train
+  trajectory verbatim (user turns, assistant text, one record per tool call), then dreams over
+  windows of three trajectories.
+- **`build-wiki`** dreams a wiki on top of a finished claim store.
+- **`build-feedback`** refocuses the wiki on feedback from the agent's own scored **train**
+  episodes. Add `--balanced` to learn from successes and failures together; learning only from
+  failures made the agent over-cautious.
+
+The retrieval mixins for a `StateBenchAgent` subclass are:
+
+| Mixin | `retrieve_learnings` returns |
+|---|---|
+| `SomniLearnings` | top-k claims |
+| `SomniWikiLearnings` | top-k pages, then claims |
+| `SomniWikiSearchLearnings` | top pages plus a digest of the most similar past episode (wiki + search) |
+| `SomniLayeredLearnings` | the promoted, always-loaded index first, then content pages |
+| `SomniBriefingLearnings` | a model-written briefing for the situation, then the two best pages |
 
 ```bash
 OPENAI_API_KEY=... python3 -m adapters.state_bench.somni_state_bench build \
   --train-dir STATE-Bench/datasets/train_task_trajectories/travel --workspace learnings/somni/travel
+python3 -m adapters.state_bench.somni_state_bench build-wiki --from learnings/somni/travel --workspace learnings/wiki/travel
 ```
-
-STATE-Bench redacts "Today's date" in its shipped train trajectories, although an agent at work
-would see it. Add `--task-dir STATE-Bench/state_bench/domains/<domain>/tasks --split-file
-STATE-Bench/state_bench/domains/<domain>/splits/train_test.json` to restore each **train**
-episode's date (`now`) from its task file. Only ids in the official train split are read, and
-only the `now` field; a trajectory without train metadata is refused rather than guessed.
 
 ```python
 from state_bench.agents.state_bench import StateBenchAgent
-from adapters.state_bench.somni_state_bench import SomniLearnings
+from adapters.state_bench.somni_state_bench import SomniWikiSearchLearnings
 
-class SomniAgent(SomniLearnings, StateBenchAgent):
-    somni_root = "learnings/somni"        # <root>/<domain>/somni-v1
+class SomniAgent(SomniWikiSearchLearnings, StateBenchAgent):
+    somni_root = "learnings/wiki"          # <root>/<domain>/somni-v1
 ```
+
+STATE-Bench redacts "Today's date" in its shipped train trajectories. `build --task-dir
+STATE-Bench/state_bench/domains/<domain>/tasks --split-file .../splits/train_test.json` restores
+each **train** episode's date from its task file. It reads only ids in the train split, and only
+the `now` field.
 
 Results are in [Results](#results).
 
