@@ -112,6 +112,7 @@ class FeedbackTest(unittest.TestCase):
         self.assertIn("missed [must] Preview first -- reviewer: skipped", text)
         self.assertNotIn("Be polite", text)
         self.assertIn("final database state was wrong: fee wrong", text)
+        self.assertIn("15-turn limit", sb.feedback_text("8-y", {"task_completion_pass": 0, "turns": 15}))
 
     def test_refocus_returns_instructions_and_survives_refusal(self):
         from somni import dream as dm

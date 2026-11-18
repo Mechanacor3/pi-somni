@@ -202,9 +202,18 @@ FEEDBACK_FOCUS = ("mistakes: what the agent did wrong or failed to do according 
                   "should have done instead, and the general lesson (cite the FEEDBACK record and the transcript)")
 
 
+BALANCED_FOCUS = ("what decided the outcome, for successful and failed episodes alike (cite the FEEDBACK records and "
+                  "the transcript): what worked and should be repeated; what went wrong and what to do instead; and when "
+                  "caution helped versus when it stalled the task (for example the conversation ran out of turns, or the "
+                  "requested change was never made after the customer agreed)")
+MAX_TURNS = 15
+
+
 def feedback_text(task_id, scored):
     """One FEEDBACK observation from a scored trajectory: outcome plus each failed requirement."""
     lines = [f"FEEDBACK for episode {task_id}: outcome {'PASS' if scored.get('task_completion_pass') else 'FAIL'}."]
+    if (scored.get("turns") or 0) >= MAX_TURNS:
+        lines.append(f"- the conversation reached the {MAX_TURNS}-turn limit")
     for req in scored.get("task_requirements_details") or []:
         if not req.get("passed"):
             lines.append(f"- missed [{req.get('kind')}] {req.get('requirement', '')[:300]} -- reviewer: {str(req.get('reasoning', ''))[:300]}")
@@ -213,7 +222,7 @@ def feedback_text(task_id, scored):
     return _clip("\n".join(lines))
 
 
-def build_feedback_from(source, workspace, scored_dir, complete, *, goal=WIKI_GOAL, log=print):
+def build_feedback_from(source, workspace, scored_dir, complete, *, goal=WIKI_GOAL, log=print, balanced=False):
     """Focus memory on the goal using feedback from the agent's own scored TRAIN episodes.
 
     Records each scored train episode and its FEEDBACK into the transcript, dreams cited
@@ -226,7 +235,7 @@ def build_feedback_from(source, workspace, scored_dir, complete, *, goal=WIKI_GO
     shutil.copytree(source / "somni-v1", workspace / "somni-v1")
     memory = SomniMemory(workspace, SUBJECT).load()
     memory.set_phase("open")
-    failed, summary_lines = [], []
+    failed, passed, summary_lines = [], [], []
     for path in sorted(pathlib.Path(scored_dir).glob("*.json")):
         scored = json.loads(path.read_text())
         if scored.get("task_completion_pass") is None:
@@ -237,19 +246,32 @@ def build_feedback_from(source, workspace, scored_dir, complete, *, goal=WIKI_GO
         if not scored.get("task_completion_pass"):
             failed.append((path.stem, ids[0], ids[-1]))
             summary_lines.append(feedback_text(path.stem, scored))
+        else:
+            passed.append((path.stem, ids[0], ids[-1]))
     memory.set_phase("closed")
     memory.load()
     log(f"recorded {len(failed)} failed review episodes")
     by_id = {r["id"]: i for i, r in enumerate(memory.transcript)}
     passes = []
-    for start in range(0, len(failed), 2):
-        group = failed[start:start + 2]
-        window = memory.transcript[by_id[group[0][1]]: by_id[group[-1][2]] + 1]
-        trace = dream_pass(memory, window, complete, focus=FEEDBACK_FOCUS)
+    if balanced:  # one failed and one successful episode per window, so lessons are not one-sided
+        groups = [[f, p] for f, p in zip(failed, passed)] + [[f] for f in failed[len(passed):]]
+        focus = BALANCED_FOCUS
+    else:
+        groups = [failed[i:i + 2] for i in range(0, len(failed), 2)]
+        focus = FEEDBACK_FOCUS
+    for group in groups:
+        records = [r for name, a, b in group for r in memory.transcript[by_id[a]: by_id[b] + 1]]
+        trace = dream_pass(memory, records, complete, focus=focus)
         trace["review_episodes"] = [g[0] for g in group]
         passes.append(trace)
         memory.load()
-    instructions, reflect = refocus(memory, complete, goal=goal, failures="\n".join(summary_lines), log=log)
+    review = "\n".join(summary_lines)
+    if balanced:
+        stalled = sum("turn limit" in line for line in summary_lines)
+        review = (f"{len(passed)} episodes passed and {len(failed)} failed; {stalled} failures ran out of turns.\n"
+                  "Weigh both kinds of error: missing a required step, and over-caution that stalls or never completes "
+                  "the customer's agreed request. Keep what already works.\n\n" + review)
+    instructions, reflect = refocus(memory, complete, goal=goal, failures=review, log=log)
     passes.append(reflect)
     if instructions:
         passes.extend(rewrite_wiki(memory, complete, goal=goal, instructions=instructions, log=log))
@@ -257,7 +279,8 @@ def build_feedback_from(source, workspace, scored_dir, complete, *, goal=WIKI_GO
     passes.append(fill_gaps(memory, complete, goal=goal, log=log))
     memory.load()
     memory.write_vault()
-    summary = {"source": str(source), "scored_dir": str(scored_dir), "failed_episodes": len(failed), "goal": goal,
+    summary = {"source": str(source), "scored_dir": str(scored_dir), "failed_episodes": len(failed),
+               "passed_episodes": len(passed), "balanced": balanced, "goal": goal,
                "instructions": instructions, "metrics": memory.metrics(), "passes": passes}
     (workspace / "build-feedback-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     return summary
@@ -422,6 +445,7 @@ def main(argv=None):
     f.add_argument("--scored-dir", required=True, help="scored trajectories of TRAIN tasks only")
     f.add_argument("--model", default="gpt-6-luna")
     f.add_argument("--reasoning-effort", default="medium")
+    f.add_argument("--balanced", action="store_true", help="dream over failed and successful episodes together")
     r = sub.add_parser("recall")
     r.add_argument("--workspace", required=True)
     r.add_argument("query")
@@ -430,7 +454,7 @@ def main(argv=None):
     if args.command == "build-feedback":
         from somni.llm import openai_completer
         complete = openai_completer(args.model, reasoning_effort=args.reasoning_effort)
-        summary = build_feedback_from(args.source, args.workspace, args.scored_dir, complete)
+        summary = build_feedback_from(args.source, args.workspace, args.scored_dir, complete, balanced=args.balanced)
         summary["model"], summary["model_usage"] = args.model, complete.usage.as_dict()
         (pathlib.Path(args.workspace) / "build-feedback-trace.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
         print(json.dumps({k: v for k, v in summary.items() if k != "passes"}, indent=2))
