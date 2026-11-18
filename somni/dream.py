@@ -226,3 +226,19 @@ def rewrite_wiki(memory, complete, *, goal, instructions, max_passes=4, log=prin
         if not any(a.get("accepted") for a in trace["attempts"]):
             break
     return traces
+
+
+BRIEF_SYSTEM = ("You are the memory of an agent that is about to handle a live situation. From the memory pages "
+                "provided, write a short briefing for THIS situation only: the steps and checks in order, exact numbers "
+                "and thresholds that apply, what must be asked or confirmed (and what need not be), and traps to avoid. "
+                "Cite the page slug for each point, e.g. (returns-and-refunds). Use at most 250 words. If the pages "
+                "contain nothing relevant, say so in one sentence. Return JSON {\"briefing\": \"...\"}.")
+
+
+def brief(memory, query, complete, *, pages=4, index_bytes=2_000):
+    """Retrieval-time reading of the wiki: a situation-specific briefing (read-only)."""
+    candidates = [p for p in memory.recall_pages(query, limit=pages + 3) if p["claims"]][:pages]
+    index = memory.inject(index_bytes)
+    body = "\n\n".join(f"## {p['title']} ({p['slug']})\n{p['body']}" for p in candidates) or "(no pages)"
+    raw = complete(BRIEF_SYSTEM, f"SITUATION: {query}\n\n## Memory index\n{index}\n\n## Pages\n{body}")
+    return str(json.loads(raw).get("briefing", "")).strip(), candidates

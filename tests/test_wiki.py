@@ -180,6 +180,22 @@ class WikiDreamingTest(unittest.TestCase):
             self.assertIn("page `cancellations`", layered[0])
             self.assertTrue(layered[1].startswith("# Cancellations"))
             self.assertFalse(any(x.startswith("# Overview") for x in layered))  # navigation pages are skipped
+            class Briefed(sb.SomniBriefingLearnings):
+                somni_root = str(pathlib.Path(tmp) / "out")
+
+                class runtime_context:
+                    domain = "travel"
+            seen = []
+            def fake(system, prompt):
+                seen.append(prompt)
+                return '{"briefing": "Preview the fee first, then confirm (cancellations)."}'
+            fake.usage = type("U", (), {"as_dict": lambda self: {"calls": len(seen), "input_tokens": 10 * len(seen), "output_tokens": 5 * len(seen)}})()
+            sb.SomniBriefingLearnings._completer = fake
+            briefed = Briefed().retrieve_learnings("how to cancel and what fee", 3)
+            self.assertEqual(briefed[0], "# Memory briefing for this situation\nPreview the fee first, then confirm (cancellations).")
+            self.assertTrue(briefed[1].startswith("# Cancellations"))
+            self.assertIn("SITUATION: how to cancel", seen[0])
+            sb.SomniBriefingLearnings._completer = None
             m3 = SomniMemory(out, sb.SUBJECT).load()
             self.assertEqual(sb.episodes(m3), {})  # this toy store has no episode markers
             hits = SearchAgent().retrieve_learnings("how to cancel and what fee", 3)

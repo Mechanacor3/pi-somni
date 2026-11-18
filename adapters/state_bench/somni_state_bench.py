@@ -34,7 +34,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from somni.dream import build_wiki, dream_pass, fill_gaps, refocus, rewrite_wiki  # noqa: E402
+from somni.dream import brief, build_wiki, dream_pass, fill_gaps, refocus, rewrite_wiki  # noqa: E402
 from somni.store import SomniError, SomniMemory, _bm25, _terms  # noqa: E402
 
 SUBJECT = "state-bench-learner"
@@ -352,6 +352,47 @@ class SomniLayeredLearnings(SomniWikiLearnings):
             return out[:top_k]
         except SomniError:
             return []
+
+
+class SomniBriefingLearnings(SomniWikiLearnings):
+    """Read the wiki at retrieval time: a model writes a situation-specific briefing from the
+    best candidate pages and the promoted index; then the two best pages follow verbatim.
+
+    Read-only. Uses `$SOMNI_BRIEF_MODEL` (default gpt-6-luna) through the OpenAI Responses API;
+    token usage is reported to the agent as memory-retrieval usage when the host supports it.
+    """
+
+    brief_model = os.environ.get("SOMNI_BRIEF_MODEL", "gpt-6-luna")
+    _completer = None
+
+    def _complete(self):
+        if SomniBriefingLearnings._completer is None:
+            from somni.llm import openai_completer
+            SomniBriefingLearnings._completer = openai_completer(self.brief_model, reasoning_effort="low")
+        return SomniBriefingLearnings._completer
+
+    def retrieve_learnings(self, query: str, top_k: int = 3) -> list[str]:
+        try:
+            memory = self._somni_memory()
+        except SomniError:
+            return []
+        complete = self._complete()
+        before = complete.usage.as_dict()
+        try:
+            text, pages = brief(memory, query[:2000], complete)
+        except Exception:  # a failed model call falls back to plain page retrieval
+            return SomniWikiLearnings.retrieve_learnings(self, query, top_k)
+        after = complete.usage.as_dict()
+        add = getattr(self, "add_token_usage", None)
+        if callable(add):
+            try:
+                add(input_tokens=after["input_tokens"] - before["input_tokens"],
+                    output_tokens=after["output_tokens"] - before["output_tokens"], category="memory_retrieval")
+            except TypeError:
+                pass
+        out = [f"# Memory briefing for this situation\n{text}"] if text else []
+        out += [f"# {p['title']}\n{p['body']}\n(Somni wiki page `{p['slug']}`)" for p in pages[: max(0, top_k - len(out))]]
+        return out[:top_k]
 
 
 EPISODE = re.compile(r"^\[episode ([^\]]+)\] begins$")
