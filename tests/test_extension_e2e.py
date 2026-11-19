@@ -130,6 +130,32 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertFalse(recall.get("isError"), recall)
         self.assertIn("$50 floor", json.dumps(recall["result"]))
 
+    def test_wiki_pass_accepts_cycles_and_receives_custom_page_guide(self):
+        self.pi.close()
+        guide = "Describe terrain cues and where to aim."
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, {"SOMNI_PAGE_GUIDE": guide})
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        self.pi.prompt("Remember that for later.")
+        self.upstream.script = plan_script({"Wiki pass.": [[("somni_dream", {"proposal_json": json.dumps({
+            "schema": 1,
+            "operations": [
+                {"op": "page", "slug": "overview", "title": "Overview", "body": "See [[fees]].", "claims": []},
+                {"op": "page", "slug": "fees", "title": "Fees", "body": "Return to [[overview]].", "claims": ["n000001"]},
+            ],
+        })})]]})
+        self.pi.prompt("/somni-wiki")
+        self.pi.read(lambda event: event.get("type") == "agent_settled")
+        wiki_request = next(request for request in self.upstream.requests
+                            if any(text_of(message.get("content")).startswith("Wiki pass.") for message in request["messages"]))
+        prompt = text_of(next(message["content"] for message in wiki_request["messages"]
+                              if text_of(message.get("content")).startswith("Wiki pass.")))
+        self.assertIn(guide, prompt)
+        self.assertIn("can form cycles", prompt)
+        memory = SomniMemory(self.work / ".pi" / "somni", "pi").load()
+        self.assertEqual(memory.pages["overview"]["links"], ["fees"])
+        self.assertEqual(memory.pages["fees"]["links"], ["overview"])
+        self.assertEqual(memory.dreams[-1]["page_operations"], 2)
+
     def test_vision_records_text_and_bounded_tool_results_then_dreams_in_json_mode(self):
         self.pi.close()
         task = PiSession("extensions/somni.ts", self.work, self.upstream.port, {

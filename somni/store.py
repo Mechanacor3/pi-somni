@@ -14,7 +14,7 @@ Layers (all under `<workspace>/somni-v1/`):
   wiki.jsonl        pages that gather what is known about one subject (the essay's
                     "representations"): markdown written by dreaming, each citing the
                     active claims it rests on and linking (with [[slug]] wikilinks)
-                    only to pages that exist.
+                    only to pages that exist at the end of the pass.
   vault/            a readable Obsidian-style rendering of the wiki, regenerated after
                     every dream: one note per page with frontmatter and backlinks,
                     index.md, and claims.md with each claim's exact evidence quotes.
@@ -591,8 +591,8 @@ class SomniMemory:
                 raise MemoryError("unknown note event operation")
         return claims
 
-    @staticmethod
-    def _replay_wiki(events, claims):
+    @classmethod
+    def _replay_wiki(cls, events, claims):
         pages = {}
         for event in events:
             if event.get("op") == "page":
@@ -609,7 +609,18 @@ class SomniMemory:
                 del pages[event["slug"]]
             else:
                 raise MemoryError("unknown wiki event")
+        broken = next(cls._broken_wiki_links(pages), None)
+        if broken:
+            source, target = broken
+            raise MemoryError(f"wiki page {source!r} links to {target!r}, which does not exist")
         return pages
+
+    @staticmethod
+    def _broken_wiki_links(pages):
+        for slug, page in pages.items():
+            for target in page["links"]:
+                if target not in pages:
+                    yield slug, target
 
     @staticmethod
     def _validate_page(op, simulated_claims, simulated_pages):
@@ -633,16 +644,13 @@ class SomniMemory:
             if not isinstance(ref, str) or ref not in simulated_claims or simulated_claims[ref]["state"] != "active":
                 raise MemoryError(f"page cites {ref!r}, which is not an active claim")
         links = op.get("links", [])
-        if not isinstance(links, list) or not all(isinstance(x, str) for x in links):
+        if not isinstance(links, list) or not all(isinstance(x, str) and PAGE_SLUG.fullmatch(x) for x in links):
             raise MemoryError("page links must be a list of slugs")
         links = sorted(set(links) | set(WIKILINK.findall(body)))
         if len(links) > 32:
             raise MemoryError("a page may link to at most 32 other pages")
         if not refs and not links:
             raise MemoryError("a page must cite at least one claim, or link other pages (a navigation page)")
-        for link in links:
-            if link == slug or link not in simulated_pages:
-                raise MemoryError(f"page links to {link!r}, which does not exist (write linked pages first)")
         if slug not in simulated_pages and len(simulated_pages) >= MAX_PAGES:
             raise MemoryError("page limit reached")
         version = simulated_pages[slug]["version"] + 1 if slug in simulated_pages else 1
@@ -1013,19 +1021,7 @@ class SomniMemory:
                 raise MemoryError("dreaming is offline-only; close the subject session first")
             if self.state["dream_count"] >= MAX_DREAM_PASSES:
                 raise MemoryError("dream pass limit reached; seal the bounded attempt")
-            # Validate all operations against a simulation before appending any event.
-            simulated = {key: dict(value) for key, value in self.claims.items()}
-            self._sim_pages = {key: dict(value) for key, value in self.pages.items()}
-            prepared = []
-            rejected = []
-            next_claim = self.state["next_claim"]
-            for index, operation in enumerate(operations):
-                try:
-                    next_claim = self._prepare_dream_op(operation, simulated, prepared, next_claim, viewed_images)
-                except (MemoryError, OSError) as exc:
-                    if not partial or "claim limit reached" in str(exc):
-                        raise
-                    rejected.append({"index": index, "reason": str(exc)[:300]})
+            prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images)
             if not prepared and operations:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected)
@@ -1034,16 +1030,59 @@ class SomniMemory:
                 self.write_vault()
             return self.dreams[-1]
 
-    def _prepare_dream_op(self, operation, simulated, prepared, next_claim, viewed_images):
+    def _prepare_dream(self, operations, partial, viewed_images):
+        # Removing a broken wiki operation can expose another broken link or an
+        # earlier page version. Rebuild the simulation before checking again.
+        link_rejections = {}
+        while True:
+            simulated = {key: dict(value) for key, value in self.claims.items()}
+            pages = self.pages.copy()
+            page_changes = {}
+            prepared = []
+            rejected = link_rejections.copy()
+            next_claim = self.state["next_claim"]
+            for index, operation in enumerate(operations):
+                if index in rejected:
+                    continue
+                try:
+                    next_claim = self._prepare_dream_op(operation, simulated, pages, prepared, next_claim, viewed_images)
+                except (MemoryError, OSError) as exc:
+                    if not partial or "claim limit reached" in str(exc):
+                        raise
+                    rejected[index] = str(exc)[:300]
+                    continue
+                if operation["op"] in {"page", "drop_page"}:
+                    page_changes[operation["slug"]] = (index, operation["op"])
+
+            conflict = self._wiki_link_conflict(pages, page_changes)
+            if conflict is None:
+                return prepared, next_claim, [{"index": index, "reason": rejected[index]} for index in sorted(rejected)]
+            index, reason = conflict
+            if not partial:
+                raise MemoryError(reason)
+            link_rejections[index] = reason
+
+    def _wiki_link_conflict(self, pages, page_changes):
+        blocked_drop = None
+        for source, target in self._broken_wiki_links(pages):
+            drop_index, op = page_changes.get(target, (None, None))
+            if op != "drop_page":
+                return page_changes[source][0], f"page {source!r} links to {target!r}, which does not exist at the end of the pass"
+            # Resolve broken writes first. Removing one can make the drop valid.
+            if blocked_drop is None:
+                blocked_drop = drop_index, f"cannot drop {target!r}: page {source!r} would still link to it"
+        return blocked_drop
+
+    def _prepare_dream_op(self, operation, simulated, pages, prepared, next_claim, viewed_images):
         if not isinstance(operation, dict):
             raise MemoryError("dream operation must be an object")
         op = operation.get("op")
         if not isinstance(op, str):
             raise MemoryError("dream operation type is invalid")
         if op == "page":
-            page = self._validate_page(operation, simulated, self._sim_pages)
+            page = self._validate_page(operation, simulated, pages)
             prepared.append(("page", page))
-            self._sim_pages[page["slug"]] = page
+            pages[page["slug"]] = page
             return next_claim
         if op == "promote":
             if set(operation) != {"op", "claim_id", "salience"}:
@@ -1057,14 +1096,13 @@ class SomniMemory:
             simulated[claim_id]["salience"] = salience
             return next_claim
         if op == "drop_page":
-            if set(operation) != {"op", "slug", "reason"} or operation.get("slug") not in self._sim_pages:
+            slug = operation.get("slug")
+            if set(operation) != {"op", "slug", "reason"} or not isinstance(slug, str) or slug not in pages:
                 raise MemoryError("drop_page needs an existing slug and a reason")
             if not isinstance(operation["reason"], str) or not operation["reason"].strip():
                 raise MemoryError("drop_page needs a reason")
-            if any(operation["slug"] in p["links"] for k, p in self._sim_pages.items() if k != operation["slug"]):
-                raise MemoryError("other pages still link to this page; relink them first")
-            prepared.append(("drop_page", {"slug": operation["slug"], "reason": operation["reason"]}))
-            del self._sim_pages[operation["slug"]]
+            prepared.append(("drop_page", {"slug": slug, "reason": operation["reason"]}))
+            del pages[slug]
             return next_claim
         if op in {"add", "correct", "merge"}:
             _require_claim_capacity(len(simulated), self._limit("max_claims"))
@@ -1458,13 +1496,13 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         root = str(pathlib.Path(__file__).resolve().parent.parent)
         if root not in sys.path:
             sys.path.insert(0, root)
-        from somni.dream import PAGE_GUIDE, _uncovered, render_pages
+        from somni.dream import WIKI_LINK_GUIDE, _uncovered, page_guide, render_pages
 
         viewed.clear()
         memory.load()
         uncovered = _uncovered(memory)[:120]
         return {
-            "pages": render_pages(memory), "guide": PAGE_GUIDE, "n": len(uncovered),
+            "pages": render_pages(memory), "guide": f"{page_guide(args.get('page_guide'))} {WIKI_LINK_GUIDE}", "n": len(uncovered),
             "claims": "\n".join(f"[{claim['id']}] {claim['text']}" for claim in uncovered),
         }
     else:

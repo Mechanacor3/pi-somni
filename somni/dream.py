@@ -12,12 +12,16 @@ model gets one retry with the rejection reasons.
 from __future__ import annotations
 
 import json
+import os
 
 from .store import SomniError
 
 DEFAULT_FOCUS = ("durable lessons that would help in future, similar situations: rules the environment "
                  "enforced, required order of steps or tool calls, checks and confirmations that mattered, "
                  "thresholds and calculations, and common traps or failure modes")
+
+WIKI_LINK_GUIDE = ("Wiki links can point to pages created later in the same pass and can form cycles. "
+                   "Every link must resolve at the end of the pass.")
 
 SYSTEM = """You consolidate an agent's memory offline ("dreaming").
 
@@ -44,12 +48,13 @@ Rules the store enforces (violations are rejected):
 - merge synthesizes two or more distinct active claims with related guidance. The store inherits their
   evidence and keeps their provenance. Use a page when the claims are better kept as separate ideas.
 - Pages (wiki): a page gathers what is known about ONE subject. Its body is markdown that cites claims
-  inline as [n000004] (each cited ID must be in "claims", which must be active claims) and links other pages
-  as [[slug]] (the linked page must already exist or be written earlier in the same proposal).
-  Writing a page with an existing slug replaces it (new version). Drop a page only after no page links to it.
+  inline as [n000004] (each cited ID must be in "claims", which must be active claims) and links pages
+  as [[slug]]. """ + WIKI_LINK_GUIDE + """
+  Writing a page with an existing slug replaces it (new version). When dropping a page, remove or update
+  all links to it in the same pass.
 
-Write claims that generalize: no customer names, booking IDs, dates or one-off amounts unless the amount is a
-policy constant. One idea per claim, phrased as guidance ("Before X, do Y because Z."). Prefer correcting an
+Write claims that generalize. Omit names, identifiers and one-off details unless they matter in future
+situations. One idea per claim, phrased as guidance ("Before X, do Y because Z."). Prefer correcting an
 existing claim over adding a near-duplicate. Salience 5 = applies to most future situations; 1 = rare edge case.
 Return at most {max_ops} operations. Return only the JSON object."""
 
@@ -126,9 +131,16 @@ def dream_pass(memory, records, complete, *, focus=DEFAULT_FOCUS, max_ops=12, re
     return trace
 
 
-PAGE_GUIDE = ("Write each page as a practical playbook for one subject: when it applies, the checks and tool calls to "
-              "make and in what order, the exact policy numbers and thresholds, what must be confirmed with the person "
-              "before acting, and traps to avoid. Quote terms verbatim where the claims do. Keep each page under ~5 KB.")
+PAGE_GUIDE = ("Write a practical playbook for one subject. Explain when it applies, which steps and checks matter, "
+              "and how to avoid common mistakes. Include details the cited claims support and that help a future "
+              "agent act. Keep each page under about 5 KB.")
+
+
+def page_guide(override=None):
+    guide = os.environ.get("SOMNI_PAGE_GUIDE", "") if override is None else override
+    if not isinstance(guide, str):
+        raise SomniError("wiki page guide must be text")
+    return guide.strip() or PAGE_GUIDE
 
 
 def _uncovered(memory):
@@ -151,7 +163,7 @@ def build_wiki(memory, complete, *, goal, max_passes=8, pages_per_pass=6, log=pr
         if not uncovered or len(uncovered) <= max(2, active // 20):
             break
         claims = "\n".join(f"[{c['id']}] (salience {c['salience']}) {c['text']}" for c in uncovered[:120])
-        prompt = (f"GOAL for this memory: {goal}\n\nBUILD THE WIKI. {PAGE_GUIDE} Write or extend at most {pages_per_pass} pages "
+        prompt = (f"GOAL for this memory: {goal}\n\nBUILD THE WIKI. {page_guide()} Write or extend at most {pages_per_pass} pages "
                   f"so that the claims below are gathered under the subjects they belong to; extend an existing page (same slug) "
                   f"when it already covers the subject. Use only page and correct operations.\n\n"
                   f"## Existing pages\n{render_pages(memory)}\n\n## Claims not yet on any page\n{claims}\n")
@@ -169,9 +181,9 @@ def fill_gaps(memory, complete, *, goal, log=print):
     memory.load()
     stale = memory.stale_pages()
     top = sorted((c for c in memory.claims.values() if c["state"] == "active"), key=lambda c: (-c["salience"], c["id"]))[:40]
-    prompt = (f"GOAL for this memory: {goal}\n\nFILL GAPS AND TIDY THE WIKI. {PAGE_GUIDE}\n"
+    prompt = (f"GOAL for this memory: {goal}\n\nFILL GAPS AND TIDY THE WIKI. {page_guide()}\n"
               "1. Merge pages that cover the same subject: rewrite the better one with both pages' content and claims, "
-              "rewrite any page that links to the other, then drop_page it.\n"
+              "drop the redundant page and update any links to it in the same pass.\n"
               "2. Repair pages that cite claims which are no longer active (listed below): rewrite them on active claims.\n"
               "3. Write or update an `overview` page that links the main pages ([[slug]]) with one line on when to use each.\n"
               "4. Promote: for up to 5 claims that apply to most situations, use promote to raise their salience to 5.\n\n"
@@ -218,7 +230,7 @@ def rewrite_wiki(memory, complete, *, goal, instructions, max_passes=4, log=prin
         active = sorted((c for c in memory.claims.values() if c["state"] == "active"), key=lambda c: (-c["salience"], c["id"]))
         claims = "\n".join(f"[{c['id']}] (salience {c['salience']}) {c['text']}" for c in active[:160])
         prompt = (f"GOAL for this memory: {goal}\n\nREVISED INSTRUCTIONS (from reflecting on failures): {instructions}\n\n"
-                  f"REWRITE THE WIKI pass {number + 1}/{max_passes}. {PAGE_GUIDE} Rewrite the pages that the instructions "
+                  f"REWRITE THE WIKI pass {number + 1}/{max_passes}. {page_guide()} Rewrite the pages that the instructions "
                   "say are missing or misleading (reuse the slug to replace a page) and add pages for uncovered subjects. "
                   "At most 6 page operations.\n\n"
                   f"## Pages\n{render_pages(memory, body_chars=600)}\n\n## Active claims\n{claims}\n")

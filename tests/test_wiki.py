@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Wiki layer: page validation, wikilinks, provenance, stale pages, and the Obsidian vault view."""
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -31,7 +33,6 @@ class WikiTest(unittest.TestCase):
 
     def test_pages_cite_active_claims_and_links_must_resolve(self):
         dangling = self.page("cancellations", "See [[refunds]]. Preview first [n000001].", ["n000001"])
-        out = self.m.dream({"schema": 1, "operations": [dangling]}, partial=True) if False else None
         with self.assertRaisesRegex(SomniError, "does not exist"):
             self.m.dream({"schema": 1, "operations": [dangling]})
         with self.assertRaisesRegex(SomniError, "not an active claim"):
@@ -51,6 +52,53 @@ class WikiTest(unittest.TestCase):
         self.assertEqual(m.recall_pages("how do I cancel", 1)[0]["slug"], "cancellations")
         with self.assertRaisesRegex(SomniError, "still link"):
             m.dream({"schema": 1, "operations": [{"op": "drop_page", "slug": "consent", "reason": "merge"}]})
+
+    def test_forward_links_and_cycles_survive_reload_and_render_backlinks(self):
+        record = self.m.dream({"schema": 1, "operations": [
+            self.page("overview", "Start at [[consent]].", []),
+            self.page("consent", "See [[cancellations]] and [[overview]].", ["n000002"]),
+            self.page("cancellations", "Preview the fee [n000001], then follow [[consent]].", ["n000001"]),
+        ]})
+        self.assertEqual(record["page_operations"], 3)
+        pages = SomniMemory(self.ws, "s").load().pages
+        self.assertEqual(pages["overview"]["links"], ["consent"])
+        self.assertEqual(pages["consent"]["links"], ["cancellations", "overview"])
+        self.assertEqual(pages["cancellations"]["links"], ["consent"])
+        vault = self.ws / "somni-v1" / "vault"
+        self.assertIn("## Backlinks\n\n- [[consent|Consent]]", (vault / "overview.md").read_text())
+        self.assertIn("## See also\n\n- [[consent|Consent]]", (vault / "overview.md").read_text())
+
+    def test_drops_and_rewrites_use_final_links(self):
+        self.m.dream({"schema": 1, "operations": [
+            self.page("overview", "See [[consent]].", []),
+            self.page("consent", "See [[overview]].", ["n000002"]),
+        ]})
+        self.m.dream({"schema": 1, "operations": [
+            {"op": "drop_page", "slug": "consent", "reason": "incorporated into overview"},
+            self.page("overview", "Get an explicit yes [n000002].", ["n000002"]),
+        ]})
+        pages = SomniMemory(self.ws, "s").load().pages
+        self.assertEqual(list(pages), ["overview"])
+        self.assertEqual(pages["overview"]["version"], 2)
+        self.assertEqual(pages["overview"]["links"], [])
+
+    def test_partial_pass_rejects_broken_link_dependencies_and_keeps_valid_operations(self):
+        self.m.dream({"schema": 1, "operations": [
+            self.page("overview", "[[consent]]", []),
+            self.page("consent", "Get an explicit yes [n000002].", ["n000002"]),
+        ]})
+        record = self.m.dream({"schema": 1, "operations": [
+            {"op": "drop_page", "slug": "consent", "reason": "retire"},
+            self.page("start", "See [[next]].", []),
+            self.page("next", "See [[missing]].", []),
+            self.page("cancellations", "Preview costs [n000001].", ["n000001"]),
+        ]}, partial=True)
+        self.assertEqual(record["page_operations"], 1)
+        self.assertEqual([item["index"] for item in record["rejected"]], [0, 1, 2])
+        self.assertIn("would still link", record["rejected"][0]["reason"])
+        self.assertIn("'next'", record["rejected"][1]["reason"])
+        self.assertIn("'missing'", record["rejected"][2]["reason"])
+        self.assertEqual(set(SomniMemory(self.ws, "s").load().pages), {"overview", "consent", "cancellations"})
 
     def test_vault_is_readable_and_tracks_retractions(self):
         self.m.dream({"schema": 1, "operations": [
@@ -96,6 +144,25 @@ class WikiTest(unittest.TestCase):
 
 
 class WikiFeedbackTest(unittest.TestCase):
+    def test_page_guide_uses_neutral_default_and_can_be_overridden(self):
+        from somni import dream as dm
+        with tempfile.TemporaryDirectory() as tmp:
+            m = SomniMemory.create(pathlib.Path(tmp), "s", "l", "a")
+            calls = []
+
+            def complete(system, prompt):
+                calls.append((system, prompt))
+                return '{"schema":1,"operations":[]}'
+
+            with patch.dict(os.environ, {"SOMNI_PAGE_GUIDE": " "}):
+                dm.fill_gaps(m, complete, goal="g", log=lambda *_: None)
+            with patch.dict(os.environ, {"SOMNI_PAGE_GUIDE": "Describe terrain cues."}):
+                dm.fill_gaps(m, complete, goal="g", log=lambda *_: None)
+        self.assertIn("can form cycles", calls[0][0])
+        self.assertIn("steps and checks", calls[0][1])
+        self.assertNotIn("confirmed with the person", calls[0][1])
+        self.assertIn("Describe terrain cues.", calls[-1][1])
+
     def test_refocus_returns_instructions_and_survives_refusal(self):
         from somni import dream as dm
         with tempfile.TemporaryDirectory() as tmp:

@@ -67,6 +67,9 @@ In a session Somni records automatically, and adds these tools:
 
 Run `/somni-dream [focus]` to consolidate recent transcript into claims, and
 `/somni-wiki [goal]` to gather claims that are not yet on a page into linked wiki pages.
+Wiki links can point forward to pages created in the same pass and can form cycles.
+Every link must resolve when the pass ends, including after any page drops.
+Set `SOMNI_PAGE_GUIDE` to replace the default wiki-writing guidance for your domain.
 `/somni-dream` works as follows. Somni closes the
 recording session, asks the model for one pass, and reopens recording when the pass settles.
 Invalid operations (for example, a quote that does not match) are rejected one by one and
@@ -112,6 +115,7 @@ can be `null`. Claims inherit the union of run labels and tags from the records 
 | `SOMNI_PYTHON` | `python3` | Interpreter for the backend |
 | `SOMNI_RUN_LABEL` | unset | Optional label on each recorded event, up to 96 UTF-8 bytes |
 | `SOMNI_TAGS` | `[]` | JSON array of up to eight printable tags, each up to 96 UTF-8 bytes |
+| `SOMNI_PAGE_GUIDE` | domain-neutral playbook guidance | Optional replacement for the wiki-writing guide |
 | `SOMNI_TOOL_RESULT_BYTES` | `4096` | Tool result text budget in UTF-8 bytes, clamped to 512–8000 |
 | `SOMNI_DIGEST_TOOLS` | `stream_read` | Comma-separated tool names whose text output is recorded as a byte count and SHA-256 alongside their arguments. An empty value disables this policy |
 | `SOMNI_IMAGE_BYTES` | `262144` | Stored bytes per image, up to 2097152. Set to `0` to disable image capture |
@@ -184,7 +188,7 @@ The essay reports that a wiki combined with search beat either alone. Somni's re
 that: pages first, then claims.
 
 What Somni adds:
-- **No dangling links.** A link must point to a page that already exists. The essay lists links
+- **No dangling links.** Every link must resolve at the end of its pass. The essay lists links
   to not-yet-created pages as a failure mode.
 - **Checked evidence.** Every claim must cite transcript records, and `verified` claims must quote
   them exactly or cite a stored image, which the store checks. History is hash-chained and append-only.

@@ -324,7 +324,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("somni-wiki", {
 		description: "Gather claims into linked wiki pages (dreaming that builds representations)",
 		handler: (args, ctx) => submitCommand(ctx, async () => {
-			const info = await getBackend().request<{ pages: string; claims: string; guide: string; n: number }>("wiki");
+			const info = await getBackend().request<{ pages: string; claims: string; guide: string; n: number }>("wiki", {
+				page_guide: process.env.SOMNI_PAGE_GUIDE,
+			});
 			if (!info.n) {
 				pi.sendMessage({ customType: "somni-wiki", content: "Every active claim is already on a wiki page.", display: true });
 				return;

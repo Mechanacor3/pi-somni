@@ -8,6 +8,8 @@
 - [x] Verify writer recovery after `SIGKILL`. The next Pi session appended to the original transcript head using the existing lock file.
 - [x] Record assistant text before, between, and after tool calls. The one-shot transcript test verifies the order of text and tool results.
 - [x] Verify a read-only plugin install. The tests record into a separate store and render a wiki without altering the install.
+- [x] Validate forward and circular wiki links against the final page graph of a dream pass. Tests cover reload, backlinks, drops, and partial rejection of broken links.
+- [x] Use a domain-neutral wiki guide and support a per-run override. The Pi integration test checks that `SOMNI_PAGE_GUIDE` reaches the model.
 
 The [verification commands](../EVALUATION.md#verification-tests) run these cases against a scripted model. The packaged extension passed on Pi 1.0.0 and 1.5.2.
 
