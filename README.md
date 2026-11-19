@@ -86,7 +86,9 @@ to pause automatic recording. It can still inject and retrieve existing memory.
 
 One Pi process owns recording in a workspace at a time. A second Pi can use existing memory while
 the first owns the store. Close the second session and reopen it after the first exits to take over
-recording. Somni warns on recording errors, including a full store. To archive a full store, close
+recording. Pi starts one local Python child for the session and exchanges requests over private
+pipes. The child exits when the session closes. Somni warns on recording errors, including a full
+store. To archive a full store, close
 all Pi sessions using it, then move the directory named by `SOMNI_WORKSPACE` (by default
 `.pi/somni`) to a private location. The next Pi session creates a clean store. Stale wiki pages
 remain visible in the vault for repair while recall and the injected index skip them.

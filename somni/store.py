@@ -29,6 +29,7 @@ append only text the agent itself already saw or produced.
 """
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import fcntl
 import hashlib
 import json
@@ -275,10 +276,15 @@ class SomniMemory:
     def _locked(self):
         class Lock:
             def __enter__(inner):
-                fd = os.open(self.store / "memory.lock", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                path = self.store / "memory.lock"
+                if path.is_symlink() or not path.is_file():
+                    raise MemoryError("missing or unsafe store file: memory.lock")
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
                 try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise MemoryError("unsafe store file: memory.lock")
                     fcntl.flock(fd, fcntl.LOCK_EX)
-                except OSError:
+                except (OSError, MemoryError):
                     os.close(fd)
                     raise
                 inner.fd = fd
@@ -1015,8 +1021,9 @@ def _terms(text):
 LayeredMemory = SomniMemory  # backwards-compatible name
 
 
-def hold_session(memory):
-    """Acquire one writer for the Pi process holding our stdin open."""
+@contextmanager
+def _recording_lease(memory):
+    """The child keeps the writer lock until Pi closes its input pipe."""
     lease = memory.workspace / ".somni-session.lock"
     fd = os.open(lease, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
@@ -1024,18 +1031,90 @@ def hold_session(memory):
             raise MemoryError("the Somni session lock must be a regular file")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise MemoryError("another Pi session is recording in this Somni workspace") from exc
-        if not os.path.lexists(memory.store):
-            memory = SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
-        memory.set_phase("open", allow_same=True)
-        try:
-            print("ready", flush=True)
-            sys.stdin.buffer.read(1)
-        finally:
-            memory.set_phase("closed", allow_same=True)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
     finally:
         os.close(fd)
+
+
+def _handle_request(memory, method, args, *, writable):
+    if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable:
+        raise MemoryError("Somni memory changes require the session that owns recording")
+    if method == "phase":
+        memory.set_phase(args["phase"], allow_same=True)
+    elif method == "record":
+        index_bytes = args.get("index_bytes")
+        _validate_index_bound(index_bytes)
+        ref = memory.record(args["source"], args["text"])
+        return ref if index_bytes is None else memory.inject(index_bytes)
+    elif method == "note":
+        if len(canonical(args).encode("utf-8")) > MAX_INPUT_BYTES:
+            raise MemoryError("note input exceeds byte limit")
+        return memory.add_note(args["text"], args["status"], args["evidence"], args["salience"])
+    elif method == "dream":
+        return memory.dream(json.loads(args["proposal_json"]), partial=True)
+    elif method == "inject":
+        return memory.load().inject(args["index_bytes"])
+    elif method == "search":
+        return memory.load().search(args["query"], args["limit"])
+    elif method == "recall":
+        memory.load()
+        query, limit = args["query"], args["limit"]
+        return memory.recall_pages(query, limit) + memory.recall(query, limit)
+    elif method == "recent":
+        return [{"id": r["id"], "source": r["source"], "text": r["text"][:1500]}
+                for r in memory.load().transcript[-120:]]
+    elif method == "wiki":
+        # With python -I, explicitly add this package's root for the formatter.
+        root = str(pathlib.Path(__file__).resolve().parent.parent)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from somni.dream import PAGE_GUIDE, _uncovered, render_pages
+
+        memory.load()
+        uncovered = _uncovered(memory)[:120]
+        return {
+            "pages": render_pages(memory), "guide": PAGE_GUIDE, "n": len(uncovered),
+            "claims": "\n".join(f"[{claim['id']}] {claim['text']}" for claim in uncovered),
+        }
+    else:
+        raise MemoryError(f"unknown Somni backend method: {method}")
+
+
+def _serve(memory, record):
+    def reply(request_id, **fields):
+        print(json.dumps({"id": request_id, **fields}), flush=True)
+
+    with _recording_lease(memory) if record else nullcontext(None) as owner:
+        if owner is not False and not os.path.lexists(memory.store):
+            memory = SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
+        if owner:
+            memory.set_phase("open", allow_same=True)
+        else:
+            memory.load()
+        try:
+            reply(0, result={"writable": owner is not False})
+            while line := sys.stdin.buffer.readline(512 * 1024 + 1):
+                if len(line) > 512 * 1024:
+                    raise MemoryError("Somni backend request exceeds byte limit")
+                request_id = None
+                try:
+                    request = json.loads(line)
+                    request_id = request["id"]
+                    result = _handle_request(memory, request["method"], request["args"], writable=owner is not False)
+                    reply(request_id, result=result)
+                except (MemoryError, OSError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    reply(request_id, error=str(exc))
+        finally:
+            if owner:
+                memory.set_phase("closed", allow_same=True)
+
+
+def _validate_index_bound(bound):
+    if bound is not None and (type(bound) is not int or not 256 <= bound <= MAX_INJECTION_BYTES):
+        raise MemoryError(f"injection bound must be 256-{MAX_INJECTION_BYTES} bytes")
 
 
 def _input_json(memory, value):
@@ -1067,8 +1146,10 @@ def parser():
     commands = ap.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init"); init.add_argument("--lineage-id", required=True); init.add_argument("--attempt-id", required=True)
     commands.add_parser("session-open"); commands.add_parser("session-close")
-    commands.add_parser("session-hold", help=argparse.SUPPRESS)
+    serve = commands.add_parser("serve", help=argparse.SUPPRESS)
+    serve.add_argument("--record", action="store_true")
     record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES), required=True); record.add_argument("--text", required=True)
+    record.add_argument("--inject-max-bytes", type=int, help="emit the updated index instead of the record ID")
     note = commands.add_parser("note"); note.add_argument("--input", required=True, help="claim JSON relative to workspace, or - for stdin")
     dream = commands.add_parser("dream"); dream.add_argument("--input", required=True, help="proposal JSON relative to workspace, or - for stdin")
     search = commands.add_parser("search"); search.add_argument("query"); search.add_argument("--limit", type=int, default=20)
@@ -1085,14 +1166,20 @@ def main():
             print(f"LAYERED_MEMORY_INITIALIZED store={memory.store}")
             return 0
         memory = SomniMemory(args.workspace, args.subject_id)
-        if args.command == "session-hold":
-            hold_session(memory)
+        if args.command == "serve":
+            _serve(memory, args.record)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":
             memory.set_phase("closed"); print("LAYERED_MEMORY_SESSION_CLOSED")
         elif args.command == "record":
-            print(memory.record(args.source, args.text))
+            bound = args.inject_max_bytes
+            _validate_index_bound(bound)
+            record = memory.record(args.source, args.text)
+            if bound is None:
+                print(record)
+            else:
+                sys.stdout.write(memory.inject(bound))
         elif args.command == "note":
             claim = _input_json(memory, args.input)
             if not isinstance(claim, dict) or set(claim) - {"text", "status", "evidence", "salience", "links"}:

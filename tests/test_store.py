@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 
 import sys
+import contextlib
+import io
 import json
 import pathlib
+import select
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -51,6 +55,17 @@ class SomniStoreTest(unittest.TestCase):
         self.assertEqual(reloaded.record("agent_output", "Retried output."), "t000002")
         self.assertFalse((reloaded.store / ".transaction.json").exists())
 
+    def test_record_cli_can_return_the_index_without_recording_twice(self):
+        ref = self.open_with_evidence()
+        self.memory.add_note("Remember the harvest.", "uncertain", self.evidence(ref))
+        argv = ["store.py", "--workspace", str(self.workspace), "--subject-id", "subject-a",
+                "record", "--source", "ordinary_observation", "--text", "New event.",
+                "--inject-max-bytes", "4096"]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(layered.main(), 0)
+        self.assertEqual(output.getvalue(), self.memory.load().inject(4096))
+        self.assertEqual(self.memory.state["transcript_count"], 2)
+
     def test_committed_state_survives_interrupted_transaction_cleanup(self):
         self.open_with_evidence()
         with mock.patch.object(self.memory, "_clear_transaction", side_effect=OSError("interrupted")):
@@ -59,6 +74,23 @@ class SomniStoreTest(unittest.TestCase):
         reloaded = layered.SomniMemory(self.workspace, "subject-a").load()
         self.assertEqual(reloaded.transcript[-1]["text"], "Committed output.")
         self.assertFalse((reloaded.store / ".transaction.json").exists())
+
+    def test_backend_reacquires_recording_after_owner_is_killed(self):
+        cmd = [sys.executable, "-I", str(ROOT / "somni/store.py"), "--workspace", str(self.workspace),
+               "--subject-id", "subject-a", "serve", "--record"]
+        owner = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(select.select([owner.stdout], [], [], 10)[0], "backend did not report readiness")
+            self.assertTrue(json.loads(owner.stdout.readline())["result"]["writable"])
+        finally:
+            owner.kill()
+            owner.communicate(timeout=10)
+        self.assertEqual(self.memory.load().state["phase"], "open")
+        with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as replacement:
+            stdout, _ = replacement.communicate(input="", timeout=10)
+            self.assertEqual(replacement.returncode, 0)
+        self.assertTrue(json.loads(stdout)["result"]["writable"])
+        self.assertEqual(self.memory.load().state["phase"], "closed")
 
     def test_interrupted_dream_rolls_back_multiple_logs_and_a_partial_line(self):
         ref = self.open_with_evidence()
