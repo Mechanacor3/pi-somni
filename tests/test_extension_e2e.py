@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end: real Pi 1.0.0 + extensions/somni.ts + scripted fake model (Docker; skips otherwise)."""
+"""End-to-end: real Pi + extensions/somni.ts + scripted fake model."""
 import json
 import pathlib
 import sys
@@ -9,7 +9,7 @@ import unittest
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "e2e"))
 sys.path.insert(0, str(HERE.parent))
-from harness import FakeUpstream, PiSession, docker_ready, plan_script, text_of  # noqa: E402
+from harness import FakeUpstream, PiSession, pi_ready, plan_script, text_of  # noqa: E402
 from somni.store import SomniMemory  # noqa: E402
 
 PLANS = {
@@ -23,12 +23,13 @@ PLANS = {
         {"op": "add", "text": "Bad quote is rejected.", "status": "verified", "salience": 2,
          "evidence": [{"ref": "t000002", "quote": "not in the record"}]}]})})]],
     "Anything else": [],
+    "Recall the rule": [[("somni_recall", {"query": "cancellation fee", "limit": 1})]],
     "Wiki pass.": [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
         {"op": "page", "slug": "fees", "title": "Fees", "body": "Economy fees have a floor [n000001].", "claims": ["n000001"]}]})})]],
 }
 
 
-@unittest.skipUnless(docker_ready(), "needs docker and the e2e image (see tests/e2e/Dockerfile)")
+@unittest.skipUnless(pi_ready(), "set PI_PLUGIN_E2E_BINARY or build the Docker image in tests/e2e")
 class SomniPiEndToEnd(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -84,6 +85,34 @@ class SomniPiEndToEnd(unittest.TestCase):
         tools = {t["function"]["name"] for t in self.upstream.requests[0]["tools"]}
         self.assertTrue({"somni_recall", "somni_search", "somni_note", "somni_dream", "lookup_fee"} <= tools)
         self.assertTrue(all("not-a-real-key" not in text_of(m.get("content")) for r in self.upstream.requests for m in r["messages"]))
+
+    def test_second_pi_session_cannot_write_or_close_the_first(self):
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        store = self.work / ".pi" / "somni"
+        before = SomniMemory(store, "pi").load().state["transcript_count"]
+        other = PiSession("extensions/somni.ts", self.work, self.upstream.port)
+        try:
+            other.prompt("Remember that for later.")
+            warnings = [e.get("message", "") for e in other.events if e.get("method") == "notify"]
+            self.assertTrue(any("another Pi session is recording" in msg for msg in warnings), warnings)
+            self.assertTrue(next(e for e in other.tool_ends() if e["toolName"] == "somni_note")["isError"])
+        finally:
+            other.close()
+        self.assertEqual(SomniMemory(store, "pi").load().state["transcript_count"], before)
+        self.pi.prompt("Anything else I should know?")
+        self.assertGreater(SomniMemory(store, "pi").load().state["transcript_count"], before)
+
+    def test_recall_after_restart(self):
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        self.pi.prompt("Remember that for later.")
+        self.pi.close()
+        store = self.work / ".pi" / "somni"
+        self.assertEqual(SomniMemory(store, "pi").load().state["phase"], "closed")
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port)
+        self.pi.prompt("Recall the rule we saved.")
+        recall = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_recall")
+        self.assertFalse(recall.get("isError"), recall)
+        self.assertIn("$50 floor", json.dumps(recall["result"]))
 
 
 if __name__ == "__main__":

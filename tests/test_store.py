@@ -41,6 +41,51 @@ class SomniStoreTest(unittest.TestCase):
             for name in ("state.json", "notes.jsonl", "dreams.jsonl")
         )
 
+    def test_interrupted_append_recovers_the_last_committed_transcript(self):
+        first = self.open_with_evidence()
+        with mock.patch.object(self.memory, "_save_state", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.memory.record("agent_output", "Uncommitted output.")
+        reloaded = layered.SomniMemory(self.workspace, "subject-a").load()
+        self.assertEqual([entry["id"] for entry in reloaded.transcript], [first])
+        self.assertEqual(reloaded.record("agent_output", "Retried output."), "t000002")
+        self.assertFalse((reloaded.store / ".transaction.json").exists())
+
+    def test_committed_state_survives_interrupted_transaction_cleanup(self):
+        self.open_with_evidence()
+        with mock.patch.object(self.memory, "_clear_transaction", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.memory.record("agent_output", "Committed output.")
+        reloaded = layered.SomniMemory(self.workspace, "subject-a").load()
+        self.assertEqual(reloaded.transcript[-1]["text"], "Committed output.")
+        self.assertFalse((reloaded.store / ".transaction.json").exists())
+
+    def test_interrupted_dream_rolls_back_multiple_logs_and_a_partial_line(self):
+        ref = self.open_with_evidence()
+        self.memory.set_phase("closed")
+        proposal = {"schema": 1, "operations": [
+            {"op": "add", "text": "Check inventory.", "status": "uncertain",
+             "evidence": self.evidence(ref), "salience": 3},
+            {"op": "page", "slug": "inventory", "title": "Inventory", "body": "Check inventory [n000001].",
+             "claims": ["n000001"]},
+        ]}
+        before = self.lineage_bytes()
+        append = layered._append_encoded
+
+        def interrupt_wiki(path, encoded):
+            if path.name == "wiki.jsonl":
+                append(path, encoded[:10])
+                raise OSError("interrupted")
+            append(path, encoded)
+
+        with mock.patch.object(layered, "_append_encoded", side_effect=interrupt_wiki):
+            with self.assertRaises(OSError):
+                self.memory.dream(proposal)
+        reloaded = layered.SomniMemory(self.workspace, "subject-a").load()
+        self.assertEqual(self.lineage_bytes(), before)
+        self.assertEqual((reloaded.store / "wiki.jsonl").read_bytes(), b"")
+        self.assertEqual(reloaded.dream(proposal)["operation_count"], 2)
+
     def test_identity_scope_isolation_and_create_only(self):
         with self.assertRaises(layered.MemoryError):
             layered.LayeredMemory(self.workspace, "sibling-subject").load()

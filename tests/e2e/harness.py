@@ -3,13 +3,14 @@
 FakeUpstream serves OpenAI chat-completions SSE on 127.0.0.1.  `script(body, n)`
 returns {"text": ...} or {"tool_calls": [(name, args), ...]}.  PiSession starts
 Pi in RPC mode with only this plugin's extension and the fixture tool loaded,
-the workspace bind-mounted, and no credentials.  Requires Docker and the image
-built from tests/e2e/Dockerfile (tag below); tests skip otherwise.
+and no credentials. Use PI_PLUGIN_E2E_BINARY to run a local Pi executable,
+or use the Docker image built from tests/e2e/Dockerfile.
 """
 import json
 import os
 import pathlib
 import secrets
+import select
 import shutil
 import subprocess
 import threading
@@ -17,6 +18,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IMAGE = os.environ.get("PI_PLUGIN_E2E_IMAGE", "pi-plugin-e2e:pi-1.0.0")
+BINARY = os.environ.get("PI_PLUGIN_E2E_BINARY")
+PACKAGE = pathlib.Path(os.environ["PI_PLUGIN_E2E_PACKAGE"]).resolve() if "PI_PLUGIN_E2E_PACKAGE" in os.environ else None
 REPO = pathlib.Path(__file__).resolve().parents[2]
 E2E = pathlib.Path(__file__).resolve().parent
 
@@ -24,6 +27,10 @@ E2E = pathlib.Path(__file__).resolve().parent
 def docker_ready():
     return bool(shutil.which("docker")) and subprocess.run(
         ["docker", "image", "inspect", IMAGE], capture_output=True).returncode == 0
+
+
+def pi_ready():
+    return shutil.which(BINARY) is not None if BINARY else docker_ready()
 
 
 def text_of(content):
@@ -82,7 +89,8 @@ def plan_script(plans):
     """Reply by the last user message's prefix and how many assistant turns followed it."""
     def script(body, _index):
         messages = body["messages"]
-        users = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+        users = [i for i, m in enumerate(messages) if m.get("role") == "user"
+                 and not text_of(m.get("content")).lstrip().startswith("# Subject memory index")]
         last = users[-1]
         prompt = text_of(messages[last].get("content"))
         k = sum(1 for m in messages[last + 1:] if m.get("role") == "assistant")
@@ -98,6 +106,23 @@ class PiSession:
         self.name = f"pi-plugin-e2e-{secrets.token_hex(4)}"
         models = {"providers": {"fake": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
                                          "apiKey": "not-a-real-key", "models": [{"id": "m", "name": "fake"}]}}}
+        self.events, self.seq = [], 0
+        self.buffer = bytearray()
+        if BINARY:
+            profile = workspace / self.name
+            profile.mkdir()
+            (profile / "models.json").write_text(json.dumps(models))
+            (profile / "auth.json").write_text("{}")
+            local_env = {
+                "HOME": str(workspace), "PATH": os.environ["PATH"],
+                "PI_CODING_AGENT_DIR": str(profile), **(env or {}),
+            }
+            args = [shutil.which(BINARY), "--mode", "rpc", "--no-session", "--offline", "--no-approve", "--no-extensions",
+                    "--extension", str((PACKAGE or REPO) / extension), "--extension", str(E2E / "fixture.ts"),
+                    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--provider", "fake", "--model", "m"]
+            self.proc = subprocess.Popen(args, cwd=workspace, env=local_env, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return
         setup = (f"mkdir -p /tmp/agent && printf '%s' '{json.dumps(models)}' > /tmp/agent/models.json && "
                  "echo '{}' > /tmp/agent/auth.json && export PI_CODING_AGENT_DIR=/tmp/agent && "
                  "exec pi --mode rpc --no-session --offline --no-approve --no-extensions "
@@ -110,7 +135,6 @@ class PiSession:
             args += ["-e", f"{key}={value}"]
         self.proc = subprocess.Popen([*args, IMAGE, "sh", "-c", setup], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.events, self.seq = [], 0
 
     def send(self, command):
         self.seq += 1
@@ -120,11 +144,16 @@ class PiSession:
         return command["id"]
 
     def read(self, until, timeout=120):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise RuntimeError("pi exited: " + self.proc.stderr.read().decode()[-2000:])
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            while b"\n" not in self.buffer:
+                if not select.select([self.proc.stdout], [], [], max(0, deadline - time.monotonic()))[0]:
+                    raise TimeoutError("no matching pi record")
+                data = os.read(self.proc.stdout.fileno(), 65536)
+                if not data:
+                    raise RuntimeError("pi exited: " + self.proc.stderr.read().decode()[-2000:])
+                self.buffer.extend(data)
+            line, _, self.buffer = self.buffer.partition(b"\n")
             record = json.loads(line)
             self.events.append(record)
             if until(record):
@@ -144,11 +173,17 @@ class PiSession:
         return [e for e in self.events if e.get("type") == "tool_execution_end"]
 
     def close(self):
+        if self.proc.stdin.closed:
+            return
         try:
             self.proc.stdin.close()
             self.proc.wait(timeout=20)
         except Exception:
-            subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+            if BINARY:
+                self.proc.kill()
+                self.proc.wait()
+            else:
+                subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
         finally:
             self.proc.stdout.close()
             self.proc.stderr.close()

@@ -12,3 +12,26 @@ jobs:
           python-version: "3.12"
       - name: Unit tests (stdlib only; Docker e2e tests skip without the image)
         run: python -m unittest discover -s tests -t . -v
+  pi-client:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pi: ["1.0.0", "1.5.2"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test the packaged extension in Pi against the scripted model
+        env:
+          PI_VERSION: ${{ matrix.pi }}
+          PI_OFFLINE: "1"
+        run: |
+          npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@$PI_VERSION"
+          archive=$(npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP")
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          PI_PLUGIN_E2E_BINARY="$(command -v pi)" PI_PLUGIN_E2E_PACKAGE="$RUNNER_TEMP/package" \
+            python -m unittest tests.test_extension_e2e -v

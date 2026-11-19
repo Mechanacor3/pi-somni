@@ -30,9 +30,9 @@ The design follows Anthropic's engineering essay
 (see [Background and credits](#background-and-credits)). Somni is a small, independent
 interpretation of it, not Anthropic's implementation.
 
-**Measured:** on STATE-Bench, Somni (wiki + search) raised an agent's pooled task completion from
-57.6% to 62.2% (+4.7 points, +9.3 in travel) and improved judged conversation quality. See
-[Results](#results).
+**Measured with the Python STATE-Bench adapter:** the wiki + search condition scored an estimated
++4.7 percentage points in pooled task completion (95% interval −0.4 to +9.8) and +9.3 in travel.
+The native Pi client has a separate test suite. See [Results](#results).
 
 ## Install
 
@@ -46,6 +46,15 @@ pi -e git:github.com/Mechanacor3/pi-somni
 
 ## Use
 
+### Record, dream, and recall
+
+1. Start Pi in a project directory. For a first run, give it a harmless example such as “Our
+   sandbox smoke test uses port 8042. Remember this using evidence from this session.”
+2. Run `/somni-dream smoke test convention`, then `/somni-wiki project conventions`.
+   These commands make model calls. Review the resulting notes in `.pi/somni/somni-v1/vault/`.
+3. Start a fresh Pi session in the same directory and ask it to use `somni_recall` to find the
+   smoke test port. The index and matching claim or page come from the same on-disk store.
+
 In a session Somni records automatically, and adds these tools:
 
 | Tool | Purpose |
@@ -53,7 +62,7 @@ In a session Somni records automatically, and adds these tools:
 | `somni_recall` | Wiki pages, then claims, most relevant to a query |
 | `somni_search` | Exact phrase search over the transcript (to find evidence IDs) |
 | `somni_note` | Add a cited claim while working |
-| `somni_dream` | Submit a consolidation pass (only during `/somni-dream`) |
+| `somni_dream` | Submit a consolidation pass during `/somni-dream` or `/somni-wiki` |
 
 Run `/somni-dream [focus]` to consolidate recent transcript into claims, and
 `/somni-wiki [goal]` to gather claims that are not yet on a page into linked wiki pages.
@@ -69,6 +78,18 @@ listed in the pass record.
 | `SOMNI_INJECT_BYTES` | `4096` | Size of the injected index (256–8192) |
 | `SOMNI_SUBJECT` | `pi` | Identity bound into the store's manifest |
 | `SOMNI_PYTHON` | `python3` | Interpreter for the backend |
+
+The store holds user prompt text, text from non-Somni tool results, assistant text, and derived
+memory. The configured model can receive the bounded index, recalled content, and excerpts selected
+for dreaming. Keep the store out of version control. Set `SOMNI_RECORD=0` before launching Pi
+to pause automatic recording. It can still inject and retrieve existing memory.
+
+One Pi process owns recording in a workspace at a time. A second Pi can use existing memory while
+the first owns the store. Close the second session and reopen it after the first exits to take over
+recording. Somni warns on recording errors, including a full store. To archive a full store, close
+all Pi sessions using it, then move the directory named by `SOMNI_WORKSPACE` (by default
+`.pi/somni`) to a private location. The next Pi session creates a clean store. Stale wiki pages
+remain visible in the vault for repair while recall and the injected index skip them.
 
 The store also has a CLI: `python3 somni/store.py --workspace W --subject-id S
 {init,session-open,session-close,record,note,dream,search,inject,report,metrics}`.
@@ -142,7 +163,9 @@ Results are in [Results](#results).
 
 ```bash
 python3 -m unittest discover -s tests -t .
-# Pi end-to-end test (real Pi 1.0.0 in Docker against a scripted fake model):
+# Run the Pi client test using the local Pi executable and a scripted model:
+PI_PLUGIN_E2E_BINARY="$(command -v pi)" python3 -m unittest tests.test_extension_e2e -v
+# Or use the test image:
 docker build -t pi-plugin-e2e:pi-1.0.0 tests/e2e && python3 -m unittest tests.test_extension_e2e
 ```
 
@@ -184,7 +207,7 @@ Evaluation uses [STATE-Bench](https://github.com/microsoft/STATE-Bench) (MIT) an
 
 ## Results
 
-Evaluated on the [STATE-Bench](https://github.com/microsoft/STATE-Bench) Agent Learning Track
+The Python adapter was evaluated on the [STATE-Bench](https://github.com/microsoft/STATE-Bench) Agent Learning Track
 (v0.8.1, 50 held-out test tasks per domain, three runs per condition). Learnings were built from
 the shipped train trajectories only.
 

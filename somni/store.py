@@ -67,6 +67,12 @@ EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output"}
 STATUSES = {"verified", "uncertain"}
 FILES = ("manifest.json", "state.json", "transcript.jsonl", "notes.jsonl", "dreams.jsonl", "memory.lock")
+LOG_STATE = {
+    "transcript.jsonl": ("transcript_count", "transcript_head"),
+    "notes.jsonl": ("note_events", "notes_head"),
+    "dreams.jsonl": ("dream_count", "dreams_head"),
+    "wiki.jsonl": ("wiki_events", "wiki_head"),
+}
 
 
 class SomniError(ValueError):
@@ -152,9 +158,18 @@ def _atomic_json(path, value, *, create=False):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _sync_directory(path.parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _encode_log_record(value):
@@ -165,8 +180,10 @@ def _preflight_append(path, encoded_records):
     encoded_size = sum(len(encoded) for encoded in encoded_records)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
     try:
-        if os.fstat(fd).st_size + encoded_size > MAX_LOG_BYTES:
+        size = os.fstat(fd).st_size
+        if size + encoded_size > MAX_LOG_BYTES:
             raise MemoryError(f"{path.name} reached its {MAX_LOG_BYTES}-byte bound")
+        return size
     finally:
         os.close(fd)
 
@@ -198,8 +215,12 @@ def _read_json(path):
         raise MemoryError(f"invalid JSON file {path.name}: {exc}") from exc
 
 
-def _read_log(path):
+def _read_log(path, committed_size=None):
     data = _read_regular(path, limit=MAX_LOG_BYTES)
+    if committed_size is not None:
+        if committed_size > len(data) or (committed_size and data[committed_size - 1] != 10):
+            raise MemoryError(f"invalid transaction offset for {path.name}")
+        data = data[:committed_size]
     records = []
     for number, raw in enumerate(data.splitlines(), 1):
         try:
@@ -254,8 +275,12 @@ class SomniMemory:
     def _locked(self):
         class Lock:
             def __enter__(inner):
-                fd = os.open(self.store / "memory.lock", os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                fd = os.open(self.store / "memory.lock", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    os.close(fd)
+                    raise
                 inner.fd = fd
                 return inner
 
@@ -275,6 +300,10 @@ class SomniMemory:
         if not self.store.is_dir():
             raise MemoryError("somni memory is not initialized")
         _no_symlink(self.store)
+        with self._locked():
+            return self._load_locked()
+
+    def _load_locked(self):
         for name in FILES:
             path = self.store / name
             if not os.path.lexists(path) or path.is_symlink() or not path.is_file():
@@ -285,6 +314,9 @@ class SomniMemory:
         _validate_limits(manifest.get("limits") or {})
         self.manifest = manifest
         state = _read_json(self.store / "state.json")
+        journal = self.store / ".transaction.json"
+        if os.path.lexists(journal):
+            self._recover_transaction(journal, state)
         transcript = _read_log(self.store / "transcript.jsonl")
         notes = _read_log(self.store / "notes.jsonl")
         dreams = _read_log(self.store / "dreams.jsonl")
@@ -302,7 +334,40 @@ class SomniMemory:
         self.transcript, self.note_log, self.dreams, self.claims = transcript, notes, dreams, claims
         self.wiki_log = wiki
         self.pages = self._replay_wiki(wiki, claims)
+        if os.path.lexists(journal):
+            self._clear_transaction(journal)
         return self
+
+    def _recover_transaction(self, journal, state):
+        pending = _read_json(journal)
+        if not isinstance(pending, dict) or set(pending) != {"before", "after", "offsets"}:
+            raise MemoryError("invalid memory transaction")
+        offsets = pending["offsets"]
+        if not isinstance(offsets, dict) or not offsets or any(
+            name not in LOG_STATE or type(size) is not int or not 0 <= size <= MAX_LOG_BYTES
+            for name, size in offsets.items()
+        ):
+            raise MemoryError("invalid memory transaction offsets")
+        if state == pending["after"]:
+            return  # state commit succeeded; load verifies the new logs before cleanup
+        if state != pending["before"]:
+            raise MemoryError("memory transaction does not match state")
+        # Verify all committed prefixes before removing any interrupted append.
+        for name, size in offsets.items():
+            count, head = LOG_STATE[name]
+            prefix = _read_log(self.store / name, size)
+            self._check_chain(prefix, name, state.get(count, 0), state.get(head, ZERO_HASH))
+        for name, size in offsets.items():
+            fd = os.open(self.store / name, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.ftruncate(fd, size)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    def _clear_transaction(self, journal):
+        journal.unlink()
+        _sync_directory(self.store)
 
     @staticmethod
     def _check_chain(records, label, count, head):
@@ -535,12 +600,24 @@ class SomniMemory:
     def _save_state(self):
         _atomic_json(self.store / "state.json", self.state)
 
-    def set_phase(self, phase):
+    def _commit_logs(self, entries, next_state):
+        journal = self.store / ".transaction.json"
+        offsets = {name: _preflight_append(self.store / name, values) for name, values in entries.items()}
+        _atomic_json(journal, {"before": self.state, "after": next_state, "offsets": offsets})
+        for name, values in entries.items():
+            _append_encoded(self.store / name, b"".join(values))
+        self.state = next_state
+        self._save_state()
+        self._clear_transaction(journal)
+
+    def set_phase(self, phase, *, allow_same=False):
         if not isinstance(phase, str) or phase not in {"open", "closed"}:
             raise MemoryError("phase must be open or closed")
         with self._locked():
-            self.load()
+            self._load_locked()
             if self.state["phase"] == phase:
+                if allow_same:
+                    return
                 raise MemoryError(f"session is already {phase}")
             self.state["phase"] = phase
             self._save_state()
@@ -553,15 +630,15 @@ class SomniMemory:
         items = list(items)
         if not items:
             return []
-        max_bytes = None
         for source, text in items:
             if not isinstance(source, str) or source not in SOURCES:
                 raise MemoryError("invalid transcript source")
-            max_bytes = self._limit("max_record_bytes")
-            if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > max_bytes:
-                raise MemoryError("transcript text is empty or too large")
         with self._locked():
-            self.load()
+            self._load_locked()
+            max_bytes = self._limit("max_record_bytes")
+            if any(not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > max_bytes
+                   for _, text in items):
+                raise MemoryError("transcript text is empty or too large")
             if self.state["phase"] != "open":
                 raise MemoryError("recording requires an open subject session")
             if self.state["transcript_count"] + len(items) > self._limit("max_transcript_records"):
@@ -575,17 +652,15 @@ class SomniMemory:
                 encoded.append(_encode_log_record(record))
                 ids.append(record["id"])
                 records.append(record)
-            _preflight_append(self.store / "transcript.jsonl", encoded)
-            _append_encoded(self.store / "transcript.jsonl", b"".join(encoded))
-            self.state["transcript_count"] = seq
-            self.state["transcript_head"] = head
+            self._commit_logs({"transcript.jsonl": encoded}, {
+                **self.state, "transcript_count": seq, "transcript_head": head,
+            })
             self.transcript.extend(records)
-            self._save_state()
         return ids
 
     def add_note(self, text, status, evidence, salience=3, links=None):
         with self._locked():
-            self.load()
+            self._load_locked()
             if self.state["phase"] != "open":
                 raise MemoryError("agent notes require an open subject session")
             return self._append_claim(text, status, evidence, salience, links or [], None)
@@ -600,14 +675,13 @@ class SomniMemory:
         self._validate_claim(claim, self.transcript, self.claims)
         event = {"schema": SCHEMA, "seq": self.state["note_events"] + 1, "op": "add", "claim": claim,
                  "prev_sha256": self.state["notes_head"]}
-        _append(self.store / "notes.jsonl", event)
-        self.state["note_events"] += 1
-        self.state["notes_head"] = sha(event)
-        self.state["next_claim"] += 1
+        self._commit_logs({"notes.jsonl": [_encode_log_record(event)]}, {
+            **self.state, "note_events": event["seq"], "notes_head": sha(event),
+            "next_claim": self.state["next_claim"] + 1,
+        })
         self.claims[claim_id] = {**claim, "state": "active"}
         if replaces is not None:
             self.claims[replaces]["state"] = "superseded"
-        self._save_state()
         return claim_id
 
     def dream(self, proposal, partial=False):
@@ -628,7 +702,7 @@ class SomniMemory:
         if len(proposal_bytes) > MAX_INPUT_BYTES:
             raise MemoryError("dream proposal exceeds byte limit")
         with self._locked():
-            self.load()
+            self._load_locked()
             if self.state["phase"] != "closed":
                 raise MemoryError("dreaming is offline-only; close the subject session first")
             if self.state["dream_count"] >= MAX_DREAM_PASSES:
@@ -649,10 +723,10 @@ class SomniMemory:
             if not prepared:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected)
-        self.load()
-        if self.pages or os.path.isdir(self.store / VAULT_DIR):
-            self.write_vault()
-        return self.dreams[-1]
+            self._load_locked()
+            if self.pages or os.path.isdir(self.store / VAULT_DIR):
+                self.write_vault()
+            return self.dreams[-1]
 
     def _prepare_dream_op(self, operation, simulated, prepared, next_claim):
         if not isinstance(operation, dict):
@@ -757,27 +831,21 @@ class SomniMemory:
         if rejected:
             dream["rejected"] = rejected
         note_bytes = [_encode_log_record(event) for event in note_events]
-        dream_bytes = _encode_log_record(dream)
-        _preflight_append(self.store / "notes.jsonl", note_bytes)
-        _preflight_append(self.store / "dreams.jsonl", [dream_bytes])
         wiki_bytes = [_encode_log_record(event) for event in wiki_events]
+        entries = {}
+        if note_bytes:
+            entries["notes.jsonl"] = note_bytes
         if wiki_bytes:
             wiki_path = self.store / "wiki.jsonl"
             if not os.path.lexists(wiki_path):
                 os.close(os.open(wiki_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-            _preflight_append(wiki_path, wiki_bytes)
-        if note_bytes:
-            _append_encoded(self.store / "notes.jsonl", b"".join(note_bytes))
-        if wiki_bytes:
-            _append_encoded(self.store / "wiki.jsonl", b"".join(wiki_bytes))
-            self.state["wiki_events"], self.state["wiki_head"] = wiki_seq, wiki_head
-        _append_encoded(self.store / "dreams.jsonl", dream_bytes)
-        self.state["note_events"] = note_seq
-        self.state["notes_head"] = notes_head
-        self.state["next_claim"] = next_claim
-        self.state["dream_count"] = pass_number
-        self.state["dreams_head"] = sha(dream)
-        self._save_state()
+            entries["wiki.jsonl"] = wiki_bytes
+        entries["dreams.jsonl"] = [_encode_log_record(dream)]
+        self._commit_logs(entries, {
+            **self.state, "note_events": note_seq, "notes_head": notes_head, "next_claim": next_claim,
+            "dream_count": pass_number, "dreams_head": sha(dream),
+            **({"wiki_events": wiki_seq, "wiki_head": wiki_head} if wiki_bytes else {}),
+        })
 
     def search(self, query, limit=20):
         if not isinstance(query, str) or not query.strip() or len(query) > 256 or not 1 <= limit <= 50:
@@ -804,7 +872,8 @@ class SomniMemory:
         """Rank wiki pages for ``query`` with BM25 over title and body (title counted twice)."""
         if not isinstance(query, str) or not query.strip() or not 1 <= limit <= 50:
             raise MemoryError("invalid recall query or limit")
-        pages = list(self.pages.values())
+        stale = self.stale_pages()
+        pages = [page for slug, page in self.pages.items() if slug not in stale]
         if not pages:
             return []
         docs = [_terms(f"{p['title']} {p['title']} {p['body']}") for p in pages]
@@ -817,7 +886,10 @@ class SomniMemory:
                   "Claims are subject-authored interpretations, not guaranteed truths. "
                   "Use evidence IDs to inspect the immutable subject-visible transcript.\n")
         lines = [header]
-        for page in sorted(self.pages.values(), key=lambda p: p["slug"]):
+        stale = self.stale_pages()
+        for slug, page in sorted(self.pages.items()):
+            if slug in stale:
+                continue
             line = f"- page `{page['slug']}`: {page['title']}\n"
             if len(("".join(lines) + line).encode("utf-8")) > max_bytes // 2:
                 break
@@ -943,6 +1015,29 @@ def _terms(text):
 LayeredMemory = SomniMemory  # backwards-compatible name
 
 
+def hold_session(memory):
+    """Acquire one writer for the Pi process holding our stdin open."""
+    lease = memory.workspace / ".somni-session.lock"
+    fd = os.open(lease, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MemoryError("the Somni session lock must be a regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MemoryError("another Pi session is recording in this Somni workspace") from exc
+        if not os.path.lexists(memory.store):
+            memory = SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
+        memory.set_phase("open", allow_same=True)
+        try:
+            print("ready", flush=True)
+            sys.stdin.buffer.read(1)
+        finally:
+            memory.set_phase("closed", allow_same=True)
+    finally:
+        os.close(fd)
+
+
 def _input_json(memory, value):
     if value == "-":
         data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
@@ -972,6 +1067,7 @@ def parser():
     commands = ap.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init"); init.add_argument("--lineage-id", required=True); init.add_argument("--attempt-id", required=True)
     commands.add_parser("session-open"); commands.add_parser("session-close")
+    commands.add_parser("session-hold", help=argparse.SUPPRESS)
     record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES), required=True); record.add_argument("--text", required=True)
     note = commands.add_parser("note"); note.add_argument("--input", required=True, help="claim JSON relative to workspace, or - for stdin")
     dream = commands.add_parser("dream"); dream.add_argument("--input", required=True, help="proposal JSON relative to workspace, or - for stdin")
@@ -988,8 +1084,10 @@ def main():
             memory = SomniMemory.create(args.workspace, args.subject_id, args.lineage_id, args.attempt_id)
             print(f"LAYERED_MEMORY_INITIALIZED store={memory.store}")
             return 0
-        memory = SomniMemory(args.workspace, args.subject_id).load()
-        if args.command == "session-open":
+        memory = SomniMemory(args.workspace, args.subject_id)
+        if args.command == "session-hold":
+            hold_session(memory)
+        elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":
             memory.set_phase("closed"); print("LAYERED_MEMORY_SESSION_CLOSED")
@@ -1003,13 +1101,13 @@ def main():
         elif args.command == "dream":
             print(canonical(memory.dream(_input_json(memory, args.input))))
         elif args.command == "search":
-            print(json.dumps(memory.search(args.query, args.limit), ensure_ascii=False, indent=2, sort_keys=True))
+            print(json.dumps(memory.load().search(args.query, args.limit), ensure_ascii=False, indent=2, sort_keys=True))
         elif args.command == "inject":
-            sys.stdout.write(memory.inject(args.max_bytes))
+            sys.stdout.write(memory.load().inject(args.max_bytes))
         elif args.command == "report":
-            sys.stdout.write(memory.report())
+            sys.stdout.write(memory.load().report())
         elif args.command == "metrics":
-            print(json.dumps(memory.metrics(), indent=2, sort_keys=True))
+            print(json.dumps(memory.load().metrics(), indent=2, sort_keys=True))
         return 0
     except (MemoryError, OSError, KeyError) as exc:
         print(f"LAYERED_MEMORY_ERROR {exc}", file=sys.stderr)

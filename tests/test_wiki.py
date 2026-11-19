@@ -69,10 +69,26 @@ class WikiTest(unittest.TestCase):
         m.dream({"schema": 1, "operations": [{"op": "retract", "claim_id": "n000002", "reason": "test", "evidence": [{"ref": "t000002"}]}]})
         m = SomniMemory(self.ws, "s").load()
         self.assertEqual(m.stale_pages(), {"consent": ["n000002"]})
+        self.assertNotIn("consent", [p["slug"] for p in m.recall_pages("consent")])
+        self.assertNotIn("page `consent`", m.inject())
         self.assertIn("(**retracted**)", (vault / "consent.md").read_text())
         before = {p.name: p.read_text() for p in vault.glob("*.md")}
         m.write_vault()
         self.assertEqual(before, {p.name: p.read_text() for p in vault.glob("*.md")})
+
+    def test_corrected_page_can_be_recalled_after_repair(self):
+        self.m.dream({"schema": 1, "operations": [
+            self.page("cancellations", "Preview the fee first [n000001].", ["n000001"]),
+        ]})
+        self.m.dream({"schema": 1, "operations": [{
+            "op": "correct", "claim_id": "n000001", "text": "Check the actual fare rules.",
+            "status": "uncertain", "evidence": [{"ref": "t000001"}], "salience": 5,
+        }]})
+        self.assertEqual(self.m.recall_pages("cancellations"), [])
+        self.m.dream({"schema": 1, "operations": [
+            self.page("cancellations", "Check the actual fare rules [n000003].", ["n000003"]),
+        ]})
+        self.assertIn("n000003", self.m.recall_pages("cancellations")[0]["body"])
 
     def test_store_without_wiki_still_loads(self):
         self.assertFalse((self.ws / "somni-v1" / "wiki.jsonl").exists())

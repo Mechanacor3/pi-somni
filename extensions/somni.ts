@@ -27,8 +27,8 @@
  */
 
 import { Type } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { spawnSync } from "node:child_process";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,20 +42,82 @@ const INJECT_BYTES = Number(process.env.SOMNI_INJECT_BYTES ?? 4096);
 const MAX_RECORD_BYTES = 8000;
 const DREAM_WINDOW = 120;
 
-const state = { workspace: process.env.SOMNI_WORKSPACE ?? "", dreaming: false, ready: false };
+const backendEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", LC_ALL: "C.UTF-8" };
+const state = {
+	workspace: "", dreaming: false, ready: false,
+	lease: undefined as ChildProcessWithoutNullStreams | undefined,
+	recordWarning: false, indexWarning: false,
+};
 
-function run(args: string[], input = "") {
-	const out = spawnSync(PYTHON, ["-I", STORE_PY, "--workspace", state.workspace, "--subject-id", SUBJECT, ...args], {
+function storeArgs(args: string[]) {
+	return ["-I", STORE_PY, "--workspace", state.workspace, "--subject-id", SUBJECT, ...args];
+}
+
+function runPython(args: string[], input = "") {
+	const out = spawnSync(PYTHON, args, {
 		input,
 		encoding: "utf8",
 		timeout: 120_000,
 		maxBuffer: 8 * 1024 * 1024,
-		env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LC_ALL: "C.UTF-8" },
+		env: backendEnv,
 	});
 	if (out.error || out.status !== 0) {
 		throw new Error(`somni: ${out.error?.message ?? out.stderr?.trim().slice(-500) ?? out.status}`);
 	}
 	return out.stdout;
+}
+
+function run(args: string[], input = "") {
+	return runPython(storeArgs(args), input);
+}
+
+async function acquireRecording(ctx: ExtensionContext) {
+	const child = spawn(PYTHON, storeArgs(["session-hold"]), { env: backendEnv });
+	child.stdin.on("error", () => {}); // The helper may have already exited during shutdown.
+	let stderr = "";
+	child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-500); });
+	try {
+		await new Promise<void>((done, fail) => {
+			const timeout = setTimeout(() => failed(new Error("timed out opening the memory store")), 30_000);
+			const cleanup = () => {
+				clearTimeout(timeout);
+				child.stdout.off("data", read);
+				child.off("close", closed);
+				child.off("error", failed);
+			};
+			let stdout = "";
+			const read = (chunk: Buffer) => {
+				stdout += chunk.toString();
+				if (!stdout.includes("ready\n")) return;
+				cleanup();
+				state.lease = child;
+				done();
+			};
+			const closed = () => failed(new Error(stderr.trim() || "memory session helper exited"));
+			const failed = (error: Error) => {
+				cleanup();
+				fail(error);
+			};
+			child.stdout.on("data", read);
+			child.once("close", closed);
+			child.once("error", failed);
+		});
+		child.once("close", () => {
+			if (state.lease !== child) return;
+			state.lease = undefined;
+			state.dreaming = false;
+			ctx.ui.notify(`Somni recording stopped. ${stderr.trim() || "The session helper exited."}`, "warning");
+		});
+	} catch (error) {
+		child.kill();
+		ctx.ui.notify(`Somni opened without recording. ${(error as Error).message}`, "warning");
+	}
+}
+
+function requireWriteAccess() {
+	if (!state.ready || (RECORD && !state.lease)) {
+		throw new Error("Somni memory changes require the session that owns recording.");
+	}
 }
 
 function clip(text: string) {
@@ -64,12 +126,16 @@ function clip(text: string) {
 	return `${bytes.subarray(0, MAX_RECORD_BYTES - 32).toString("utf8")} …[truncated]`;
 }
 
-function record(source: "ordinary_observation" | "tool_result" | "agent_output", text: string) {
-	if (!RECORD || !state.ready || state.dreaming || !text.trim()) return;
+function record(source: "ordinary_observation" | "tool_result" | "agent_output", text: string, ctx: ExtensionContext) {
+	if (!RECORD || !state.lease || state.dreaming || !text.trim()) return;
 	try {
 		run(["record", "--source", source, "--text", clip(text)]);
-	} catch {
-		// Recording is best-effort; a full or closed store must not break the session.
+		state.recordWarning = false;
+	} catch (error) {
+		if (!state.recordWarning) {
+			state.recordWarning = true;
+			ctx.ui.notify(`Somni could not record an event. ${(error as Error).message}`, "warning");
+		}
 	}
 }
 
@@ -100,12 +166,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id: string, params: { query: string; limit?: number }) {
 			const py = `import sys,json;sys.path.insert(0,${JSON.stringify(dirname(STORE_PY))});import store as s
 m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps(m.recall_pages(sys.argv[3],int(sys.argv[4]))+m.recall(sys.argv[3],int(sys.argv[4]))))`;
-			const out = spawnSync(PYTHON, ["-I", "-c", py, state.workspace, SUBJECT, params.query.slice(0, 2000), String(params.limit ?? 5)], {
-				encoding: "utf8",
-				timeout: 60_000,
-			});
-			if (out.status !== 0) throw new Error(out.stderr.slice(-400));
-			const hits = JSON.parse(out.stdout) as any[];
+			const hits = JSON.parse(runPython(["-I", "-c", py, state.workspace, SUBJECT, params.query.slice(0, 2000), String(params.limit ?? 5)])) as any[];
 			const lines = hits.slice(0, params.limit ?? 5).map((h) =>
 				h.slug ? `# ${h.title} (page ${h.slug})\n${h.body}` : `${h.id} [${h.status}; ${h.evidence.length} cited] ${h.text}`,
 			);
@@ -135,6 +196,7 @@ m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps(m.recall_pages(
 			evidence: Type.Array(Type.Object({ ref: Type.String(), quote: Type.Optional(Type.String()) }), { minItems: 1, maxItems: 16 }),
 		}),
 		async execute(_id: string, params: any) {
+			requireWriteAccess();
 			const claim = { text: params.text, status: params.status, salience: params.salience ?? 3, evidence: params.evidence, links: [] };
 			const id = run(["note", "--input", "-"], JSON.stringify(claim)).trim();
 			return { content: asText(`saved ${id}`), details: { id } };
@@ -149,21 +211,22 @@ m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps(m.recall_pages(
 			"operations. Invalid operations are rejected individually.",
 		parameters: Type.Object({ proposal_json: Type.String() }),
 		async execute(_id: string, params: { proposal_json: string }) {
+			requireWriteAccess();
 			if (!state.dreaming) throw new Error("dreaming is only allowed during /somni-dream");
 			const py = `import sys,json;sys.path.insert(0,${JSON.stringify(dirname(STORE_PY))});import store as s
 m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps(m.dream(json.loads(sys.stdin.read()),partial=True)))`;
-			const out = spawnSync(PYTHON, ["-I", "-c", py, state.workspace, SUBJECT], { input: params.proposal_json, encoding: "utf8", timeout: 60_000 });
-			if (out.status !== 0) throw new Error(out.stderr.trim().split("\n").slice(-1)[0] ?? "dream refused");
-			return { content: asText(out.stdout), details: JSON.parse(out.stdout) };
+			const out = runPython(["-I", "-c", py, state.workspace, SUBJECT], params.proposal_json);
+			return { content: asText(out), details: JSON.parse(out) };
 		},
 	});
 
 	pi.registerCommand("somni-dream", {
 		description: "Consolidate recent transcript into cited memory claims (offline dreaming)",
 		handler: async (args: string) => {
+			requireWriteAccess();
 			const recent = JSON.parse(
-				spawnSync(PYTHON, ["-I", "-c", `import sys,json;sys.path.insert(0,${JSON.stringify(dirname(STORE_PY))});import store as s
-m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps([{"id":r["id"],"source":r["source"],"text":r["text"][:1500]} for r in m.transcript[-${DREAM_WINDOW}:]]))`, state.workspace, SUBJECT], { encoding: "utf8" }).stdout || "[]",
+				runPython(["-I", "-c", `import sys,json;sys.path.insert(0,${JSON.stringify(dirname(STORE_PY))});import store as s
+m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps([{"id":r["id"],"source":r["source"],"text":r["text"][:1500]} for r in m.transcript[-${DREAM_WINDOW}:]]))`, state.workspace, SUBJECT]),
 			);
 			setPhase("closed");
 			state.dreaming = true;
@@ -180,13 +243,14 @@ m=s.SomniMemory(sys.argv[1],sys.argv[2]).load();print(json.dumps([{"id":r["id"],
 	pi.registerCommand("somni-wiki", {
 		description: "Gather claims into linked wiki pages (dreaming that builds representations)",
 		handler: async (args: string) => {
+			requireWriteAccess();
 			const py = `import sys,json;sys.path.insert(0,${JSON.stringify(resolve(dirname(STORE_PY), ".."))})
 from somni import store as s
 from somni.dream import render_pages, _uncovered, PAGE_GUIDE
 m=s.SomniMemory(sys.argv[1],sys.argv[2]).load()
 u=_uncovered(m)[:120]
 print(json.dumps({"pages":render_pages(m),"claims":"\\n".join(f"[{c['id']}] {c['text']}" for c in u),"guide":PAGE_GUIDE,"n":len(u)}))`;
-			const info = JSON.parse(spawnSync(PYTHON, ["-I", "-c", py, state.workspace, SUBJECT], { encoding: "utf8" }).stdout || "{}");
+			const info = JSON.parse(runPython(["-I", "-c", py, state.workspace, SUBJECT]));
 			if (!info.n) {
 				pi.sendMessage({ customType: "somni-wiki", content: "Every active claim is already on a wiki page.", display: true });
 				return;
@@ -205,51 +269,63 @@ print(json.dumps({"pages":render_pages(m),"claims":"\\n".join(f"[{c['id']}] {c['
 	pi.on("agent_settled", async () => {
 		if (!state.dreaming) return;
 		state.dreaming = false;
-		if (RECORD) setPhase("open");
+		if (state.lease) setPhase("open");
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (!state.workspace) state.workspace = join(ctx.cwd, ".pi", "somni");
-		if (!existsSync(state.workspace)) mkdirSync(state.workspace, { recursive: true });
-		if (!existsSync(join(state.workspace, "somni-v1"))) run(["init", "--lineage-id", "pi", "--attempt-id", "session"]);
-		if (RECORD) setPhase("open");
-		state.ready = true;
+		state.workspace = process.env.SOMNI_WORKSPACE ?? join(ctx.cwd, ".pi", "somni");
+		state.ready = state.dreaming = state.recordWarning = state.indexWarning = false;
+		mkdirSync(state.workspace, { recursive: true });
+		if (RECORD) {
+			await acquireRecording(ctx);
+		} else if (!existsSync(join(state.workspace, "somni-v1"))) {
+			run(["init", "--lineage-id", "pi", "--attempt-id", "session"]);
+		}
+		state.ready = existsSync(join(state.workspace, "somni-v1", "state.json"));
 	});
 
 	pi.on("session_shutdown", async () => {
-		if (!state.ready || !RECORD) return;
-		try {
-			setPhase("closed");
-		} catch {
-			// already closed
-		}
+		const child = state.lease;
+		state.lease = undefined;
+		state.ready = state.dreaming = false;
+		if (!child) return;
+		await new Promise<void>((done) => {
+			const timeout = setTimeout(() => { child.kill(); done(); }, 5000);
+			child.once("close", () => { clearTimeout(timeout); done(); });
+			child.stdin.end();
+		});
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.ready || state.dreaming) return undefined;
-		record("ordinary_observation", `USER: ${event.prompt}`);
+		if (event.prompt) record("ordinary_observation", `USER: ${event.prompt}`, ctx);
 		let index = "";
 		try {
 			index = run(["inject", "--max-bytes", String(Math.min(Math.max(INJECT_BYTES, 256), 8192))]);
-		} catch {
+			state.indexWarning = false;
+		} catch (error) {
+			if (!state.indexWarning) {
+				state.indexWarning = true;
+				ctx.ui.notify(`Somni could not load its memory index. ${(error as Error).message}`, "warning");
+			}
 			return undefined;
 		}
-		if (!/- n\d{6}/.test(index)) return undefined; // no claims yet
+		if (!/^-(?: n\d{6} | page `)/m.test(index)) return undefined;
 		return { message: { customType: "somni-index", content: index, display: false } };
 	});
 
-	pi.on("tool_result", async (event) => {
+	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName.startsWith("somni_")) return undefined;
 		const body = textOf(event.content);
-		record("tool_result", `TOOL ${event.toolName}(${JSON.stringify(event.input ?? {}).slice(0, 1000)}) -> ${body}`);
+		record("tool_result", `TOOL ${event.toolName}(${JSON.stringify(event.input ?? {}).slice(0, 1000)}) -> ${body}`, ctx);
 		return undefined;
 	});
 
-	pi.on("message_end", async (event) => {
+	pi.on("message_end", async (event, ctx) => {
 		const message = event.message as any;
 		if (message?.role !== "assistant") return undefined;
 		const body = textOf(message.content);
-		if (body.trim()) record("agent_output", `AGENT: ${body}`);
+		if (body.trim()) record("agent_output", `AGENT: ${body}`, ctx);
 		return undefined;
 	});
 }
