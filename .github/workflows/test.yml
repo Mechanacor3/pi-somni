@@ -12,6 +12,8 @@ jobs:
           python-version: "3.12"
       - name: Unit tests (stdlib only; Docker e2e tests skip without the image)
         run: python -m unittest discover -s tests -t . -v
+      - name: STATE-Bench evaluation tests (synthetic trajectories)
+        run: python -m unittest discover -s evals/state_bench/tests -t . -v
   pi-client:
     runs-on: ubuntu-latest
     strategy:

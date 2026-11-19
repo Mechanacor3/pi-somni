@@ -1,6 +1,6 @@
 # pi-somni
 
-**Somni** is a memory plugin for the [Pi coding agent](https://pi.dev). It keeps three layers
+**Somni** is a memory plugin for the [Pi coding agent](https://pi.dev). It keeps three memory layers
 and consolidates them offline ("dreaming"):
 
 1. **Transcript**: a canonical, hash-chained, append-only record of what the agent saw
@@ -32,7 +32,7 @@ interpretation of it, not Anthropic's implementation.
 
 **Measured with the Python STATE-Bench adapter:** the wiki + search condition scored an estimated
 +4.7 percentage points in pooled task completion (95% interval −0.4 to +9.8) and +9.3 in travel.
-The native Pi client has a separate test suite. See [Results](#results).
+See [evaluation methods, results, and tests](EVALUATION.md) for the full comparison and replay.
 
 ## Install
 
@@ -96,62 +96,11 @@ remain visible in the vault for repair while recall and the injected index skip 
 The store also has a CLI: `python3 somni/store.py --workspace W --subject-id S
 {init,session-open,session-close,record,note,dream,search,inject,report,metrics}`.
 
-## Offline dreaming over trajectories
+## Dreaming internals
 
-`somni/dream.py` holds the model-authored dreaming operations. Each takes any
-`complete(system, prompt) -> json_text` function; `somni/llm.py` supplies one for the OpenAI
-Responses API using only the standard library. Every pass records what it accepted and why the
-rest was rejected, so `dreams.jsonl` doubles as the learning trace.
-
-| Function | Essay operation | What it does |
-|---|---|---|
-| `dream_pass` | correct memory | Turns a transcript window into cited claims; can correct, retract or promote |
-| `build_wiki` | build new representations | Gathers claims not yet on a page into linked subject pages, until nearly all are covered |
-| `fill_gaps` | fill gaps, promote | Merges duplicate pages, repairs stale ones, writes an overview page, promotes key claims |
-| `refocus` + `rewrite_wiki` | focus on a goal | Reflects on recorded feedback, revises the wiki instructions, and rewrites pages under them |
-| `brief` | (reading the wiki) | At retrieval time, writes a short situation-specific briefing from the index and best pages |
-
-### STATE-Bench Agent Learning Track
-
-`adapters/state_bench/somni_state_bench.py` has three subcommands:
-- **`build`** records every [STATE-Bench](https://github.com/microsoft/STATE-Bench) train
-  trajectory verbatim (user turns, assistant text, one record per tool call), then dreams over
-  windows of three trajectories.
-- **`build-wiki`** dreams a wiki on top of a finished claim store.
-- **`build-feedback`** refocuses the wiki on feedback from the agent's own scored **train**
-  episodes. Add `--balanced` to learn from successes and failures together; learning only from
-  failures made the agent over-cautious.
-
-The retrieval mixins for a `StateBenchAgent` subclass are:
-
-| Mixin | `retrieve_learnings` returns |
-|---|---|
-| `SomniLearnings` | top-k claims |
-| `SomniWikiLearnings` | top-k pages, then claims |
-| `SomniWikiSearchLearnings` | top pages plus a digest of the most similar past episode (wiki + search) |
-| `SomniLayeredLearnings` | the promoted, always-loaded index first, then content pages |
-| `SomniBriefingLearnings` | a model-written briefing for the situation, then the two best pages |
-
-```bash
-OPENAI_API_KEY=... python3 -m adapters.state_bench.somni_state_bench build \
-  --train-dir STATE-Bench/datasets/train_task_trajectories/travel --workspace learnings/somni/travel
-python3 -m adapters.state_bench.somni_state_bench build-wiki --from learnings/somni/travel --workspace learnings/wiki/travel
-```
-
-```python
-from state_bench.agents.state_bench import StateBenchAgent
-from adapters.state_bench.somni_state_bench import SomniWikiSearchLearnings
-
-class SomniAgent(SomniWikiSearchLearnings, StateBenchAgent):
-    somni_root = "learnings/wiki"          # <root>/<domain>/somni-v1
-```
-
-STATE-Bench redacts "Today's date" in its shipped train trajectories. `build --task-dir
-STATE-Bench/state_bench/domains/<domain>/tasks --split-file .../splits/train_test.json` restores
-each **train** episode's date from its task file. It reads only ids in the train split, and only
-the `now` field.
-
-Results are in [Results](#results).
+Somni's Python backend implements claim consolidation, wiki building, promotion, and
+gap filling. The commands in [Use](#use) apply these operations in Pi. For trajectory
+imports, build recipes, and benchmark details, see [Evaluation](EVALUATION.md).
 
 ## Safety notes
 
@@ -160,16 +109,6 @@ Results are in [Results](#results).
 - Record only what the agent itself saw or produced. Hash chains detect accidental or
   out-of-band edits on load; they are not signatures against an agent that owns the files.
 - `verified` means "the cited excerpts exist", not "the interpretation is true".
-
-## Tests
-
-```bash
-python3 -m unittest discover -s tests -t .
-# Run the Pi client test using the local Pi executable and a scripted model:
-PI_PLUGIN_E2E_BINARY="$(command -v pi)" python3 -m unittest tests.test_extension_e2e -v
-# Or use the test image:
-docker build -t pi-plugin-e2e:pi-1.0.0 tests/e2e && python3 -m unittest tests.test_extension_e2e
-```
 
 ## Background and credits
 
@@ -203,59 +142,6 @@ What Somni adds:
 
 These are our design choices, not claims about Anthropic's system. Nothing here is Anthropic
 code. Any errors are ours.
-
-Evaluation uses [STATE-Bench](https://github.com/microsoft/STATE-Bench) (MIT) and runs on
-[Pi](https://pi.dev).
-
-## Results
-
-The Python adapter was evaluated on the [STATE-Bench](https://github.com/microsoft/STATE-Bench) Agent Learning Track
-(v0.8.1, 50 held-out test tasks per domain, three runs per condition). Learnings were built from
-the shipped train trajectories only.
-
-`gpt-6-luna` played agent, user simulator and judge. That is **unofficial**: the protocol locks
-the simulator and judge to GPT-5.4, so compare these numbers with each other, not with the
-leaderboard. Δ is percentage points of pass@1 against the same agent without memory, paired by
-task, with 95% bootstrap intervals.
-
-| Configuration | Travel | Customer support | Shopping | Pooled |
-|---|---:|---:|---:|---:|
-| No memory (pass@1) | 56.7% | 62.7% | 53.3% | 57.6% |
-| **Somni wiki + search** (recommended) | **+9.3** [+1.3, +17.3] | +1.3 [−9.3, +12.0] | +3.3 [−4.0, +10.7] | **+4.7** [−0.4, +9.8] |
-| Somni claims only | +8.0 [−0.7, +16.7] | +1.3 [−8.0, +10.0] | +4.7 [−0.7, +10.7] | +4.7 [+0.2, +9.1] |
-| Somni wiki (pages only) | +6.7 | +1.3 | +3.3 | +3.8 |
-| Somni wiki refocused on train feedback | +4.0 | +3.3 | +2.7 | +3.3 |
-
-- **Completion:** the recommended setup raises pooled pass@1 from 57.6% to 62.2%. That's about
-  8% relative, and it fixes 11% of the baseline's failures. The gain is largest in travel, small
-  in shopping, and not detectable in customer support.
-- **Conversation quality:** the judge's 1–5 UX score improves in travel (+0.23 [+0.04, +0.45])
-  and customer support (+0.68 [+0.37, +0.99]). Claims-only memory gets about half of that.
-- **Cost:** about 2× the baseline's agent tokens per task, because whole pages are retrieved.
-  Claims only costs about 1.4×. The one-time build used about 130 model calls (≈1.5M tokens)
-  for all three domains.
-- **Not detected:** in customer support, memory made the agent better at the conversational
-  requirements (asking, confirming, explaining) but sometimes over-cautious. Its final-state
-  accuracy dropped slightly, so completion stayed flat.
-- **What didn't help:** recording the episode date. Dreaming only over failures also made the
-  agent over-cautious, consistent with the essay's warning about a "record only failures" rule.
-
-Full methodology, every condition tried, and per-run numbers:
-[`state-bench-eval/results`](https://github.com/Mechanacor3/state-bench-eval) (private).
-
-### Recommended setup
-
-1. **Build claims:** `build` over your trajectories, dreaming in windows of about three episodes.
-2. **Build the wiki:** `build-wiki` gathers the claims into linked pages, then `fill_gaps` merges
-   them, adds an overview and promotes key claims. Open `somni-v1/vault/` in Obsidian to review
-   what was learned.
-3. **Retrieve:** use `SomniWikiSearchLearnings`, which returns the two best pages plus the most
-   similar past case.
-4. **In Pi:** recording, `/somni-dream` and `/somni-wiki` do the same online. `somni_recall`
-   returns pages, then claims.
-
-`SomniLayeredLearnings`, `SomniBriefingLearnings` and `build-feedback --balanced` are
-implemented and tested, but were not fully evaluated: the evaluation budget ran out.
 
 ## License
 

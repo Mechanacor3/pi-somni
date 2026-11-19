@@ -8,7 +8,6 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from adapters.state_bench import somni_state_bench as sb  # noqa: E402
 from somni import dream as dm  # noqa: E402
 from somni.store import SomniError, SomniMemory  # noqa: E402
 
@@ -82,71 +81,6 @@ class FeatureTest(unittest.TestCase):
         self.assertIn("model_error", dm.dream_pass(self.memory.load(), self.memory.transcript, refuse)["attempts"][0])
         trace = dm.dream_pass(self.memory.load(), self.memory.transcript, lambda s, p: "not json")
         self.assertEqual(trace["attempts"][-1]["accepted"], 0)
-
-
-class StateBenchAdapterTest(unittest.TestCase):
-    CONVERSATION = [
-        {"role": "system", "content": "You are a travel agent."},
-        {"role": "user", "content": "Cancel BK-1."},
-        {"role": "assistant", "content": "Here is the preview.", "tool_calls": [
-            {"name": "cancel_booking", "arguments": {"booking_id": "BK-1", "confirm": False},
-             "result": {"status": "preview", "cancellation_fee": 50}}]},
-        {"role": "user", "content": "Yes, go ahead."},
-    ]
-
-    def test_trajectory_records_and_build_and_retrieve(self):
-        items = sb.trajectory_records("t1", self.CONVERSATION)
-        self.assertEqual([s for s, _ in items], ["ordinary_observation", "ordinary_observation", "ordinary_observation",
-                                                   "tool_result", "agent_output", "ordinary_observation", "ordinary_observation"])
-        self.assertIn('TOOL cancel_booking({"booking_id": "BK-1", "confirm": false})', items[3][1])
-        with tempfile.TemporaryDirectory() as tmp:
-            train = pathlib.Path(tmp) / "travel"
-            train.mkdir()
-            for i in range(2):
-                (train / f"{i + 1}-task.json").write_text(json.dumps({"conversation": self.CONVERSATION}))
-
-            def complete(system, prompt):
-                ref = prompt.split("[t", 1)[1][:6]
-                return json.dumps({"operations": [{"op": "add", "status": "uncertain", "salience": 5,
-                                                   "text": "Show the cancellation preview before confirming.",
-                                                   "evidence": [{"ref": "t" + ref}]}]})
-            summary = sb.build(train, pathlib.Path(tmp) / "out" / "travel", complete, per_pass=1, log=lambda *_: None)
-            self.assertEqual(summary["metrics"]["active_claims"], 2)
-
-            class Agent(sb.SomniLearnings):
-                somni_root = str(pathlib.Path(tmp) / "out")
-
-                class runtime_context:
-                    domain = "travel"
-            learnings = Agent().retrieve_learnings("cancellation preview", 3)
-            self.assertEqual(len(learnings), 2)
-            self.assertTrue(all(isinstance(x, str) and "preview" in x for x in learnings))
-            self.assertEqual(Agent().retrieve_learnings("unrelated words", 3), [])
-
-
-class EpisodeMetaTest(unittest.TestCase):
-    def make(self, tmp):
-        tasks = pathlib.Path(tmp) / "tasks"
-        tasks.mkdir()
-        for task_id, now in (("1-train", "2026-06-15T10:00:00"), ("2-test", "2026-07-01T09:00:00")):
-            (tasks / f"{task_id}.json").write_text(json.dumps({"task_id": task_id, "now": now, "task_summary": "secret"}))
-        split = pathlib.Path(tmp) / "split.json"
-        split.write_text(json.dumps({"splits": {"train": ["1-train"], "test": ["2-test"]}}))
-        return tasks, split
-
-    def test_only_train_ids_and_only_requested_fields_are_read(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tasks, split = self.make(tmp)
-            meta = sb.train_episode_meta(tasks, split)
-            self.assertEqual(meta, {"1-train": {"now": "2026-06-15T10:00:00"}})
-            self.assertEqual(sb._episode_for("1-train", meta), {"now": "2026-06-15T10:00:00"})
-            with self.assertRaisesRegex(ValueError, "refusing"):
-                sb._episode_for("2-test", meta)
-            self.assertIsNone(sb._episode_for("anything", None))
-
-    def test_now_is_recorded_as_an_observation(self):
-        items = sb.trajectory_records("t1", [{"role": "user", "content": "hi"}], {"now": "2026-06-15T10:00:00"})
-        self.assertEqual(items[1], ("ordinary_observation", "[episode t1] Today's date: 2026-06-15T10:00:00"))
 
 
 if __name__ == "__main__":

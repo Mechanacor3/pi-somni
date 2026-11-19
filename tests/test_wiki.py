@@ -95,41 +95,7 @@ class WikiTest(unittest.TestCase):
         self.assertEqual(SomniMemory(self.ws, "s").load().pages, {})
 
 
-class EpisodeSearchTest(unittest.TestCase):
-    def test_episode_digest_and_ranking(self):
-        sys.path.insert(0, str(ROOT))
-        from adapters.state_bench import somni_state_bench as sb
-        with tempfile.TemporaryDirectory() as tmp:
-            m = SomniMemory.create(pathlib.Path(tmp), sb.SUBJECT, "l", "a")
-            m.set_phase("open")
-            for tid, req, tool in (("1-cancel", "Cancel my flight BK-1", "cancel_booking"), ("2-bag", "Add a checked bag", "add_bag")):
-                m.record_many(sb.trajectory_records(tid, [{"role": "user", "content": req},
-                    {"role": "assistant", "content": "Done.", "tool_calls": [{"name": tool, "arguments": {"id": 1}, "result": {"ok": True}}]}]))
-            m.set_phase("closed")
-            m = m.load()
-            eps = sb.episodes(m)
-            self.assertEqual(sorted(eps), ["1-cancel", "2-bag"])
-            digest = sb.episode_digest("1-cancel", eps["1-cancel"])
-            self.assertIn("USER: Cancel my flight", digest)
-            self.assertIn('- cancel_booking({"id": 1})', digest)
-            self.assertIn("Final answer: Done.", digest)
-            docs = [sb._terms_for(" ".join(r["text"] for r in eps[k])) for k in eps]
-            self.assertEqual(sb._rank(list(eps), docs, "checked bag")[0], "2-bag")
-
-
-class FeedbackTest(unittest.TestCase):
-    def test_feedback_text_lists_missed_requirements(self):
-        sys.path.insert(0, str(ROOT))
-        from adapters.state_bench import somni_state_bench as sb
-        text = sb.feedback_text("7-x", {"task_completion_pass": 0, "state_requirements_met": 0, "state_requirements_reasoning": "fee wrong",
-                                        "task_requirements_details": [{"kind": "must", "requirement": "Preview first", "passed": False, "reasoning": "skipped"},
-                                                                      {"kind": "must", "requirement": "Be polite", "passed": True}]})
-        self.assertIn("outcome FAIL", text)
-        self.assertIn("missed [must] Preview first -- reviewer: skipped", text)
-        self.assertNotIn("Be polite", text)
-        self.assertIn("final database state was wrong: fee wrong", text)
-        self.assertIn("15-turn limit", sb.feedback_text("8-y", {"task_completion_pass": 0, "turns": 15}))
-
+class WikiFeedbackTest(unittest.TestCase):
     def test_refocus_returns_instructions_and_survives_refusal(self):
         from somni import dream as dm
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,84 +107,6 @@ class FeedbackTest(unittest.TestCase):
             ins, trace = dm.refocus(m, refuse, goal="g", failures="x", log=lambda *_: None)
             self.assertEqual(ins, "")
             self.assertIn("flagged", trace["error"])
-
-
-class WikiDreamingTest(unittest.TestCase):
-    def test_build_wiki_fill_gaps_and_page_retrieval(self):
-        sys.path.insert(0, str(ROOT))
-        from adapters.state_bench import somni_state_bench as sb
-        with tempfile.TemporaryDirectory() as tmp:
-            src = pathlib.Path(tmp) / "src"
-            src.mkdir()
-            m = SomniMemory.create(src, sb.SUBJECT, "l", "a")
-            m.set_phase("open")
-            m.record_many([("tool_result", f"TOOL cancel_booking -> fee {i}") for i in range(4)])
-            for i in range(4):
-                m.add_note(f"Cancellation rule {i}: preview the fee before cancelling.", "uncertain", [{"ref": f"t00000{i + 1}"}], 3)
-            m.set_phase("closed")
-            calls = []
-
-            def complete(system, prompt):
-                calls.append(prompt)
-                if "BUILD THE WIKI" in prompt:
-                    return '{"operations": [{"op": "page", "slug": "cancellations", "title": "Cancellations", "body": "Always preview the fee first [n000001]. Then confirm [n000002].", "claims": ["n000001", "n000002", "n000003", "n000004"]}]}'
-                return '{"operations": [{"op": "page", "slug": "overview", "title": "Overview", "body": "Start with [[cancellations]].", "claims": []}, {"op": "promote", "claim_id": "n000001", "salience": 5}]}'
-            out = pathlib.Path(tmp) / "out" / "travel"
-            summary = sb.build_wiki_from(src, out, complete, log=lambda *_: None)
-            self.assertEqual(summary["metrics"]["wiki_pages"], 2)
-            self.assertIn("GOAL for this memory", calls[0])
-            self.assertTrue((out / "somni-v1" / "vault" / "overview.md").exists())
-            m2 = SomniMemory(out, sb.SUBJECT).load()
-            self.assertEqual(m2.stale_pages(), {})  # promotion keeps the claim id, so pages stay valid
-            self.assertEqual(m2.claims["n000001"]["salience"], 5)
-            self.assertTrue(m2.inject(4096).index("page `cancellations`") < m2.inject(4096).index("n000001"))
-            self.assertFalse((src / "somni-v1" / "wiki.jsonl").exists())  # the source store is untouched
-
-            class Agent(sb.SomniWikiLearnings):
-                somni_root = str(pathlib.Path(tmp) / "out")
-
-                class runtime_context:
-                    domain = "travel"
-            got = Agent().retrieve_learnings("how to cancel and what fee", 3)
-
-            class SearchAgent(sb.SomniWikiSearchLearnings):
-                somni_root = str(pathlib.Path(tmp) / "out")
-
-                class runtime_context:
-                    domain = "travel"
-            class Layered(sb.SomniLayeredLearnings):
-                somni_root = str(pathlib.Path(tmp) / "out")
-
-                class runtime_context:
-                    domain = "travel"
-            layered = Layered().retrieve_learnings("how to cancel and what fee", 3)
-            self.assertTrue(layered[0].startswith("# Always-loaded memory"))
-            self.assertIn("page `cancellations`", layered[0])
-            self.assertTrue(layered[1].startswith("# Cancellations"))
-            self.assertFalse(any(x.startswith("# Overview") for x in layered))  # navigation pages are skipped
-            class Briefed(sb.SomniBriefingLearnings):
-                somni_root = str(pathlib.Path(tmp) / "out")
-
-                class runtime_context:
-                    domain = "travel"
-            seen = []
-            def fake(system, prompt):
-                seen.append(prompt)
-                return '{"briefing": "Preview the fee first, then confirm (cancellations)."}'
-            fake.usage = type("U", (), {"as_dict": lambda self: {"calls": len(seen), "input_tokens": 10 * len(seen), "output_tokens": 5 * len(seen)}})()
-            sb.SomniBriefingLearnings._completer = fake
-            briefed = Briefed().retrieve_learnings("how to cancel and what fee", 3)
-            self.assertEqual(briefed[0], "# Memory briefing for this situation\nPreview the fee first, then confirm (cancellations).")
-            self.assertTrue(briefed[1].startswith("# Cancellations"))
-            self.assertIn("SITUATION: how to cancel", seen[0])
-            sb.SomniBriefingLearnings._completer = None
-            m3 = SomniMemory(out, sb.SUBJECT).load()
-            self.assertEqual(sb.episodes(m3), {})  # this toy store has no episode markers
-            hits = SearchAgent().retrieve_learnings("how to cancel and what fee", 3)
-            self.assertTrue(hits[0].startswith("# Cancellations"))
-            self.assertLessEqual(len(hits), 3)
-            self.assertTrue(got[0].startswith("# Cancellations"))
-            self.assertEqual(len(got), 3)
 
 
 if __name__ == "__main__":
