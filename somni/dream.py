@@ -30,6 +30,7 @@ OP is one of:
   {"op": "add", "text": CLAIM, "status": "verified"|"uncertain", "salience": 1-5,
    "evidence": [{"ref": "t000123", "quote": "exact excerpt"}], "links": []}
   {"op": "correct", "claim_id": "n000004", "text": ..., "status": ..., "salience": ..., "evidence": [...], "links": []}
+  {"op": "merge", "claim_ids": ["n000004", "n000007"], "text": "Combined guidance", "status": "uncertain", "salience": 3}
   {"op": "retract", "claim_id": "n000004", "reason": "why it is wrong or redundant", "evidence": [{"ref": "t000123"}]}
   {"op": "page", "slug": "lowercase-hyphenated", "title": "...", "body": "markdown", "claims": ["n000004", ...]}
   {"op": "drop_page", "slug": "...", "reason": "merged into other-slug"}
@@ -40,6 +41,8 @@ Rules the store enforces (violations are rejected):
 - A quote must be copied EXACTLY (character for character) from the cited record. Keep quotes short (3-15 words).
 - "verified" needs a quote for every ref; use "uncertain" for interpretations you cannot quote directly.
 - links may only name existing claim IDs. correct/retract may only target active claims.
+- merge synthesizes two or more distinct active claims with related guidance. The store inherits their
+  evidence and keeps their provenance. Use a page when the claims are better kept as separate ideas.
 - Pages (wiki): a page gathers what is known about ONE subject. Its body is markdown that cites claims
   inline as [n000004] (each cited ID must be in "claims", which must be active claims) and links other pages
   as [[slug]] (the linked page must already exist or be written earlier in the same proposal).

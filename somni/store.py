@@ -30,6 +30,7 @@ append only text the agent itself already saw or produced.
 
 import argparse
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -40,6 +41,7 @@ import re
 import stat
 import sys
 import tempfile
+from time import monotonic
 
 
 STORE_DIR = "somni-v1"
@@ -68,6 +70,9 @@ EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output"}
 STATUSES = {"verified", "uncertain"}
 FILES = ("manifest.json", "state.json", "transcript.jsonl", "notes.jsonl", "dreams.jsonl", "memory.lock")
+VERIFIED_FILES = (*FILES, "wiki.jsonl", ".transaction.json")
+VERIFY_AFTER_ACCESSES = 128
+VERIFY_AFTER_SECONDS = 60
 LOG_STATE = {
     "transcript.jsonl": ("transcript_count", "transcript_head"),
     "notes.jsonl": ("note_events", "notes_head"),
@@ -78,6 +83,13 @@ LOG_STATE = {
 
 class SomniError(ValueError):
     pass
+
+
+@dataclass
+class _VerifiedStore:
+    files: dict
+    checked_at: float
+    accesses: int = 0
 
 
 MemoryError = SomniError  # backwards-compatible name
@@ -236,13 +248,15 @@ def _read_log(path, committed_size=None):
 
 
 class SomniMemory:
-    def __init__(self, workspace, subject_id):
+    def __init__(self, workspace, subject_id, *, scheduled_verification=False):
         raw = pathlib.Path(workspace)
         _no_symlink(raw)
         self.workspace = raw.resolve(strict=True)
         self.store = self.workspace / STORE_DIR
         _no_symlink(self.store)
         self.subject_id = _safe_id(subject_id, "subject id")
+        self._scheduled_verification = scheduled_verification
+        self._verified = None
 
     @classmethod
     def create(cls, workspace, subject_id, lineage_id, attempt_id, limits=None):
@@ -309,7 +323,40 @@ class SomniMemory:
         with self._locked():
             return self._load_locked()
 
-    def _load_locked(self):
+    def _fingerprints(self, names):
+        _no_symlink(self.store)
+        files = {}
+        for name in names:
+            try:
+                info = (self.store / name).lstat()
+            except FileNotFoundError:
+                files[name] = None
+            else:
+                files[name] = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        return files
+
+    def _load_locked(self, *, force=False):
+        if not self._scheduled_verification:
+            return self._verify_locked()
+        current = self._fingerprints(VERIFIED_FILES)
+        snapshot = self._verified
+        if (not force and snapshot is not None and current == snapshot.files
+                and snapshot.accesses < VERIFY_AFTER_ACCESSES
+                and monotonic() - snapshot.checked_at < VERIFY_AFTER_SECONDS):
+            snapshot.accesses += 1
+            return self
+
+        self._verified = None
+        self._verify_locked()
+        # Recovery can truncate logs and clear the journal. The next access takes
+        # a fresh snapshot of the recovered files.
+        if current[".transaction.json"] is None:
+            if self._fingerprints(VERIFIED_FILES) != current:
+                raise MemoryError("store changed during verification")
+            self._verified = _VerifiedStore(current, monotonic())
+        return self
+
+    def _verify_locked(self):
         for name in FILES:
             path = self.store / name
             if not os.path.lexists(path) or path.is_symlink() or not path.is_file():
@@ -554,6 +601,9 @@ class SomniMemory:
                    f"- state: {c['state']}; status: {c['status']}; salience: {c['salience']}"]
             if c.get("replaces"):
                 cl.append(f"- supersedes [[claims#{c['replaces']}|{c['replaces']}]]")
+            if c.get("merged_from"):
+                parents = ", ".join(f"[[claims#{ref}|{ref}]]" for ref in c["merged_from"])
+                cl.extend([f"- merged from {parents}", f"- provenance SHA-256: `{c['provenance_sha256']}`"])
             if cited_by.get(cid):
                 cl.append("- used by: " + ", ".join(f"[[{s}]]" for s in sorted(cited_by[cid])))
             for ev in c["evidence"]:
@@ -583,7 +633,9 @@ class SomniMemory:
     @classmethod
     def _validate_claim(cls, claim, transcript, existing):
         required = {"id", "text", "status", "salience", "evidence", "links"}
-        if not isinstance(claim, dict) or not required.issubset(claim) or set(claim) - (required | {"replaces"}):
+        merge_fields = {"merged_from", "provenance_sha256"}
+        if (not isinstance(claim, dict) or not required.issubset(claim)
+                or set(claim) - (required | {"replaces"} | merge_fields)):
             raise MemoryError("claim has invalid fields")
         text = claim["text"]
         if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_NOTE_BYTES:
@@ -602,19 +654,74 @@ class SomniMemory:
             if (not isinstance(replaced, str) or not CLAIM_ID.fullmatch(replaced)
                     or replaced not in existing or existing[replaced]["state"] != "active"):
                 raise MemoryError("replacement target is invalid or non-active")
+        if claim.keys() & merge_fields:
+            parents = cls._merge_parents(claim.get("merged_from"), existing)
+            if ("replaces" in claim or claim["merged_from"] != parents or claim["links"] != parents
+                    or claim["evidence"] != cls._merge_evidence(parents, existing)):
+                raise MemoryError("merged claim must use its canonical parents and evidence")
+            if claim.get("provenance_sha256") != cls._merge_digest(claim, transcript, existing):
+                raise MemoryError("merged claim provenance hash does not match its parents and content")
+
+    @staticmethod
+    def _merge_parents(claim_ids, existing):
+        if (not isinstance(claim_ids, list) or not 2 <= len(claim_ids) <= 16
+                or any(not isinstance(ref, str) or not CLAIM_ID.fullmatch(ref) for ref in claim_ids)
+                or len(set(claim_ids)) != len(claim_ids)):
+            raise MemoryError("merge requires 2-16 distinct claim IDs")
+        if any(ref not in existing or existing[ref]["state"] != "active" for ref in claim_ids):
+            raise MemoryError("merge requires active parent claims")
+        return sorted(claim_ids)
+
+    @staticmethod
+    def _merge_evidence(parents, existing):
+        evidence = {}
+        for ref in parents:
+            for citation in existing[ref]["evidence"]:
+                previous = evidence.get(citation["ref"])
+                if previous is None or (citation.get("quote") and not previous.get("quote")):
+                    evidence[citation["ref"]] = citation
+        return [evidence[ref] for ref in sorted(evidence)]
+
+    @classmethod
+    def _merge_digest(cls, claim, transcript, existing):
+        known = cls._evidence_map(transcript)
+
+        def parent_hash(parent):
+            if "provenance_sha256" in parent:
+                return parent["provenance_sha256"]
+            evidence = [
+                {**ref, "record_sha256": sha(known[ref["ref"]])}
+                for ref in sorted(parent["evidence"], key=lambda ref: ref["ref"])
+            ]
+            return sha({
+                "schema": SCHEMA, "kind": "claim", "text": parent["text"], "status": parent["status"],
+                "evidence": evidence, "links": sorted(parent["links"]), "replaces": parent.get("replaces"),
+            })
+
+        return sha({
+            "schema": SCHEMA, "kind": "merge", "text": claim["text"], "status": claim["status"],
+            "parents": [[ref, parent_hash(existing[ref])] for ref in claim["merged_from"]],
+        })
 
     def _save_state(self):
         _atomic_json(self.store / "state.json", self.state)
 
+    def _accept_local_write(self, snapshot, names):
+        if snapshot is not None:
+            snapshot.files.update(self._fingerprints(names))
+            self._verified = snapshot
+
     def _commit_logs(self, entries, next_state):
         journal = self.store / ".transaction.json"
         offsets = {name: _preflight_append(self.store / name, values) for name, values in entries.items()}
+        snapshot, self._verified = self._verified, None
         _atomic_json(journal, {"before": self.state, "after": next_state, "offsets": offsets})
         for name, values in entries.items():
             _append_encoded(self.store / name, b"".join(values))
         self.state = next_state
         self._save_state()
         self._clear_transaction(journal)
+        self._accept_local_write(snapshot, ("state.json", *entries))
 
     def set_phase(self, phase, *, allow_same=False):
         if not isinstance(phase, str) or phase not in {"open", "closed"}:
@@ -625,8 +732,10 @@ class SomniMemory:
                 if allow_same:
                     return
                 raise MemoryError(f"session is already {phase}")
+            snapshot, self._verified = self._verified, None
             self.state["phase"] = phase
             self._save_state()
+            self._accept_local_write(snapshot, ("state.json",))
 
     def record(self, source, text):
         return self.record_many([(source, text)])[0]
@@ -685,9 +794,11 @@ class SomniMemory:
             **self.state, "note_events": event["seq"], "notes_head": sha(event),
             "next_claim": self.state["next_claim"] + 1,
         })
+        self.note_log.append(event)
         self.claims[claim_id] = {**claim, "state": "active"}
         if replaces is not None:
             self.claims[replaces]["state"] = "superseded"
+            self.claims[replaces]["superseded_by"] = claim_id
         return claim_id
 
     def dream(self, proposal, partial=False):
@@ -729,7 +840,7 @@ class SomniMemory:
             if not prepared:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected)
-            self._load_locked()
+            self._load_locked(force=True)
             if self.pages or os.path.isdir(self.store / VAULT_DIR):
                 self.write_vault()
             return self.dreams[-1]
@@ -766,9 +877,10 @@ class SomniMemory:
             prepared.append(("drop_page", {"slug": operation["slug"], "reason": operation["reason"]}))
             del self._sim_pages[operation["slug"]]
             return next_claim
-        if op in {"add", "correct"}:
+        if op in {"add", "correct", "merge"}:
             _require_claim_capacity(len(simulated), self._limit("max_claims"))
-            allowed = {"op", "text", "status", "evidence", "salience", "links"}
+            allowed = {"op", "text", "status", "salience"}
+            allowed |= {"claim_ids"} if op == "merge" else {"evidence", "links"}
             if op == "correct":
                 allowed.add("claim_id")
             if set(operation) - allowed or (op == "correct" and "claim_id" not in operation):
@@ -783,6 +895,11 @@ class SomniMemory:
                      "links": operation.get("links", [])}
             if replaces is not None:
                 claim["replaces"] = replaces
+            if op == "merge":
+                parents = self._merge_parents(operation.get("claim_ids"), simulated)
+                claim.update(merged_from=parents, links=parents, evidence=self._merge_evidence(parents, simulated))
+                claim["status"] = operation.get("status", "uncertain")
+                claim["provenance_sha256"] = self._merge_digest(claim, self.transcript, simulated)
             self._validate_claim(claim, self.transcript, simulated)
             prepared.append(("add", claim))
             simulated[claim_id] = {**claim, "state": "active"}
@@ -1089,7 +1206,8 @@ def _serve(memory, record):
 
     with _recording_lease(memory) if record else nullcontext(None) as owner:
         if owner is not False and not os.path.lexists(memory.store):
-            memory = SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
+            SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
+        memory = SomniMemory(memory.workspace, memory.subject_id, scheduled_verification=True)
         if owner:
             memory.set_phase("open", allow_same=True)
         else:

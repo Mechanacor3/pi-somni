@@ -45,6 +45,86 @@ class SomniStoreTest(unittest.TestCase):
             for name in ("state.json", "notes.jsonl", "dreams.jsonl")
         )
 
+    def test_scheduled_verification_checks_after_access_count_and_time(self):
+        ref = self.open_with_evidence()
+        session = layered.SomniMemory(self.workspace, "subject-a", scheduled_verification=True)
+        with mock.patch.object(layered, "VERIFY_AFTER_ACCESSES", 2), mock.patch.object(
+            layered, "monotonic", return_value=100
+        ) as now, mock.patch.object(session, "_verify_locked", wraps=session._verify_locked) as audit:
+            session.load()
+            session.record("agent_output", "Recorded through the verified snapshot.")
+            claim = session.add_note("Inventory changed.", "verified", self.evidence(ref, "changed"))
+            self.assertEqual(audit.call_count, 1)
+            self.assertEqual(session.note_log[-1]["claim"]["id"], claim)
+            self.assertIn(claim, session.inject())
+            session.load()
+            self.assertEqual(audit.call_count, 2)
+            now.return_value += layered.VERIFY_AFTER_SECONDS
+            session.load()
+            self.assertEqual(audit.call_count, 3)
+
+    def test_scheduled_verification_detects_external_writes_and_tampering(self):
+        self.open_with_evidence("Original evidence.")
+        session = layered.SomniMemory(self.workspace, "subject-a", scheduled_verification=True).load()
+        self.memory.record("agent_output", "Written by another store client.")
+        self.assertEqual(session.record("agent_output", "Next session record."), "t000003")
+        log = self.memory.store / "transcript.jsonl"
+        log.write_text(log.read_text().replace("Original evidence.", "Tampered evidence."))
+        with self.assertRaisesRegex(layered.SomniError, "broken transcript chain"):
+            session.load()
+
+    def test_scheduled_verification_recovers_from_interrupted_write(self):
+        first = self.open_with_evidence()
+        session = layered.SomniMemory(self.workspace, "subject-a", scheduled_verification=True).load()
+        with mock.patch.object(session, "_save_state", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                session.record("agent_output", "Uncommitted cached output.")
+        self.assertEqual([record["id"] for record in session.load().transcript], [first])
+        self.assertEqual(session.record("agent_output", "Committed after recovery."), "t000002")
+        self.assertEqual(session.load().transcript[-1]["text"], "Committed after recovery.")
+
+    def merge_fixture(self):
+        first = self.open_with_evidence("The preview lists the fee.")
+        second = self.memory.record("tool_result", "Confirmation is required for a write.")
+        left = self.memory.add_note("Look up the fee.", "verified", self.evidence(first, "lists the fee"))
+        right = self.memory.add_note("Ask for confirmation.", "uncertain", self.evidence(second))
+        self.memory.set_phase("closed")
+        return left, right
+
+    def test_merge_digest_is_parent_order_independent_and_tracks_content(self):
+        left, right = self.merge_fixture()
+        merge = {"op": "merge", "claim_ids": [right, left], "text": "Quote the fee, then confirm."}
+        self.memory.dream({"schema": 1, "operations": [
+            merge,
+            {"op": "promote", "claim_id": left, "salience": 5},
+            {**merge, "claim_ids": [left, right]},
+            {**merge, "text": "Explain the fee, then confirm."},
+            {**merge, "claim_ids": [left, "n000003"]},
+        ]})
+        claims = self.memory.load().claims
+        merged = claims["n000003"]
+        self.assertEqual(merged["merged_from"], [left, right])
+        self.assertEqual(merged["evidence"], self.evidence("t000001", "lists the fee") + self.evidence("t000002"))
+        self.assertEqual(merged["status"], "uncertain")
+        self.assertEqual(merged["provenance_sha256"], claims["n000004"]["provenance_sha256"])
+        self.assertNotEqual(merged["provenance_sha256"], claims["n000005"]["provenance_sha256"])
+        self.assertNotEqual(merged["provenance_sha256"], claims["n000006"]["provenance_sha256"])
+        self.assertTrue(all(claims[ref]["state"] == "active" for ref in (left, right)))
+
+    def test_merge_replay_rejects_tampered_provenance_even_with_valid_chain_head(self):
+        left, right = self.merge_fixture()
+        self.memory.dream({"schema": 1, "operations": [
+            {"op": "merge", "claim_ids": [left, right], "text": "Quote the fee, then confirm."},
+        ]})
+        log = self.memory.store / "notes.jsonl"
+        notes = [json.loads(line) for line in log.read_text().splitlines()]
+        notes[-1]["claim"]["provenance_sha256"] = "f" * 64
+        log.write_bytes(b"".join(layered._encode_log_record(item) for item in notes))
+        state = {**self.memory.state, "notes_head": layered.sha(notes[-1])}
+        layered._atomic_json(self.memory.store / "state.json", state)
+        with self.assertRaisesRegex(layered.SomniError, "provenance hash"):
+            self.memory.load()
+
     def test_interrupted_append_recovers_the_last_committed_transcript(self):
         first = self.open_with_evidence()
         with mock.patch.object(self.memory, "_save_state", side_effect=OSError("interrupted")):

@@ -99,9 +99,11 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
 		async execute(_id: string, params: { query: string; limit?: number }) {
 			const hits = await getBackend().request<any[]>("recall", { query: params.query.slice(0, 2000), limit: params.limit ?? 5 });
-			const lines = hits.slice(0, params.limit ?? 5).map((h) =>
-				h.slug ? `# ${h.title} (page ${h.slug})\n${h.body}` : `${h.id} [${h.status}; ${h.evidence.length} cited] ${h.text}`,
-			);
+			const lines = hits.slice(0, params.limit ?? 5).map((h) => {
+				if (h.slug) return `# ${h.title} (page ${h.slug})\n${h.body}`;
+				const lineage = h.merged_from ? `; merged from ${h.merged_from.join(", ")}` : "";
+				return `${h.id} [${h.status}; ${h.evidence.length} cited${lineage}] ${h.text}`;
+			});
 			return { content: asText(lines.join("\n\n") || "no matching memory"), details: hits };
 		},
 	});
@@ -137,8 +139,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Somni dream",
 		description:
 			"Only during /somni-dream or /somni-wiki: submit one consolidation pass as JSON text " +
-			'{"schema":1,"operations":[...]} with add/correct/retract/promote claim operations and page/drop_page wiki ' +
-			"operations. Invalid operations are rejected individually.",
+			'{"schema":1,"operations":[...]} with add/correct/merge/retract/promote claim operations and page/drop_page wiki ' +
+			'operations. A merge takes {"op":"merge","claim_ids":["n000001","n000002"],"text":"combined guidance"} and inherits their evidence.',
 		parameters: Type.Object({ proposal_json: Type.String() }),
 		async execute(_id: string, params: { proposal_json: string }) {
 			const backend = requireWriteAccess();

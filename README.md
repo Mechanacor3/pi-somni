@@ -71,6 +71,11 @@ recording session, asks the model for one pass, and reopens recording when the p
 Invalid operations (for example, a quote that does not match) are rejected one by one and
 listed in the pass record.
 
+During a dream, a `merge` operation can synthesize active claims into one new claim.
+Somni sorts their IDs, inherits their evidence, and hashes the parent fingerprints together
+with the combined text and status. Parent order and salience changes leave the digest
+stable. The claim log and rendered vault show the parent IDs and the provenance digest.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `SOMNI_WORKSPACE` | `<cwd>/.pi/somni` | Store location |
@@ -87,9 +92,13 @@ to pause automatic recording. It can still inject and retrieve existing memory.
 One Pi process owns recording in a workspace at a time. A second Pi can use existing memory while
 the first owns the store. Close the second session and reopen it after the first exits to take over
 recording. Pi starts one local Python child for the session and exchanges requests over private
-pipes. The child exits when the session closes. Somni warns on recording errors, including a full
-store. To archive a full store, close
-all Pi sessions using it, then move the directory named by `SOMNI_WORKSPACE` (by default
+pipes. The child verifies the store on open and reuses that verified snapshot for up to 128
+store accesses or 60 seconds. It runs the next full check on access once either limit is
+reached, when it detects an outside file change, during recovery, and after a dream. New
+writes still extend the hash chain and use the transaction journal. A standalone store
+CLI command loads and verifies the store when it opens it. The child exits when the Pi
+session closes. Somni warns on recording errors, including a full store. To archive a full
+store, close all Pi sessions using it, then move the directory named by `SOMNI_WORKSPACE` (by default
 `.pi/somni`) to a private location. The next Pi session creates a clean store. Stale wiki pages
 remain visible in the vault for repair while recall and the injected index skip them.
 

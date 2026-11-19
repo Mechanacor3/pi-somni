@@ -21,7 +21,8 @@ PLANS = {
         {"op": "add", "text": "Look up the fee before quoting it.", "status": "uncertain", "salience": 3,
          "evidence": [{"ref": "t000002"}]},
         {"op": "add", "text": "Bad quote is rejected.", "status": "verified", "salience": 2,
-         "evidence": [{"ref": "t000002", "quote": "not in the record"}]}]})})]],
+         "evidence": [{"ref": "t000002", "quote": "not in the record"}]},
+        {"op": "merge", "claim_ids": ["n000002", "n000001"], "text": "Look up the cancellation fee before quoting its floor."}]})})]],
     "Anything else": [],
     "Recall the rule": [[("somni_recall", {"query": "cancellation fee", "limit": 1})]],
     "Wiki pass.": [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
@@ -69,8 +70,10 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertFalse(dream_end.get("isError"), dream_end)
         memory = SomniMemory(store, "pi").load()
         self.assertEqual(len(memory.dreams), 1)
-        self.assertEqual(memory.dreams[0]["operation_count"], 1)
+        self.assertEqual(memory.dreams[0]["operation_count"], 2)
         self.assertEqual(memory.dreams[0]["rejected"][0]["index"], 1)
+        merged = memory.claims["n000003"]
+        self.assertEqual(merged["merged_from"], ["n000001", "n000002"])
         self.assertEqual(memory.state["phase"], "open")
         # /somni-wiki gathers uncovered claims into pages; the vault becomes readable markdown.
         self.pi.prompt("/somni-wiki fees")
@@ -80,6 +83,7 @@ class SomniPiEndToEnd(unittest.TestCase):
         vault = store / "somni-v1" / "vault"
         self.assertIn("[[claims#n000001|n000001]]", (vault / "fees.md").read_text())
         self.assertIn("[[fees|Fees]]", (vault / "index.md").read_text())
+        self.assertIn(merged["provenance_sha256"], (vault / "claims.md").read_text())
         self.pi.prompt("Anything else I should know?")
         self.assertIn("page `fees`", json.dumps(self.upstream.requests[-1]["messages"][-1]))
         tools = {t["function"]["name"] for t in self.upstream.requests[0]["tools"]}
