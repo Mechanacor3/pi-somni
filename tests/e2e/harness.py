@@ -64,6 +64,8 @@ class FakeUpstream:
                     calls = [{"index": i, "id": f"call_{index}_{i}", "type": "function",
                               "function": {"name": n, "arguments": json.dumps(a)}} for i, (n, a) in enumerate(reply["tool_calls"])]
                     delta, finish = {"role": "assistant", "tool_calls": calls}, "tool_calls"
+                    if "text" in reply:
+                        delta["content"] = reply["text"]
                 else:
                     delta, finish = {"role": "assistant", "content": reply["text"]}, "stop"
                 chunks = [dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": None}]),
@@ -90,50 +92,57 @@ def plan_script(plans):
     def script(body, _index):
         messages = body["messages"]
         users = [i for i, m in enumerate(messages) if m.get("role") == "user"
-                 and not text_of(m.get("content")).lstrip().startswith("# Subject memory index")]
+                 and not text_of(m.get("content")).lstrip().startswith(
+                     ("# Subject memory index", "Attached image(s) from tool result:"))]
         last = users[-1]
         prompt = text_of(messages[last].get("content"))
-        k = sum(1 for m in messages[last + 1:] if m.get("role") == "assistant")
+        k = sum(1 for m in messages[last + 1:] if m.get("role") == "assistant" and m.get("tool_calls"))
         for key, plan in plans.items():
             if prompt.startswith(key):
-                return {"tool_calls": plan[k]} if k < len(plan) else {"text": "done"}
+                if k >= len(plan):
+                    return {"text": "done"}
+                return plan[k] if isinstance(plan[k], dict) else {"tool_calls": plan[k]}
         return {"text": "ok"}
     return script
 
 
 class PiSession:
-    def __init__(self, extension, workspace, port, env=None):
+    def __init__(self, extension, workspace, port, env=None, *, mode="rpc", prompt=None, package=None):
         self.name = f"pi-plugin-e2e-{secrets.token_hex(4)}"
         models = {"providers": {"fake": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
-                                         "apiKey": "not-a-real-key", "models": [{"id": "m", "name": "fake"}]}}}
+                                         "apiKey": "not-a-real-key", "models": [{"id": "m", "name": "fake",
+                                                                                 "input": ["text", "image"]}]}}}
         self.events, self.seq = [], 0
         self.buffer = bytearray()
+        cli = ["--mode", mode, "--no-session", "--offline", "--no-approve", "--no-extensions"]
+        cli += ["--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--provider", "fake", "--model", "m"]
+        trailing = ["-p", prompt] if prompt is not None else []
         if BINARY:
             profile = workspace / self.name
             profile.mkdir()
             (profile / "models.json").write_text(json.dumps(models))
             (profile / "auth.json").write_text("{}")
+            (profile / "settings.json").write_text('{"compaction":{"enabled":false}}')
             local_env = {
                 "HOME": str(workspace), "PATH": os.environ["PATH"],
                 "PI_CODING_AGENT_DIR": str(profile), **(env or {}),
             }
-            args = [shutil.which(BINARY), "--mode", "rpc", "--no-session", "--offline", "--no-approve", "--no-extensions",
-                    "--extension", str((PACKAGE or REPO) / extension), "--extension", str(E2E / "fixture.ts"),
-                    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--provider", "fake", "--model", "m"]
+            args = [shutil.which(BINARY), *cli, "--extension", str((package or PACKAGE or REPO) / extension),
+                    "--extension", str(E2E / "fixture.ts"), *trailing]
             self.proc = subprocess.Popen(args, cwd=workspace, env=local_env, stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return
         setup = (f"mkdir -p /tmp/agent && printf '%s' '{json.dumps(models)}' > /tmp/agent/models.json && "
-                 "echo '{}' > /tmp/agent/auth.json && export PI_CODING_AGENT_DIR=/tmp/agent && "
-                 "exec pi --mode rpc --no-session --offline --no-approve --no-extensions "
-                 f"--extension /plugin/{extension} --extension /plugin/tests/e2e/fixture.ts "
-                 "--no-skills --no-prompt-templates --no-context-files --no-themes --provider fake --model m")
+                 "echo '{}' > /tmp/agent/auth.json && "
+                 "echo '{\"compaction\":{\"enabled\":false}}' > /tmp/agent/settings.json && "
+                 "export PI_CODING_AGENT_DIR=/tmp/agent && exec pi \"$@\"")
         args = ["docker", "run", "--rm", "-i", "--name", self.name, "--network", "host",
                 "--user", f"{os.getuid()}:{os.getgid()}", "--read-only", "--tmpfs", "/tmp:rw,exec,size=64m",
                 "-e", "HOME=/tmp", "-v", f"{REPO}:/plugin:ro", "-v", f"{workspace}:/work", "-w", "/work"]
         for key, value in (env or {}).items():
             args += ["-e", f"{key}={value}"]
-        self.proc = subprocess.Popen([*args, IMAGE, "sh", "-c", setup], stdin=subprocess.PIPE,
+        self.proc = subprocess.Popen([*args, IMAGE, "sh", "-c", setup, "pi", *cli, "--extension", f"/plugin/{extension}",
+                                      "--extension", "/plugin/tests/e2e/fixture.ts", *trailing], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def send(self, command):
@@ -171,6 +180,21 @@ class PiSession:
 
     def tool_ends(self):
         return [e for e in self.events if e.get("type") == "tool_execution_end"]
+
+    def finish(self):
+        try:
+            out, err = self.proc.communicate(timeout=40)
+        except subprocess.TimeoutExpired:
+            self.kill()
+            raise
+        return self.proc.returncode, out.decode(), err.decode()
+
+    def kill(self):
+        if BINARY:
+            self.proc.kill()
+        else:
+            subprocess.run(["docker", "kill", "--signal", "KILL", self.name], check=True, capture_output=True)
+        self.close()
 
     def close(self):
         if self.proc.stdin.closed:

@@ -9,7 +9,8 @@ Layers (all under `<workspace>/somni-v1/`):
   transcript.jsonl  canonical, hash-chained, append-only record of what the agent
                     saw (observations, tool results) and said (its own output).
   notes.jsonl       agent-authored claims.  Every claim cites transcript records;
-                    `verified` claims quote an exact excerpt of each cited record.
+                    `verified` claims cite exact excerpts or stored images.
+  images/           bounded, content-addressed attachments for tool results.
   wiki.jsonl        pages that gather what is known about one subject (the essay's
                     "representations"): markdown written by dreaming, each citing the
                     active claims it rests on and linking (with [[slug]] wikilinks)
@@ -29,10 +30,13 @@ append only text the agent itself already saw or produced.
 """
 
 import argparse
-from contextlib import contextmanager, nullcontext
+import base64
+import binascii
+from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -55,6 +59,14 @@ MAX_TRANSCRIPT_RECORDS = 4_096
 MAX_DREAM_PASSES = 512
 MAX_LOG_BYTES = 16 * 1024 * 1024
 MAX_INJECTION_BYTES = 8_192
+DEFAULT_IMAGE_BYTES = 256 * 1024
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_INPUT = 4 * 1024 * 1024  # raw before optional downscaling
+MAX_RECORD_IMAGES = 4
+MAX_IMAGE_STORE_BYTES = 64 * 1024 * 1024
+MAX_BACKEND_REQUEST = 512 * 1024 + MAX_RECORD_IMAGES * ((MAX_IMAGE_INPUT + 2) // 3 * 4)
+IMAGE_SUFFIX = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 # Per-store overrides (set once at create time, recorded in the manifest).
 LIMIT_KEYS = {"max_transcript_records": 65_536, "max_claims": 4_096, "max_record_bytes": 32_768}
 DEFAULT_INJECTION_BYTES = 4_096
@@ -107,6 +119,78 @@ def sha(value):
 def token_estimate(value):
     size = len(value.encode("utf-8") if isinstance(value, str) else value)
     return (size + 3) // 4
+
+
+def _record_context(run_label=None, tags=None):
+    def label(value):
+        return (isinstance(value, str) and value.strip() and value.isprintable()
+                and len(value.encode("utf-8")) <= 96)
+
+    if run_label is not None and not label(run_label):
+        raise MemoryError("run label must be printable text up to 96 bytes")
+    if tags is not None and (not isinstance(tags, list) or len(tags) > 8 or not all(map(label, tags))):
+        raise MemoryError("tags must be an array of up to 8 printable strings, each up to 96 bytes")
+    return {**({"run_label": run_label} if run_label else {}), **({"tags": sorted(set(tags))} if tags else {})}
+
+
+def _clip_record(text, max_bytes):
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    marker = b" [truncated]"
+    if max_bytes <= len(marker):
+        return "!" * max_bytes
+    return data[:max_bytes - len(marker)].decode("utf-8", errors="ignore") + marker.decode()
+
+
+def _image_type(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _image_bytes(image, max_bytes, resize=None):
+    if not isinstance(image, dict):
+        return None
+    mime, encoded = image.get("mimeType"), image.get("data")
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    if (not isinstance(mime, str) or mime not in IMAGE_SUFFIX or not isinstance(encoded, str)
+            or len(encoded) > (MAX_IMAGE_INPUT + 2) // 3 * 4):
+        return None
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if len(data) > MAX_IMAGE_INPUT or _image_type(data) != mime:
+        return None
+    if resize:
+        pillow, max_edge = resize
+        try:
+            with pillow.open(io.BytesIO(data)) as original:
+                if max(original.size) > max_edge or len(data) > max_bytes:
+                    if original.width * original.height > 24_000_000:
+                        return None
+                    preview = original.convert("RGB")
+                    preview.thumbnail((max_edge, max_edge))
+                    output = io.BytesIO()
+                    preview.save(output, "JPEG", quality=80)
+                    mime, data = "image/jpeg", output.getvalue()
+        except (OSError, ValueError, SyntaxError, pillow.DecompressionBombError):
+            return None
+    return (mime, data) if len(data) <= max_bytes else None
+
+
+def _require_viewed_images(evidence, viewed):
+    if viewed is not None and any("image_sha256" in item and (item["ref"], item["image_sha256"]) not in viewed
+                                  for item in evidence):
+        raise MemoryError("view the cited image in this dream first with somni_image")
 
 
 def _require_claim_capacity(existing_count, limit=None):
@@ -379,12 +463,15 @@ class SomniMemory:
         wiki_path = self.store / "wiki.jsonl"
         wiki = _read_log(wiki_path) if os.path.lexists(wiki_path) else []
         self._check_chain(wiki, "wiki", state.get("wiki_events", 0), state.get("wiki_head", ZERO_HASH))
-        claims = self._replay_notes(notes, transcript, self._limit("max_claims"))
+        records = {record["id"]: record for record in transcript}
+        claims = self._replay_notes(notes, records, self._limit("max_claims"))
         expected_next = max([int(key[1:]) for key in claims] + [0]) + 1
         if state.get("next_claim") != expected_next or state.get("phase") not in {"open", "closed"}:
             raise MemoryError("state counters are inconsistent")
         self.manifest, self.state = manifest, state
         self.transcript, self.note_log, self.dreams, self.claims = transcript, notes, dreams, claims
+        self._records_by_id = records
+        self._image_store_bytes = None
         self.wiki_log = wiki
         self.pages = self._replay_wiki(wiki, claims)
         if os.path.lexists(journal):
@@ -435,29 +522,36 @@ class SomniMemory:
             raise MemoryError(f"{label} head does not match state")
 
     @staticmethod
-    def _evidence_map(transcript):
-        return {record["id"]: record for record in transcript}
-
-    @classmethod
-    def _validate_evidence(cls, evidence, transcript, status=None):
+    def _validate_evidence(evidence, records, status=None):
         if not isinstance(evidence, list) or not evidence or len(evidence) > 16:
             raise MemoryError("every claim needs 1-16 evidence references")
-        known = cls._evidence_map(transcript)
         normalized = []
         seen = set()
         for item in evidence:
-            if not isinstance(item, dict) or set(item) - {"ref", "quote"}:
-                raise MemoryError("evidence must contain only ref and optional quote")
+            if not isinstance(item, dict) or set(item) - {"ref", "quote", "image_sha256"}:
+                raise MemoryError("evidence must contain ref and optional quote or image_sha256")
             ref, quote = item.get("ref"), item.get("quote")
-            if not isinstance(ref, str) or not EVIDENCE_ID.fullmatch(ref) or ref not in known or ref in seen:
+            if not isinstance(ref, str) or not EVIDENCE_ID.fullmatch(ref) or ref not in records or ref in seen:
                 raise MemoryError("evidence reference is missing, duplicated, or unknown")
-            if quote is not None and (not isinstance(quote, str) or not quote or quote not in known[ref]["text"]):
+            if quote is not None and (not isinstance(quote, str) or not quote or quote not in records[ref]["text"]):
                 raise MemoryError("evidence quote must occur exactly in the referenced transcript")
-            if status == "verified" and quote is None:
-                raise MemoryError("verified claims require an exact quote for every evidence reference")
-            normalized.append({"ref": ref, **({"quote": quote} if quote is not None else {})})
+            digest = item.get("image_sha256")
+            if "image_sha256" in item and (not isinstance(digest, str) or not SHA256.fullmatch(digest)
+                    or not any(image["sha256"] == digest for image in records[ref].get("images", []))):
+                raise MemoryError("evidence image SHA-256 must match an image on the referenced transcript record")
+            if status == "verified" and quote is None and digest is None:
+                raise MemoryError("verified claims require an exact quote or stored image for every evidence reference")
+            normalized.append({"ref": ref, **({"quote": quote} if quote is not None else {}),
+                               **({"image_sha256": digest} if digest is not None else {})})
             seen.add(ref)
         return normalized
+
+    @staticmethod
+    def _claim_context(evidence, records):
+        cited = [records[item["ref"]] for item in evidence]
+        labels = sorted({r["run_label"] for r in cited if "run_label" in r})
+        tags = sorted({tag for r in cited for tag in r.get("tags", [])})
+        return {**({"run_labels": labels} if labels else {}), **({"tags": tags} if tags else {})}
 
     @classmethod
     def _replay_notes(cls, events, transcript, max_claims=None):
@@ -586,12 +680,12 @@ class SomniMemory:
             files[f"{slug}.md"] = "\n".join(lines) + "\n"
         index = ["---", "title: Index", "tags: [somni, index]", "---", "", "# Index", "",
                  f"{len(self.pages)} pages, {sum(c['state'] == 'active' for c in claims.values())} active claims. "
-                 "Pages are written by dreaming; every statement traces to [[claims]] and from there to exact transcript quotes.", ""]
+                 "Pages trace to [[claims]] and their transcript quotes and images.", ""]
         index += [f"- [[{slug}|{page['title']}]]" for slug, page in sorted(self.pages.items(), key=lambda kv: kv[1]["title"].casefold())]
         files["index.md"] = "\n".join(index) + "\n"
         transcript = {r["id"]: r for r in self.transcript}
         cl = ["---", "title: Claims", "tags: [somni, claims]", "---", "", "# Claims", "",
-              "Each claim cites transcript records; `verified` means every cited record contains the quoted excerpt.", ""]
+              "Each `verified` claim cites an exact excerpt or a stored image for each record.", ""]
         cited_by = {}
         for slug, page in self.pages.items():
             for ref in page["claims"]:
@@ -599,6 +693,10 @@ class SomniMemory:
         for cid, c in sorted(claims.items()):
             cl += [f"## {cid}", "", f"{c['text']}", "",
                    f"- state: {c['state']}; status: {c['status']}; salience: {c['salience']}"]
+            if c.get("run_labels"):
+                cl.append("- runs: " + ", ".join(c["run_labels"]))
+            if c.get("tags"):
+                cl.append("- tags: " + ", ".join(c["tags"]))
             if c.get("replaces"):
                 cl.append(f"- supersedes [[claims#{c['replaces']}|{c['replaces']}]]")
             if c.get("merged_from"):
@@ -609,7 +707,11 @@ class SomniMemory:
             for ev in c["evidence"]:
                 rec = transcript.get(ev["ref"], {})
                 quote = ev.get("quote")
-                cl.append(f"- {ev['ref']} ({rec.get('source', '?')}): " + (f"> {quote}" if quote else f"{rec.get('text', '')[:200]}"))
+                content = f"> {quote}" if quote else rec.get("text", "")[:200]
+                if "image_sha256" in ev:
+                    name = self._image_path(self._image_descriptor(ev["ref"], ev["image_sha256"])).name
+                    content = f"[image](../images/{name})" + (f" {content}" if quote else "")
+                cl.append(f"- {ev['ref']} ({rec.get('source', '?')}): {content}")
             cl.append("")
         files["claims.md"] = "\n".join(cl) + "\n"
         for existing in vault.glob("*.md"):
@@ -631,11 +733,11 @@ class SomniMemory:
                 for slug, page in self.pages.items() if any(self.claims[c]["state"] != "active" for c in page["claims"])}
 
     @classmethod
-    def _validate_claim(cls, claim, transcript, existing):
+    def _validate_claim(cls, claim, records, existing):
         required = {"id", "text", "status", "salience", "evidence", "links"}
         merge_fields = {"merged_from", "provenance_sha256"}
         if (not isinstance(claim, dict) or not required.issubset(claim)
-                or set(claim) - (required | {"replaces"} | merge_fields)):
+                or set(claim) - (required | {"replaces", "run_labels", "tags"} | merge_fields)):
             raise MemoryError("claim has invalid fields")
         text = claim["text"]
         if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_NOTE_BYTES:
@@ -643,7 +745,10 @@ class SomniMemory:
         if (not isinstance(claim["status"], str) or claim["status"] not in STATUSES
                 or type(claim["salience"]) is not int or not 1 <= claim["salience"] <= 5):
             raise MemoryError("claim status or salience is invalid")
-        cls._validate_evidence(claim["evidence"], transcript, claim["status"])
+        cls._validate_evidence(claim["evidence"], records, claim["status"])
+        context = {key: claim[key] for key in ("run_labels", "tags") if key in claim}
+        if context != cls._claim_context(claim["evidence"], records):
+            raise MemoryError("claim run labels or tags do not match its evidence")
         if not isinstance(claim["links"], list) or len(claim["links"]) > 16:
             raise MemoryError("claim links are invalid")
         for link in claim["links"]:
@@ -659,7 +764,7 @@ class SomniMemory:
             if ("replaces" in claim or claim["merged_from"] != parents or claim["links"] != parents
                     or claim["evidence"] != cls._merge_evidence(parents, existing)):
                 raise MemoryError("merged claim must use its canonical parents and evidence")
-            if claim.get("provenance_sha256") != cls._merge_digest(claim, transcript, existing):
+            if claim.get("provenance_sha256") != cls._merge_digest(claim, records, existing):
                 raise MemoryError("merged claim provenance hash does not match its parents and content")
 
     @staticmethod
@@ -677,20 +782,20 @@ class SomniMemory:
         evidence = {}
         for ref in parents:
             for citation in existing[ref]["evidence"]:
-                previous = evidence.get(citation["ref"])
-                if previous is None or (citation.get("quote") and not previous.get("quote")):
-                    evidence[citation["ref"]] = citation
+                rid = citation["ref"]
+                previous = evidence.get(rid, {})
+                best = previous if previous and (previous.get("quote") or not citation.get("quote")) else citation
+                image = previous.get("image_sha256") or citation.get("image_sha256")
+                evidence[rid] = {**best, **({"image_sha256": image} if image else {})}
         return [evidence[ref] for ref in sorted(evidence)]
 
     @classmethod
-    def _merge_digest(cls, claim, transcript, existing):
-        known = cls._evidence_map(transcript)
-
+    def _merge_digest(cls, claim, records, existing):
         def parent_hash(parent):
             if "provenance_sha256" in parent:
                 return parent["provenance_sha256"]
             evidence = [
-                {**ref, "record_sha256": sha(known[ref["ref"]])}
+                {**ref, "record_sha256": sha(records[ref["ref"]])}
                 for ref in sorted(parent["evidence"], key=lambda ref: ref["ref"])
             ]
             return sha({
@@ -737,32 +842,111 @@ class SomniMemory:
             self._save_state()
             self._accept_local_write(snapshot, ("state.json",))
 
-    def record(self, source, text):
-        return self.record_many([(source, text)])[0]
+    def _image_path(self, descriptor):
+        digest = descriptor["sha256"]
+        if not isinstance(digest, str) or not SHA256.fullmatch(digest) or descriptor["mime_type"] not in IMAGE_SUFFIX:
+            raise MemoryError("invalid stored image descriptor")
+        return self.store / "images" / f"{digest}.{IMAGE_SUFFIX[descriptor['mime_type']]}"
 
-    def record_many(self, items):
-        """Append several (source, text) records under one lock; all or nothing."""
+    def _read_image(self, descriptor):
+        data = _read_regular(self._image_path(descriptor), MAX_IMAGE_BYTES)
+        if len(data) != descriptor["bytes"] or sha(data) != descriptor["sha256"]:
+            raise MemoryError("stored image does not match its transcript digest")
+        return data
+
+    def _store_image(self, mime, data):
+        descriptor = {"sha256": sha(data), "mime_type": mime, "bytes": len(data)}
+        path = self._image_path(descriptor)
+        _no_symlink(path)
+        if path.exists():
+            self._read_image(descriptor)
+            return descriptor
+        if not path.parent.exists():
+            path.parent.mkdir(mode=0o700)
+            _sync_directory(self.store)
+        if self._image_store_bytes is None:
+            self._image_store_bytes = sum(entry.lstat().st_size for entry in path.parent.iterdir())
+        if self._image_store_bytes + len(data) > MAX_IMAGE_STORE_BYTES:
+            return None
+        fd, tmp = tempfile.mkstemp(prefix=".image-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            self._image_store_bytes += len(data)
+            _sync_directory(path.parent)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        return descriptor
+
+    def _image_descriptor(self, ref, digest):
+        record = self._records_by_id.get(ref, {})
+        for descriptor in record.get("images", []):
+            if descriptor["sha256"] == digest:
+                return descriptor
+        raise MemoryError("image not found on the referenced transcript record")
+
+    def image(self, ref, digest):
+        descriptor = self._image_descriptor(ref, digest)
+        data = self._read_image(descriptor)
+        return {"type": "image", "mimeType": descriptor["mime_type"], "data": base64.b64encode(data).decode("ascii")}
+
+    def _check_cited_images(self, evidence):
+        for item in evidence:
+            if "image_sha256" in item:
+                self._read_image(self._image_descriptor(item["ref"], item["image_sha256"]))
+
+    def record(self, source, text, **kwargs):
+        return self.record_many([(source, text)], **kwargs)[0]
+
+    def record_many(self, items, *, context=None, images=(), omitted_images=0, clip=False,
+                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None):
+        """Append several (source, text) records under one lock."""
         items = list(items)
         if not items:
             return []
+        context = _record_context(**(context or {}))
+        if len(images) > MAX_RECORD_IMAGES or type(omitted_images) is not int or omitted_images < 0:
+            raise MemoryError("invalid tool result image list or omission count")
+        if type(image_bytes) is not int or not 0 <= image_bytes <= MAX_IMAGE_BYTES:
+            raise MemoryError(f"image byte cap must be 0..{MAX_IMAGE_BYTES}")
         for source, text in items:
             if not isinstance(source, str) or source not in SOURCES:
                 raise MemoryError("invalid transcript source")
         with self._locked():
             self._load_locked()
             max_bytes = self._limit("max_record_bytes")
-            if any(not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > max_bytes
+            if any(not isinstance(text, str) or not text.strip() or (not clip and len(text.encode("utf-8")) > max_bytes)
                    for _, text in items):
                 raise MemoryError("transcript text is empty or too large")
             if self.state["phase"] != "open":
                 raise MemoryError("recording requires an open subject session")
             if self.state["transcript_count"] + len(items) > self._limit("max_transcript_records"):
                 raise MemoryError("transcript record limit reached; seal the bounded attempt")
+            if (images or omitted_images) and (len(items) != 1 or items[0][0] != "tool_result"):
+                raise MemoryError("images can only attach to one tool result at a time")
+            attachments = []
+            for image in images:
+                decoded = _image_bytes(image, image_bytes, resize)
+                stored = self._store_image(*decoded) if decoded else None
+                if stored:
+                    attachments.append(stored)
+                else:
+                    omitted_images += 1
             seq, head, encoded, ids, records = self.state["transcript_count"], self.state["transcript_head"], [], [], []
             for source, text in items:
                 seq += 1
                 record = {"schema": SCHEMA, "seq": seq, "id": f"t{seq:06d}", "source": source,
-                          "text": text, "prev_sha256": head}
+                          "text": _clip_record(text, max_bytes) if clip else text, "prev_sha256": head, **context}
+                if clip and record["text"] != text:
+                    record["original_text_bytes"] = len(text.encode("utf-8"))
+                if attachments:
+                    record["images"] = attachments
+                if omitted_images:
+                    record["omitted_images"] = omitted_images
                 head = sha(record)
                 encoded.append(_encode_log_record(record))
                 ids.append(record["id"])
@@ -771,6 +955,7 @@ class SomniMemory:
                 **self.state, "transcript_count": seq, "transcript_head": head,
             })
             self.transcript.extend(records)
+            self._records_by_id.update(zip(ids, records))
         return ids
 
     def add_note(self, text, status, evidence, salience=3, links=None):
@@ -787,7 +972,10 @@ class SomniMemory:
                  "evidence": evidence, "links": links}
         if replaces is not None:
             claim["replaces"] = replaces
-        self._validate_claim(claim, self.transcript, self.claims)
+        claim["evidence"] = self._validate_evidence(evidence, self._records_by_id, status)
+        claim.update(self._claim_context(claim["evidence"], self._records_by_id))
+        self._validate_claim(claim, self._records_by_id, self.claims)
+        self._check_cited_images(claim["evidence"])
         event = {"schema": SCHEMA, "seq": self.state["note_events"] + 1, "op": "add", "claim": claim,
                  "prev_sha256": self.state["notes_head"]}
         self._commit_logs({"notes.jsonl": [_encode_log_record(event)]}, {
@@ -801,7 +989,7 @@ class SomniMemory:
             self.claims[replaces]["superseded_by"] = claim_id
         return claim_id
 
-    def dream(self, proposal, partial=False):
+    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None):
         """Apply one offline consolidation pass.
 
         By default the pass is all-or-nothing.  With ``partial=True`` an operation
@@ -813,8 +1001,9 @@ class SomniMemory:
         if not isinstance(proposal, dict) or proposal.get("schema") != SCHEMA or set(proposal) != {"schema", "operations"}:
             raise MemoryError("dream proposal must contain schema and operations")
         operations = proposal["operations"]
-        if not isinstance(operations, list) or not 1 <= len(operations) <= 32:
-            raise MemoryError("dream proposal needs 1-32 operations")
+        minimum = 0 if allow_empty else 1
+        if not isinstance(operations, list) or not minimum <= len(operations) <= 32:
+            raise MemoryError(f"dream proposal needs {minimum}-32 operations")
         proposal_bytes = canonical(proposal).encode("utf-8")
         if len(proposal_bytes) > MAX_INPUT_BYTES:
             raise MemoryError("dream proposal exceeds byte limit")
@@ -832,12 +1021,12 @@ class SomniMemory:
             next_claim = self.state["next_claim"]
             for index, operation in enumerate(operations):
                 try:
-                    next_claim = self._prepare_dream_op(operation, simulated, prepared, next_claim)
-                except MemoryError as exc:
+                    next_claim = self._prepare_dream_op(operation, simulated, prepared, next_claim, viewed_images)
+                except (MemoryError, OSError) as exc:
                     if not partial or "claim limit reached" in str(exc):
                         raise
                     rejected.append({"index": index, "reason": str(exc)[:300]})
-            if not prepared:
+            if not prepared and operations:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected)
             self._load_locked(force=True)
@@ -845,7 +1034,7 @@ class SomniMemory:
                 self.write_vault()
             return self.dreams[-1]
 
-    def _prepare_dream_op(self, operation, simulated, prepared, next_claim):
+    def _prepare_dream_op(self, operation, simulated, prepared, next_claim, viewed_images):
         if not isinstance(operation, dict):
             raise MemoryError("dream operation must be an object")
         op = operation.get("op")
@@ -899,8 +1088,15 @@ class SomniMemory:
                 parents = self._merge_parents(operation.get("claim_ids"), simulated)
                 claim.update(merged_from=parents, links=parents, evidence=self._merge_evidence(parents, simulated))
                 claim["status"] = operation.get("status", "uncertain")
-                claim["provenance_sha256"] = self._merge_digest(claim, self.transcript, simulated)
-            self._validate_claim(claim, self.transcript, simulated)
+                claim["provenance_sha256"] = self._merge_digest(claim, self._records_by_id, simulated)
+            evidence = self._validate_evidence(claim["evidence"], self._records_by_id, claim["status"])
+            if op != "merge":
+                claim["evidence"] = evidence
+            claim.update(self._claim_context(evidence, self._records_by_id))
+            self._validate_claim(claim, self._records_by_id, simulated)
+            self._check_cited_images(evidence)
+            if op != "merge":
+                _require_viewed_images(evidence, viewed_images)
             prepared.append(("add", claim))
             simulated[claim_id] = {**claim, "state": "active"}
             if replaces:
@@ -915,7 +1111,9 @@ class SomniMemory:
                 raise MemoryError("retraction targets an invalid or non-active claim")
             if not isinstance(operation["reason"], str) or not operation["reason"].strip():
                 raise MemoryError("retraction needs a reason")
-            evidence = self._validate_evidence(operation["evidence"], self.transcript)
+            evidence = self._validate_evidence(operation["evidence"], self._records_by_id)
+            self._check_cited_images(evidence)
+            _require_viewed_images(evidence, viewed_images)
             prepared.append(("retract", {"claim_id": claim_id, "reason": operation["reason"], "evidence": evidence}))
             simulated[claim_id]["state"] = "retracted"
         else:
@@ -948,6 +1146,9 @@ class SomniMemory:
                  "transcript_head": self.state["transcript_head"], "operation_count": len(prepared),
                  "proposal_sha256": sha(proposal_bytes), "input_bytes": len(proposal_bytes),
                  "input_tokens_estimate": token_estimate(proposal_bytes), "prev_sha256": self.state["dreams_head"]}
+        merged = sum(op == "add" and "merged_from" in body for op, body in prepared)
+        dream["added_count"] = sum(op == "add" for op, _ in prepared) - merged
+        dream["merged_count"] = merged
         if wiki_events:
             dream["page_operations"] = len(wiki_events)
             dream["operation_count"] += page_ops
@@ -974,7 +1175,8 @@ class SomniMemory:
         if not isinstance(query, str) or not query.strip() or len(query) > 256 or not 1 <= limit <= 50:
             raise MemoryError("invalid search query or limit")
         needle = query.casefold()
-        return [record for record in self.transcript if needle in record["text"].casefold()][:limit]
+        return [record for record in self.transcript
+                if any(needle in value.casefold() for value in (record["text"], record.get("run_label", ""), *record.get("tags", [])))][:limit]
 
     def recall(self, query, limit=3):
         """Rank active claims for ``query``: lexical BM25 over claim text, then salience.
@@ -986,10 +1188,18 @@ class SomniMemory:
         active = [claim for claim in self.claims.values() if claim["state"] == "active"]
         if not active:
             return []
-        docs = [_terms(claim["text"]) for claim in active]
-        scored = [(score * (1 + 0.1 * claim["salience"]), claim) for score, claim in _bm25(docs, active, query)]
-        scored.sort(key=lambda item: (-item[0], -item[1]["salience"], item[1]["id"]))
-        return [{**claim, "score": round(score, 4)} for score, claim in scored[:limit]]
+        contexts = {claim["id"]: claim.get("run_labels", []) + claim.get("tags", []) for claim in active}
+        docs = [_terms(" ".join([claim["text"], *contexts[claim["id"]]])) for claim in active]
+        scores = {claim["id"]: score for score, claim in _bm25(docs, active, query)}
+        phrase = query.strip().casefold()
+        hits = []
+        for claim in active:
+            score = scores.get(claim["id"], 0) * (1 + 0.1 * claim["salience"])
+            exact = any(phrase == label.casefold() for label in contexts[claim["id"]])
+            if exact or score:
+                hits.append((exact, score, claim))
+        hits.sort(key=lambda item: (-item[0], -item[1], -item[2]["salience"], item[2]["id"]))
+        return [{**claim, "score": round(score, 4)} for _, score, claim in hits[:limit]]
 
     def recall_pages(self, query, limit=3):
         """Rank wiki pages for ``query`` with BM25 over title and body (title counted twice)."""
@@ -1022,7 +1232,9 @@ class SomniMemory:
         active.sort(key=lambda claim: (-claim["salience"], claim["id"]))
         for claim in active:
             refs = ",".join(item["ref"] for item in claim["evidence"])
-            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {claim['text']}\n"
+            labels = ", ".join(claim.get("run_labels", []) + claim.get("tags", []))
+            context = f" (context: {labels[:160]})" if labels else ""
+            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {claim['text']}{context}\n"
             if len(("".join(lines) + line).encode("utf-8")) > max_bytes:
                 break
             lines.append(line)
@@ -1055,6 +1267,18 @@ class SomniMemory:
             "local_memory_processing_usd": 0,
         }
 
+    def status(self):
+        active = {status: 0 for status in sorted(STATUSES)}
+        for claim in self.claims.values():
+            if claim["state"] == "active":
+                active[claim["status"]] += 1
+        return {
+            "phase": self.state["phase"], "transcript_count": self.state["transcript_count"],
+            "transcript_head": self.state["transcript_head"], "active_claims_by_status": active,
+            "claim_count": len(self.claims), "dream_count": self.state["dream_count"],
+            "last_pass": _dream_summary(self.dreams[-1]) if self.dreams else None,
+        }
+
     def report(self):
         metrics = self.metrics()
         lines = [
@@ -1084,7 +1308,7 @@ class SomniMemory:
             lines.append(f"- **{record['id']}** `{record['source']}` — {record['text']}")
         if not self.transcript:
             lines.append("- No transcript records.")
-        lines.extend(["", "Verified means exact cited excerpts were present in subject-visible records; it is not semantic proof.", ""])
+        lines.extend(["", "Verified describes the evidence check. Assess semantic proof from the cited excerpts and images.", ""])
         return "\n".join(lines)
 
 
@@ -1156,7 +1380,41 @@ def _recording_lease(memory):
         os.close(fd)
 
 
-def _handle_request(memory, method, args, *, writable):
+def _dream_summary(dream):
+    # Legacy passes didn't record which note events belonged to them.
+    default = 0 if dream["operation_count"] == dream.get("page_operations", 0) else None
+    return {"id": f"d{dream['seq']:06d}", "added_count": dream.get("added_count", default),
+            "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
+            "operation_count": dream["operation_count"], "transcript_head": dream["transcript_head"]}
+
+
+def _recent(memory, include_images, viewed):
+    records = memory.transcript[-120:]
+    attachments = []
+    budget = 1024 * 1024
+    viewed.clear()
+    if include_images:
+        for record in reversed(records):
+            for descriptor in record.get("images", []):
+                ref, digest = record["id"], descriptor["sha256"]
+                if (ref, digest) in viewed or descriptor["bytes"] > budget:
+                    continue
+                try:
+                    image = memory.image(ref, digest)
+                except (MemoryError, OSError):
+                    continue  # Keep the text and descriptor available for inspection.
+                attachments.append({"ref": ref, "sha256": digest, "image": image})
+                viewed.add((ref, digest))
+                budget -= descriptor["bytes"]
+                if len(attachments) == MAX_RECORD_IMAGES:
+                    break
+            if len(attachments) == MAX_RECORD_IMAGES:
+                break
+    return {"records": [{**r, "text": r["text"][:1501]} for r in records], "attachments": attachments}
+
+
+def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
+                    resize=None, viewed=None):
     if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable:
         raise MemoryError("Somni memory changes require the session that owns recording")
     if method == "phase":
@@ -1164,14 +1422,19 @@ def _handle_request(memory, method, args, *, writable):
     elif method == "record":
         index_bytes = args.get("index_bytes")
         _validate_index_bound(index_bytes)
-        ref = memory.record(args["source"], args["text"])
+        images, omitted = args.get("images", []), args.get("omitted_images", 0)
+        if not isinstance(images, list):
+            raise MemoryError("invalid tool result image list")
+        ref = memory.record(args["source"], args["text"], context=context, images=images, omitted_images=omitted,
+                            clip=True, image_bytes=image_bytes, resize=resize)
         return ref if index_bytes is None else memory.inject(index_bytes)
     elif method == "note":
         if len(canonical(args).encode("utf-8")) > MAX_INPUT_BYTES:
             raise MemoryError("note input exceeds byte limit")
         return memory.add_note(args["text"], args["status"], args["evidence"], args["salience"])
     elif method == "dream":
-        return memory.dream(json.loads(args["proposal_json"]), partial=True)
+        dream = memory.dream(json.loads(args["proposal_json"]), partial=True, allow_empty=True, viewed_images=viewed)
+        return {**dream, **_dream_summary(dream)}
     elif method == "inject":
         return memory.load().inject(args["index_bytes"])
     elif method == "search":
@@ -1181,8 +1444,15 @@ def _handle_request(memory, method, args, *, writable):
         query, limit = args["query"], args["limit"]
         return memory.recall_pages(query, limit) + memory.recall(query, limit)
     elif method == "recent":
-        return [{"id": r["id"], "source": r["source"], "text": r["text"][:1500]}
-                for r in memory.load().transcript[-120:]]
+        return _recent(memory.load(), args.get("include_images", False), viewed)
+    elif method == "image":
+        ref, digest = args["ref"], args["sha256"]
+        image = memory.load().image(ref, digest)
+        if args.get("during_dream"):
+            if len(viewed) >= 12 and (ref, digest) not in viewed:
+                raise MemoryError("this dream reached its image retrieval limit")
+            viewed.add((ref, digest))
+        return image
     elif method == "wiki":
         # With python -I, explicitly add this package's root for the formatter.
         root = str(pathlib.Path(__file__).resolve().parent.parent)
@@ -1190,6 +1460,7 @@ def _handle_request(memory, method, args, *, writable):
             sys.path.insert(0, root)
         from somni.dream import PAGE_GUIDE, _uncovered, render_pages
 
+        viewed.clear()
         memory.load()
         uncovered = _uncovered(memory)[:120]
         return {
@@ -1200,33 +1471,44 @@ def _handle_request(memory, method, args, *, writable):
         raise MemoryError(f"unknown Somni backend method: {method}")
 
 
-def _serve(memory, record):
+def _serve(memory, record, *, context, image_bytes, image_max_edge):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
 
-    with _recording_lease(memory) if record else nullcontext(None) as owner:
+    resize = None
+    if not 0 <= image_bytes <= MAX_IMAGE_BYTES or not 0 <= image_max_edge <= 4096:
+        raise MemoryError(f"image byte cap must be 0..{MAX_IMAGE_BYTES} and max edge must be 0..4096")
+    if image_bytes and image_max_edge:
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise MemoryError("SOMNI_IMAGE_MAX_EDGE requires Pillow in SOMNI_PYTHON") from exc
+        resize = (Image, image_max_edge)
+    viewed = set()
+    with _recording_lease(memory) as owner:
         if owner is not False and not os.path.lexists(memory.store):
             SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
         memory = SomniMemory(memory.workspace, memory.subject_id, scheduled_verification=True)
-        if owner:
+        if owner and record:
             memory.set_phase("open", allow_same=True)
         else:
             memory.load()
         try:
             reply(0, result={"writable": owner is not False})
-            while line := sys.stdin.buffer.readline(512 * 1024 + 1):
-                if len(line) > 512 * 1024:
+            while line := sys.stdin.buffer.readline(MAX_BACKEND_REQUEST + 1):
+                if len(line) > MAX_BACKEND_REQUEST:
                     raise MemoryError("Somni backend request exceeds byte limit")
                 request_id = None
                 try:
                     request = json.loads(line)
                     request_id = request["id"]
-                    result = _handle_request(memory, request["method"], request["args"], writable=owner is not False)
+                    result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
+                                             image_bytes=image_bytes, resize=resize, viewed=viewed)
                     reply(request_id, result=result)
                 except (MemoryError, OSError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                     reply(request_id, error=str(exc))
         finally:
-            if owner:
+            if owner and record:
                 memory.set_phase("closed", allow_same=True)
 
 
@@ -1266,6 +1548,10 @@ def parser():
     commands.add_parser("session-open"); commands.add_parser("session-close")
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
     serve.add_argument("--record", action="store_true")
+    serve.add_argument("--run-label")
+    serve.add_argument("--tags", default="[]")
+    serve.add_argument("--image-bytes", type=int, default=DEFAULT_IMAGE_BYTES)
+    serve.add_argument("--image-max-edge", type=int, default=0)
     record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES), required=True); record.add_argument("--text", required=True)
     record.add_argument("--inject-max-bytes", type=int, help="emit the updated index instead of the record ID")
     note = commands.add_parser("note"); note.add_argument("--input", required=True, help="claim JSON relative to workspace, or - for stdin")
@@ -1273,6 +1559,7 @@ def parser():
     search = commands.add_parser("search"); search.add_argument("query"); search.add_argument("--limit", type=int, default=20)
     inject = commands.add_parser("inject"); inject.add_argument("--max-bytes", type=int, default=DEFAULT_INJECTION_BYTES)
     commands.add_parser("report"); commands.add_parser("metrics")
+    commands.add_parser("status").add_argument("--json", action="store_true", help="emit the machine-readable status")
     return ap
 
 
@@ -1285,7 +1572,8 @@ def main():
             return 0
         memory = SomniMemory(args.workspace, args.subject_id)
         if args.command == "serve":
-            _serve(memory, args.record)
+            _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
+                   image_bytes=args.image_bytes, image_max_edge=args.image_max_edge)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":
@@ -1313,8 +1601,10 @@ def main():
             sys.stdout.write(memory.load().report())
         elif args.command == "metrics":
             print(json.dumps(memory.load().metrics(), indent=2, sort_keys=True))
+        elif args.command == "status":
+            print(json.dumps(memory.load().status(), ensure_ascii=False, sort_keys=True, indent=None if args.json else 2))
         return 0
-    except (MemoryError, OSError, KeyError) as exc:
+    except (MemoryError, OSError, KeyError, json.JSONDecodeError) as exc:
         print(f"LAYERED_MEMORY_ERROR {exc}", file=sys.stderr)
         return 2
 

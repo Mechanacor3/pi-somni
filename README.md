@@ -4,10 +4,10 @@
 and consolidates them offline ("dreaming"):
 
 1. **Transcript**: a canonical, hash-chained, append-only record of what the agent saw
-   (prompts, tool results) and said.
+   (prompts, bounded tool results, and screenshots) and said.
 2. **Claims**: short notes the agent writes. Every claim cites transcript records. A
-   `verified` claim must quote an exact excerpt of each record it cites, and the store checks
-   the quote character for character. `uncertain` is the honest default for interpretations.
+   `verified` claim cites an exact excerpt or a stored image from each record. The store checks
+   the quote character for character and checks image bytes against their SHA-256 digest.
 3. **Wiki**: pages that gather what is known about one subject. Pages are markdown that cite
    claims inline (`[n000012]`) and link other pages with `[[slug]]` wikilinks. Every link must
    resolve, and every cited claim must be active.
@@ -18,7 +18,7 @@ and consolidates them offline ("dreaming"):
 After every dream Somni renders the wiki as an **Obsidian-style vault** in
 `somni-v1/vault/`. Each page is one note with YAML frontmatter, *See also* and *Backlinks*
 sections, and an *Evidence* list. `index.md` is the map of content, and `claims.md` shows
-every claim with its exact transcript quotes. Open the folder in Obsidian, or read it on GitHub.
+every claim with its transcript quotes and image links. Open the folder in Obsidian, or read it on GitHub.
 The vault is a view; edits there are not read back.
 
 At the start of each run Somni injects a small index: page titles first, then claims by salience
@@ -36,7 +36,7 @@ See [evaluation methods, results, and tests](EVALUATION.md) for the full compari
 
 ## Install
 
-Requires Pi 1.0+ and `python3` (3.10 or newer, standard library only) on `PATH`.
+Requires Pi 1.0+ and `python3` (3.10 or newer) on `PATH`. Optional image downscaling uses Pillow.
 
 ```bash
 pi install git:github.com/Mechanacor3/pi-somni
@@ -61,6 +61,7 @@ In a session Somni records automatically, and adds these tools:
 |---|---|
 | `somni_recall` | Wiki pages, then claims, most relevant to a query |
 | `somni_search` | Exact phrase search over the transcript (to find evidence IDs) |
+| `somni_image` | Load image evidence by transcript ID and SHA-256 |
 | `somni_note` | Add a cited claim while working |
 | `somni_dream` | Submit a consolidation pass during `/somni-dream` or `/somni-wiki` |
 
@@ -71,10 +72,36 @@ recording session, asks the model for one pass, and reopens recording when the p
 Invalid operations (for example, a quote that does not match) are rejected one by one and
 listed in the pass record.
 
+With a vision-capable model, Somni attaches up to four recent images within a 1 MiB total
+budget. The dream can open older images with `somni_image` and cite one using
+`{"ref":"t000042","image_sha256":"<digest>"}`. The dream can cite images after receiving them
+as attachments or through the tool. Use `uncertain` for interpretations the evidence does not settle.
+
 During a dream, a `merge` operation can synthesize active claims into one new claim.
 Somni sorts their IDs, inherits their evidence, and hashes the parent fingerprints together
 with the combined text and status. Parent order and salience changes leave the digest
 stable. The claim log and rendered vault show the parent IDs and the provenance digest.
+
+### Headless runs
+
+Use Pi's normal model and login configuration. Point each task and its dream at the same store.
+
+```bash
+export SOMNI_WORKSPACE=/path/to/memory
+SOMNI_RUN_LABEL='test 001' SOMNI_TAGS='["world A", "harvest"]' \
+  pi --mode json -p 'Complete the task.'
+pi -p '/somni-dream what should carry over to the next world?'
+python3 somni/store.py --workspace "$SOMNI_WORKSPACE" --subject-id "${SOMNI_SUBJECT:-pi}" status --json
+```
+
+The one-shot dream waits for the pass and prints a line such as
+`Somni dream d000001: 1 added, 0 rejected, 0 merged.` It exits nonzero with a diagnostic if
+there is no committed pass. Use `--mode json -p` for the same dream with Pi's JSON events.
+In RPC mode, send `/somni-dream` as a `prompt` and wait for `agent_settled` before reading
+the store status. The status JSON reports the transcript head and count, active claims by
+status, and the last pass ID and counts. `added_count` includes corrections that create a
+replacement claim. For older passes that didn't record added and merged counts, those counts
+can be `null`. Claims inherit the union of run labels and tags from the records they cite.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -83,16 +110,32 @@ stable. The claim log and rendered vault show the parent IDs and the provenance 
 | `SOMNI_INJECT_BYTES` | `4096` | Size of the injected index (256–8192) |
 | `SOMNI_SUBJECT` | `pi` | Identity bound into the store's manifest |
 | `SOMNI_PYTHON` | `python3` | Interpreter for the backend |
+| `SOMNI_RUN_LABEL` | unset | Optional label on each recorded event, up to 96 UTF-8 bytes |
+| `SOMNI_TAGS` | `[]` | JSON array of up to eight printable tags, each up to 96 UTF-8 bytes |
+| `SOMNI_TOOL_RESULT_BYTES` | `4096` | Tool result text budget in UTF-8 bytes, clamped to 512–8000 |
+| `SOMNI_DIGEST_TOOLS` | `stream_read` | Comma-separated tool names whose text output is recorded as a byte count and SHA-256 alongside their arguments. An empty value disables this policy |
+| `SOMNI_IMAGE_BYTES` | `262144` | Stored bytes per image, up to 2097152. Set to `0` to disable image capture |
+| `SOMNI_IMAGE_MAX_EDGE` | `0` | Optional thumbnail edge in pixels, up to 4096. Requires Pillow in `SOMNI_PYTHON` |
 
-The store holds user prompt text, text from non-Somni tool results, assistant text, and derived
-memory. The configured model can receive the bounded index, recalled content, and excerpts selected
-for dreaming. Keep the store out of version control. Set `SOMNI_RECORD=0` before launching Pi
-to pause automatic recording. It can still inject and retrieve existing memory.
+Somni records finalized assistant text blocks before, between, and after tool calls. Large tool
+results get a bounded preview with the original byte count and SHA-256. These policies apply to
+the Somni transcript. Pi itself receives the original tool result. The store keeps up to four
+PNG, JPEG, GIF, or WebP images per result in `somni-v1/images/` and deduplicates them by content.
+The image budget is 64 MiB per store. Records count images omitted by the size, format, or
+storage limits. If configured, Pillow converts downscaled images to JPEG before hashing,
+with a 4 MiB input limit. Keep the store out of version control. Set `SOMNI_RECORD=0` before
+launching Pi to pause automatic recording while retaining memory retrieval.
 
 One Pi process owns recording in a workspace at a time. A second Pi can use existing memory while
 the first owns the store. Close the second session and reopen it after the first exits to take over
 recording. Pi starts one local Python child for the session and exchanges requests over private
-pipes. The child verifies the store on open and reuses that verified snapshot for up to 128
+pipes. The child holds an OS lock on `.somni-session.lock`. The file stays in the workspace.
+If Pi is killed, the pipe closes and the child releases its lock. If the child is killed too,
+the kernel releases it directly. The next writer verifies the chain and recovers an interrupted
+transaction on startup. PID namespaces do not affect ownership on the same mounted store.
+Leave the lock file in place so concurrent sessions lock the same file.
+The extension can be mounted read-only with `SOMNI_WORKSPACE` on a separate writable mount.
+The child reuses a verified snapshot for up to 128
 store accesses or 60 seconds. It runs the next full check on access once either limit is
 reached, when it detects an outside file change, during recovery, and after a dream. New
 writes still extend the hash chain and use the transaction journal. A standalone store
@@ -103,7 +146,7 @@ store, close all Pi sessions using it, then move the directory named by `SOMNI_W
 remain visible in the vault for repair while recall and the injected index skip them.
 
 The store also has a CLI: `python3 somni/store.py --workspace W --subject-id S
-{init,session-open,session-close,record,note,dream,search,inject,report,metrics}`.
+{init,session-open,session-close,record,note,dream,search,inject,report,metrics,status}`.
 
 ## Dreaming internals
 
@@ -117,7 +160,7 @@ imports, build recipes, and benchmark details, see [Evaluation](EVALUATION.md).
   writable mount is the Somni workspace.
 - Record only what the agent itself saw or produced. Hash chains detect accidental or
   out-of-band edits on load; they are not signatures against an agent that owns the files.
-- `verified` means "the cited excerpts exist", not "the interpretation is true".
+- `verified` means Somni checked the cited excerpt or image against the transcript.
 
 ## Background and credits
 
@@ -144,7 +187,7 @@ What Somni adds:
 - **No dangling links.** A link must point to a page that already exists. The essay lists links
   to not-yet-created pages as a failure mode.
 - **Checked evidence.** Every claim must cite transcript records, and `verified` claims must quote
-  them exactly, which the store checks. History is hash-chained and append-only.
+  them exactly or cite a stored image, which the store checks. History is hash-chained and append-only.
 - **Hard size bounds** on every layer.
 - **Partial dream passes** that log their rejected operations.
 - **Deterministic recall.**

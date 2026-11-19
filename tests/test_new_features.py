@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Recall, partial dreams, batch recording, limits, the dream loop and the STATE-Bench adapter."""
+import base64
+import io
 import json
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from somni import dream as dm  # noqa: E402
-from somni.store import SomniError, SomniMemory  # noqa: E402
+from somni.store import SomniError, SomniMemory, _recent  # noqa: E402
+
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMInhkAAAJ/AT1GZIqVAAAAAElFTkSuQmCC"
 
 
 class FeatureTest(unittest.TestCase):
@@ -59,6 +64,64 @@ class FeatureTest(unittest.TestCase):
         top = self.memory.recall("what cancellation fee applies", 2)
         self.assertEqual([c["id"] for c in top], ["n000002", "n000003"])
         self.assertEqual(self.memory.recall("zebra", 3), [])
+
+    def test_exact_run_tag_wins_over_shared_terms(self):
+        self.memory.set_phase("open")
+        for world, salience in (("world A", 5), ("world B", 1)):
+            ref = self.memory.record("ordinary_observation", "look around", context={"tags": [world]})
+            self.memory.add_note("look for landmarks", "uncertain", [{"ref": ref}], salience)
+        self.assertEqual(self.memory.recall("world B", 1)[0]["tags"], ["world B"])
+
+    def test_images_are_deduplicated_and_bound_to_cited_records(self):
+        memory = self.memory
+        memory.set_phase("open")
+        image = {"mimeType": "image/png", "data": PNG}
+        first = memory.record("tool_result", "screenshot", images=[image],
+                              context={"run_label": "task A", "tags": ["forest"]})
+        # The budget is full after one image, but the same content can still be referenced.
+        with patch("somni.store.MAX_IMAGE_STORE_BYTES", len(base64.b64decode(PNG))):
+            second = memory.record("tool_result", "again", images=[image],
+                                   context={"run_label": "task B", "tags": ["desert"]})
+            missing = memory.record("tool_result", "oversized or disabled", images=[image], image_bytes=0)
+        self.assertEqual(len(list((memory.store / "images").iterdir())), 1)
+        self.assertEqual(memory.transcript[2]["omitted_images"], 1)
+        digest = memory.transcript[0]["images"][0]["sha256"]
+        self.assertEqual(memory.transcript[1]["images"][0]["sha256"], digest)
+        memory.set_phase("closed")
+        evidence = [{"ref": first, "image_sha256": digest}, {"ref": second, "image_sha256": digest}]
+        operation = {"op": "add", "text": "The two screenshots match.", "status": "verified"}
+        proposal = {"schema": 1, "operations": [{**operation, "evidence": evidence}]}
+        with self.assertRaisesRegex(SomniError, "view the cited image"):
+            memory.dream(proposal, viewed_images=set())
+        with self.assertRaisesRegex(SomniError, "match an image"):
+            memory.dream({"schema": 1, "operations": [{**operation, "evidence": [{"ref": missing, "image_sha256": digest}]}]})
+        viewed = set()
+        attachments = _recent(memory, True, viewed)["attachments"]
+        self.assertEqual({item["ref"] for item in attachments}, {first, second})
+        memory.dream(proposal, viewed_images=viewed)
+        self.assertEqual(memory.claims["n000001"]["run_labels"], ["task A", "task B"])
+        self.assertEqual(memory.claims["n000001"]["tags"], ["desert", "forest"])
+        blob = next((memory.store / "images").iterdir())
+        blob.write_bytes(b"!" * blob.stat().st_size)
+        with self.assertRaisesRegex(SomniError, "does not match its transcript digest"):
+            memory.image(first, digest)
+
+    def test_optional_downscale_stores_a_bounded_thumbnail(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("optional Pillow dependency is unavailable")
+        original = io.BytesIO()
+        Image.new("RGB", (120, 80), "green").save(original, "PNG")
+        data = base64.b64encode(original.getvalue()).decode()
+        self.memory.set_phase("open")
+        ref = self.memory.record("tool_result", "frame", images=[{"mimeType": "image/png", "data": data}],
+                                 image_bytes=1024, resize=(Image, 24))
+        descriptor = self.memory.transcript[0]["images"][0]
+        image = self.memory.image(ref, descriptor["sha256"])
+        with Image.open(io.BytesIO(base64.b64decode(image["data"]))) as thumbnail:
+            self.assertEqual(thumbnail.size, (24, 16))
+            self.assertEqual(thumbnail.format, "JPEG")
 
     def test_dream_pass_retries_with_reasons_and_never_raises(self):
         self.memory.set_phase("open")

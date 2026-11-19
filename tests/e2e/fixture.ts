@@ -1,4 +1,4 @@
-/** Test-only fixture: a deterministic tool that returns JSON, standing in for any API tool. */
+/** Deterministic tool results used by the offline Pi tests. */
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -14,4 +14,30 @@ export default function (pi: ExtensionAPI) {
 			return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
 		},
 	});
+	pi.registerTool({
+		name: "screenshot",
+		label: "Screenshot",
+		description: "Return screenshot metadata and a tiny PNG.",
+		parameters: Type.Object({}),
+		async execute() {
+			const details = { frame_time: 100, frame_age_ms: 25 };
+			return { content: [
+				{ type: "text" as const, text: JSON.stringify(details) },
+				{ type: "image" as const, mimeType: "image/png",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMInhkAAAJ/AT1GZIqVAAAAAElFTkSuQmCC" },
+			], details };
+		},
+	});
+	for (const name of ["stream_read", "large_result"]) {
+		pi.registerTool({
+			name,
+			label: name,
+			description: "Return a large payload.",
+			parameters: Type.Object({}),
+			async execute() {
+				const text = name === "stream_read" ? "ABCD".repeat(524288) : "🌱".repeat(2048);
+				return { content: [{ type: "text" as const, text }], details: {} };
+			},
+		});
+	}
 }

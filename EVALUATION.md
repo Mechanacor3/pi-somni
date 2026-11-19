@@ -185,6 +185,10 @@ implemented and tested, but were not fully evaluated: the evaluation budget ran 
 
 ## Verification tests
 
+The offline Pi suite covers screenshot capture and citation, bounded tool results, run tags,
+one-shot and RPC dreams, writer recovery after `SIGKILL`, and a read-only extension install.
+It uses a scripted model that checks whether Pi sends the actual screenshot bytes.
+
 From the Somni repository root:
 
 ```bash
