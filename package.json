@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "repository": {"type": "git", "url": "git+https://github.com/Mechanacor3/pi-somni.git"},
-  "files": ["extensions/", "somni/*.py", "adapters/", "README.md", "LICENSE"],
+  "files": ["extensions/", "somni/*.py", "adapters/**/*.py", "README.md", "LICENSE"],
   "pi": {"extensions": ["./extensions/somni.ts"]},
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
