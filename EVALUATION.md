@@ -45,9 +45,10 @@ The persistent mode sends events one at a time to the same Python child, in trai
 order. The replay records user prompts, tool results, and assistant output. It measures index
 generation on user turns and omits the training adapter's episode markers and system messages.
 The JSON report includes per-event timings, medians, and p95 values. Set `TMPDIR`
-to a directory on the filesystem you want to measure. Omit `--persistent` to measure
-one process per event, or add `--separate-user-events` to time separate recording and index calls
-on each user turn. `--somni-root` selects another Somni checkout for comparisons.
+to a directory on the filesystem you want to measure. On Linux, set `TMPDIR=/dev/shm`
+to time a disposable RAM-backed store. Omit `--persistent` to measure one process per
+event, or add `--separate-user-events` to time separate recording and index calls on
+each user turn. `--somni-root` selects another Somni checkout for comparisons.
 
 ## STATE-Bench Agent Learning Track
 
