@@ -102,6 +102,97 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertTrue({"somni_recall", "somni_search", "somni_note", "somni_dream", "lookup_fee"} <= tools)
         self.assertTrue(all("not-a-real-key" not in text_of(m.get("content")) for r in self.upstream.requests for m in r["messages"]))
 
+    def test_prompt_ranked_index_in_recording_and_read_only_sessions(self):
+        self.pi.close()
+        store = self.work / "seeded-memory"
+        store.mkdir()
+        memory = SomniMemory.create(store, "pi", "test", "index")
+        memory.set_phase("open")
+        for number in range(10):
+            ref = memory.record("tool_result", "Earlier attempt", context={"run_label": "test 0040"})
+            memory.add_note(f"Old lesson {number} for test 004. " + "Prior observations. " * 22,
+                            "uncertain", [{"ref": ref}], 5)
+        ref = memory.record("tool_result", "The retry failed", context={"tags": ["test 004"]})
+        claim = memory.add_note("Long guidance for the next retry. " * 12, "uncertain", [{"ref": ref}], 5,
+                                gist="Verify the staging mark before retrying.")
+        memory.set_phase("closed")
+        memory.dream({"schema": 1, "operations": [
+            {"op": "page", "slug": "archive", "title": "Archive", "body": "Earlier attempts [n000001].",
+             "claims": ["n000001"]},
+            {"op": "page", "slug": "retry", "title": "Retry", "body":
+             f"Overview [{claim}].\n\n## Procedure\n\n### Before retrying\nCheck the staging mark.\n\n## Appendix\n" + "背景" * 500,
+             "claims": [claim]},
+        ]})
+        self.assertNotIn("- n000010 ", memory.inject())
+        for recording in ("1", "0"):
+            with self.subTest(recording=recording):
+                self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port,
+                                    env={"SOMNI_WORKSPACE": store.name, "SOMNI_RECORD": recording})
+                try:
+                    self.pi.prompt("Compare the prior observations for Test 004 before proceeding.")
+                    messages = [text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]]
+                    index = next(m for m in messages if m.startswith("# Subject memory index"))
+                    self.assertLessEqual(len(index.encode("utf-8")), 4096)
+                    self.assertLess(index.index(f"- {claim} "), index.index("- n000010 "))
+                    self.assertLess(index.index("page `retry`"), index.index("page `archive`"))
+                    self.assertIn("## Procedure\n\n### Before retrying\nCheck the staging mark.", index)
+                    self.assertNotIn("## Appendix", index)
+                    self.assertIn("Verify the staging mark before retrying.", index)
+                    self.assertNotIn("Long guidance for the next retry", index)
+                finally:
+                    self.pi.close()
+
+    def test_dream_checks_chel_rule_and_blocks_live_tools(self):
+        self.pi.close()
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port,
+                            env={"SOMNI_CHEL_LEARNING": "1"})
+        plans = {cabin: [[("lookup_fee", {"cabin": cabin, "price": 300})]] for cabin in ("economy", "business")}
+        self.upstream.script = plan_script(plans)
+        for cabin in ("economy", "business", "economy"):
+            self.pi.prompt(cabin)
+        memory = SomniMemory(self.work / ".pi" / "somni", "pi").load()
+        refs = [r["id"] for r in memory.transcript if r.get("tool_ok")]
+        self.assertEqual(len(refs), 3)
+        rule = {"id": "economy_fee", "text": "The economy cancellation fee is 50 for a fare of 300.",
+                "when": {"action.kind": "lookup_fee", "obs.arg_cabin": "economy", "obs.arg_price": 300},
+                "then": {"fee": {"set": 50}}}
+        op = {"op": "ledger_propose", "proposal": {"op": "add", "rule": rule}, "tests": {"yes": refs[0], "no": refs[1]}}
+        plans["Dream pass."] = [[("write", {"path": "dream-marker", "content": "unexpected"})],
+                                [("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [op]})})]]
+        self.pi.prompt("/somni-dream cancellation fees")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        self.assertTrue(next(e for e in self.pi.tool_ends() if e["toolName"] == "write")["isError"])
+        self.assertFalse((self.work / "dream-marker").exists())
+        self.assertEqual(memory.load().learning_ledger().rules_view()["economy_fee"]["support"], 2)
+        plans["Recall the economy"] = [[("somni_recall", {"query": "economy fee"})]]
+        self.pi.prompt("Recall the economy cancellation fee")
+        self.assertIn("- rule economy_fee", json.dumps(self.upstream.requests[-1]["messages"]))
+        recall = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_recall")
+        self.assertIn("Rule economy_fee", text_of(recall["result"]["content"]))
+
+    def test_dream_record_settings_bound_the_prompt(self):
+        self.pi.close()
+        store = self.work / "dream-memory"
+        store.mkdir()
+        memory = SomniMemory.create(store, "pi", "test", "dream")
+        memory.set_phase("open")
+        memory.record("ordinary_observation", "Earlier record outside the dream window")
+        memory.record("tool_result", "Recent evidence " + "雪" * 80 + " hidden tail")
+        memory.set_phase("closed")
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port,
+                            env={"SOMNI_WORKSPACE": store.name, "SOMNI_DREAM_RECORDS": "1",
+                                 "SOMNI_DREAM_RECORD_BYTES": "80"})
+        self.pi.prompt("/somni-dream fees")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        messages = [text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]]
+        prompt = next(m for m in messages if m.startswith("Dream pass."))
+        self.assertNotIn("Earlier record outside the dream window", prompt)
+        excerpt = prompt.split("[t000002] (tool_result) ")[1]
+        self.assertTrue(excerpt.startswith("Recent evidence 雪"))
+        self.assertTrue(excerpt.endswith("[excerpt truncated]"))
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 80)
+        self.assertIn("hidden tail", memory.load().transcript[-1]["text"])
+
     def test_second_pi_session_cannot_write_or_close_the_first(self):
         self.pi.prompt("What is the fee to cancel economy fare 300?")
         store = self.work / ".pi" / "somni"

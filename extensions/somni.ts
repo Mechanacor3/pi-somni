@@ -8,8 +8,8 @@
  * What it does in a session:
  *   - session_start: create the store if needed (SOMNI_WORKSPACE, default
  *     `<cwd>/.pi/somni`) and open a recording session.
- *   - before_agent_start: inject the bounded, salience-ordered claim index plus the
- *     claims most relevant to the prompt as one hidden custom message.
+ *   - before_agent_start: inject a bounded index of relevant pages and claims as
+ *     one hidden custom message.
  *   - while running: record the user prompt (observation), each tool result
  *     (tool_result) and the assistant's text blocks (agent_output) into the
  *     hash-chained transcript. Tool results can attach bounded images.
@@ -41,9 +41,16 @@ const SUBJECT = process.env.SOMNI_SUBJECT ?? "pi";
 const RECORD = process.env.SOMNI_RECORD !== "0";
 const configuredBytes = Number(process.env.SOMNI_INJECT_BYTES ?? 4096);
 const INJECT_BYTES = Number.isInteger(configuredBytes) ? Math.min(Math.max(configuredBytes, 256), 8192) : 4096;
+const LEARNING = process.env.SOMNI_CHEL_LEARNING === "1";
+const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream"]);
+const MAX_INDEX_QUERY_BYTES = 65_536;
 const MAX_RECORD_BYTES = 8000;
 const configuredToolBytes = Number(process.env.SOMNI_TOOL_RESULT_BYTES ?? 4096);
 const TOOL_RESULT_BYTES = Number.isInteger(configuredToolBytes) ? Math.min(MAX_RECORD_BYTES, Math.max(512, configuredToolBytes)) : 4096;
+const configuredDreamRecordBytes = Number(process.env.SOMNI_DREAM_RECORD_BYTES ?? 1500);
+const DREAM_RECORD_BYTES = Number.isInteger(configuredDreamRecordBytes) ? Math.min(8192, Math.max(64, configuredDreamRecordBytes)) : 1500;
+const configuredDreamRecords = Number(process.env.SOMNI_DREAM_RECORDS ?? 120);
+const DREAM_RECORDS = Number.isInteger(configuredDreamRecords) ? Math.min(120, Math.max(1, configuredDreamRecords)) : 120;
 const DIGEST_TOOLS = new Set((process.env.SOMNI_DIGEST_TOOLS ?? "stream_read").split(",").map((name) => name.trim()));
 const MAX_IMAGE_INPUT = 4 * 1024 * 1024;
 const MAX_RECORD_IMAGES = 4;
@@ -55,11 +62,11 @@ const Evidence = Type.Array(Type.Object({
 
 type RecordContext = { tags?: string[]; run_label?: string; run_labels?: string[] };
 type TranscriptRecord = RecordContext & {
-	id: string; source: string; text: string; images?: { sha256: string }[]; omitted_images?: number;
+	id: string; source: string; text: string; tool_ok?: boolean; images?: { sha256: string }[]; omitted_images?: number;
 };
 type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[] };
-type DreamResult = { id: string; added_count: number; merged_count: number; rejected_count: number };
-type DreamRun = { submitting: boolean; result?: DreamResult; error?: string };
+type DreamResult = { id: string; learning_count?: number; added_count: number; merged_count: number; rejected_count: number };
+type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string };
 const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
 	backend: undefined as Backend | undefined,
@@ -102,7 +109,7 @@ function notify(ctx: ExtensionContext, message: string) {
 }
 
 async function record(source: "ordinary_observation" | "tool_result" | "agent_output", text: string, ctx: ExtensionContext,
-		options: { index_bytes?: number; images?: ImageContent[]; omitted_images?: number } = {}) {
+		options: { tool_ok?: boolean; index_bytes?: number; query?: string; images?: ImageContent[]; omitted_images?: number } = {}) {
 	if (!canRecord() || !text.trim()) return;
 	try {
 		const output = await getBackend().request<string>("record", {
@@ -164,15 +171,17 @@ function contextLabel(record: RecordContext) {
 	return `${labels.length ? ` [run: ${labels.join(", ")}]` : ""}${tags.length ? ` [tags: ${tags.join(", ")}]` : ""}`;
 }
 
-function describeRecord(record: TranscriptRecord, chars: number) {
+function describeRecord(record: TranscriptRecord, chars = record.text.length) {
 	const images = (record.images ?? []).map(({ sha256 }) => ` [image_sha256=${sha256}]`).join("");
 	const omitted = record.omitted_images ? ` [${record.omitted_images} image(s) omitted by storage limits or format]` : "";
 	const excerpt = record.text.length > chars ? `${record.text.slice(0, chars)} [excerpt truncated]` : record.text;
-	return `[${record.id}] (${record.source})${contextLabel(record)} ${excerpt}${images}${omitted}`;
+	const status = record.tool_ok === undefined ? "" : record.tool_ok ? " [tool ok]" : " [tool error]";
+	return `[${record.id}] (${record.source})${status}${contextLabel(record)} ${excerpt}${images}${omitted}`;
 }
 
 function summary(result: DreamResult) {
-	return `Somni dream ${result.id}: ${result.added_count} added, ${result.rejected_count} rejected, ${result.merged_count} merged.`;
+	const learning = result.learning_count ? ` ${result.learning_count} ledger revision(s) accepted.` : "";
+	return `Somni dream ${result.id}: ${result.added_count} added, ${result.rejected_count} rejected, ${result.merged_count} merged.${learning}`;
 }
 
 function asText(value: unknown) {
@@ -195,7 +204,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const backend = requireWriteAccess();
 			if (state.dream || !ctx.isIdle()) throw new Error("Wait for the current Pi turn to settle first.");
-			run = { submitting: false };
+			run = { submitting: false, reads: 0, submissions: 0 };
 			state.dream = run;
 			const content = await load();
 			if (content === undefined) {
@@ -230,6 +239,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id: string, params: { query: string; limit?: number }) {
 			const hits = await getBackend().request<any[]>("recall", { query: params.query.slice(0, 2000), limit: params.limit ?? 5 });
 			const lines = hits.slice(0, params.limit ?? 5).map((h) => {
+				if (h.kind === "rule") return `Rule ${h.id} (${h.support} supporting transitions): ${h.text}\n${JSON.stringify({ when: h.when, then: h.then })}`;
 				if (h.slug) return `# ${h.title} (page ${h.slug})\n${h.body}`;
 				const lineage = h.merged_from ? `; merged from ${h.merged_from.join(", ")}` : "";
 				return `${h.id} [${h.status}; ${h.evidence.length} cited${lineage}]${contextLabel(h)} ${h.text}`;
@@ -263,9 +273,11 @@ export default function (pi: ExtensionAPI) {
 		label: "Somni note",
 		description:
 			"Add a durable memory claim. Cite transcript IDs as evidence; 'verified' requires an exact quote " +
-			"or the image_sha256 of a stored image from each record. Use 'uncertain' for interpretations. Salience 1-5.",
+			"or the image_sha256 of a stored image from each record. Use 'uncertain' for interpretations. Salience 1-5. " +
+			"For longer claims, an optional one-line gist of up to 160 UTF-8 bytes appears in the memory index.",
 		parameters: Type.Object({
 			text: Type.String(),
+			gist: Type.Optional(Type.String({ maxLength: 160 })),
 			status: Type.Union([Type.Literal("verified"), Type.Literal("uncertain")]),
 			salience: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
 			evidence: Evidence,
@@ -290,7 +302,7 @@ export default function (pi: ExtensionAPI) {
 			if (run.result || run.submitting) throw new Error("Only one dream pass can be committed per command.");
 			run.submitting = true;
 			try {
-				const out = await backend.request<DreamResult>("dream", params);
+				const out = await backend.request<DreamResult>("dream", { proposal_json: params.proposal_json });
 				run.result = out;
 				return { content: asText(out), details: out };
 			} catch (error) {
@@ -305,14 +317,32 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("somni-dream", {
 		description: "Consolidate recent transcript into cited memory claims (offline dreaming)",
 		handler: (args, ctx) => submitCommand(ctx, async () => {
-			const recent = await getBackend().request<Recent>("recent", { include_images: ctx.model?.input.includes("image") ?? false });
+			const recent = await getBackend().request<Recent>("recent", {
+				include_images: ctx.model?.input.includes("image") ?? false,
+				record_limit: DREAM_RECORDS, record_bytes: DREAM_RECORD_BYTES,
+			});
+			let learningGuide = "";
+			if (LEARNING) {
+				const ledger = await getBackend().request("ledger");
+				learningGuide = "You may submit op=ledger_propose with proposal in Chel format. For add or revise, include " +
+					'tests: {yes:"tXXXXXX",no:"tYYYYYY"}. The yes transition must support the prediction. The no transition ' +
+					"must be the same action kind and fall outside when on observed inputs, or flip a predicted boolean from true to false. Rules need two supporting " +
+					"transitions and zero counterexamples across history. Rule = {id,text,when,then}. Use obs.arg_FIELD " +
+					"and action.kind in when, and result fields with {set:value}, {copy:ref} or {expr:expression} in then. " +
+					"Proposal ops: add (rule), revise (target,rule), retract (target,reason), define_verb " +
+					"(verb:{name,params,doc,source,examples:[{args,result}]}). Verbs are pure Python with 2–32 worked examples on distinct inputs. Boolean verbs need true and false results. " +
+					"Current ledger: " + clip(JSON.stringify(ledger), 4096) + ". ";
+			}
 			const focus = args?.trim() || "lessons that will help in future sessions";
 			const prompt = `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
 				`For 'verified', cite an exact quote from the record or cite a screenshot you viewed as ` +
 				`{"ref":"t000001","image_sha256":"<digest>"}. Use somni_image for images not attached here. ` +
-				`Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
-				recent.records.map((r) => describeRecord(r, 1500)).join("\n");
+				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
+				`Reserve 5 for at most two claims that matter in most future runs. Add an optional one-line gist ` +
+				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
+				learningGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
+				recent.records.map((r) => describeRecord(r)).join("\n");
 			const content: (TextContent | ImageContent)[] = asText(prompt);
 			for (const { ref, sha256, image } of recent.attachments) {
 				content.push(...asText(`Screenshot for [${ref}] image_sha256=${sha256}`), image);
@@ -353,6 +383,7 @@ export default function (pi: ExtensionAPI) {
 		if (process.env.SOMNI_RUN_LABEL !== undefined) args.push(`--run-label=${process.env.SOMNI_RUN_LABEL}`);
 		if (process.env.SOMNI_TAGS !== undefined) args.push(`--tags=${process.env.SOMNI_TAGS}`);
 		if (RECORD) args.push("--record");
+		if (LEARNING) args.push("--learning");
 		const backend = new Backend(PYTHON, args, (error) => {
 			if (state.backend !== backend) return;
 			state.backend = undefined;
@@ -384,9 +415,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.backend || state.dream) return undefined;
 		const prompt = event.messageType === "custom" ? undefined : event.prompt;
-		let index = prompt ? await record("ordinary_observation", `USER: ${prompt}`, ctx, { index_bytes: INJECT_BYTES }) : undefined;
+		const options = { index_bytes: INJECT_BYTES, query: prompt ? utf8Prefix(prompt, MAX_INDEX_QUERY_BYTES) : undefined };
+		let index = prompt ? await record("ordinary_observation", `USER: ${prompt}`, ctx, options) : undefined;
 		try {
-			index ??= await getBackend().request<string>("inject", { index_bytes: INJECT_BYTES });
+			index ??= await getBackend().request<string>("inject", options);
 			state.indexWarning = false;
 		} catch (error) {
 			if (!state.indexWarning) {
@@ -395,14 +427,27 @@ export default function (pi: ExtensionAPI) {
 			}
 			return undefined;
 		}
-		if (!/^-(?: n\d{6} | page `)/m.test(index)) return undefined;
+		if (!/^-(?: n\d{6} | rule | page `)/m.test(index)) return undefined;
 		return { message: { customType: "somni-index", content: index, display: false } };
+	});
+
+	pi.on("tool_call", (event) => {
+		const run = state.dream;
+		if (!run) return;
+		if (!DREAM_TOOLS.has(event.toolName) || run.result || run.submitting) {
+			return { block: true, reason: "Offline dreams may only inspect Somni evidence and submit one pass." };
+		}
+		if (event.toolName === "somni_dream") {
+			if (++run.submissions > 3) return { block: true, reason: "Dream submission attempt limit reached." };
+		} else if (++run.reads > 16) {
+			return { block: true, reason: "Dream evidence read limit reached. Submit the pass." };
+		}
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (!canRecord() || event.parentToolCallId || event.toolName.startsWith("somni_")) return;
 		const { text, options } = toolRecord(event.toolName, event.input, event.content);
-		await record("tool_result", text, ctx, options);
+		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false });
 	});
 
 	pi.on("message_end", async (event, ctx) => {

@@ -55,7 +55,10 @@ Rules the store enforces (violations are rejected):
 
 Write claims that generalize. Omit names, identifiers and one-off details unless they matter in future
 situations. One idea per claim, phrased as guidance ("Before X, do Y because Z."). Prefer correcting an
-existing claim over adding a near-duplicate. Salience 5 = applies to most future situations; 1 = rare edge case.
+existing claim over adding a near-duplicate. Use salience 3 for ordinary reusable lessons, 1–2 for narrow
+cases, and 4 for recurring situations. Reserve 5 for at most two claims that matter in most future runs.
+Add, correct and merge may include a one-line gist of up to 160 UTF-8 bytes for the index. Keep the full
+guidance in text.
 Return at most {max_ops} operations. Return only the JSON object."""
 
 
@@ -186,7 +189,7 @@ def fill_gaps(memory, complete, *, goal, log=print):
               "drop the redundant page and update any links to it in the same pass.\n"
               "2. Repair pages that cite claims which are no longer active (listed below): rewrite them on active claims.\n"
               "3. Write or update an `overview` page that links the main pages ([[slug]]) with one line on when to use each.\n"
-              "4. Promote: for up to 5 claims that apply to most situations, use promote to raise their salience to 5.\n\n"
+              "4. Promote: for up to two claims that apply to most situations, use promote to raise their salience to 5.\n\n"
               f"## Pages\n{render_pages(memory, body_chars=250)}\n\n## Stale pages\n{stale or '(none)'}\n\n"
               "## Highest-salience claims\n" + "\n".join(f"[{c['id']}] (salience {c['salience']}) {c['text']}" for c in top))
     trace = dream_pass(memory, [], complete, prompt_override=prompt, max_ops=24)

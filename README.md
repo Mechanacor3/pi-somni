@@ -21,9 +21,12 @@ sections, and an *Evidence* list. `index.md` is the map of content, and `claims.
 every claim with its transcript quotes and image links. Open the folder in Obsidian, or read it on GitHub.
 The vault is a view; edits there are not read back.
 
-At the start of each run Somni injects a small index: page titles first, then claims by salience
-(at most 8 KiB, never the whole transcript). Retrieval ranks pages and claims with a
-deterministic lexical (BM25, lightly stemmed) score.
+Before each Pi turn, Somni injects a small memory index ranked against the current user prompt.
+It prioritizes exact run labels and tags, then uses lexical similarity (BM25), salience, and
+the recency of the cited evidence. Pages get up to half the available space, with an excerpt
+from the best matching page. A long page can contribute its procedure section. Claim lines
+include evidence IDs and use a short gist when one is available. The index skips entries that
+exceed the remaining space and is capped at 8 KiB.
 
 The design follows Anthropic's engineering essay
 [*The components of agent memory*](https://www.anthropic.com/research/components-of-agent-memory)
@@ -75,6 +78,12 @@ recording session, asks the model for one pass, and reopens recording when the p
 Invalid operations (for example, a quote that does not match) are rejected one by one and
 listed in the pass record.
 
+Dreams can supply an optional one-line `gist` of up to 160 UTF-8 bytes when they add, correct,
+or merge a claim. `somni_note` also accepts a gist. `somni_recall` returns the full claim text.
+All readers of a store that contains gists need a Somni version that supports them.
+Dream guidance reserves salience 5 for up to two broadly useful claims per pass and uses 3
+for an ordinary reusable lesson.
+
 With a vision-capable model, Somni attaches up to four recent images within a 1 MiB total
 budget. The dream can open older images with `somni_image` and cite one using
 `{"ref":"t000042","image_sha256":"<digest>"}`. The dream can cite images after receiving them
@@ -84,6 +93,36 @@ During a dream, a `merge` operation can synthesize active claims into one new cl
 Somni sorts their IDs, inherits their evidence, and hashes the parent fingerprints together
 with the combined text and status. Parent order and salience changes leave the digest
 stable. The claim log and rendered vault show the parent IDs and the provenance digest.
+
+### Chel rule learning in dreams
+
+Set `SOMNI_CHEL_LEARNING=1` for the task and dream sessions to learn executable predictions. Somni uses the rule ledger and pure-Python verb runner from [pi-chel at ba2dee4](https://github.com/Mechanacor3/pi-chel/tree/ba2dee4186e2b4c019d8fd5d7eb25f8d39f414e9/chel). The package includes both modules under the MIT license.
+
+A **transition** comes from a successful tool call whose complete arguments and JSON object result fit in the transcript. Its `obs` contains the arguments as `arg_*` fields, `action.kind` names the tool, and `next_obs` contains the observed result fields. Older records without a recorded tool status stay available as ordinary evidence.
+
+During `/somni-dream`, a `ledger_propose` operation contains a Chel `proposal`. An `add` or `revise` also includes two transcript references in `tests`. For example, a dream could submit this operation when the cited evidence exists.
+
+```json
+{
+  "op": "ledger_propose",
+  "proposal": {
+    "op": "add",
+    "rule": {
+      "id": "confirmed_request",
+      "text": "Confirmed requests commit the change.",
+      "when": {"action.kind": "apply", "obs.arg_confirm": true},
+      "then": {"committed": {"set": true}}
+    }
+  },
+  "tests": {"yes": "t000004", "no": "t000010"}
+}
+```
+
+The yes case must match the rule and support every prediction. The no case must cite a different transition of the same action kind. It must fall outside the rule's conditions on observed inputs, or demonstrate a correctly predicted Boolean changing from true to false. Chel then replays the rule over all eligible transitions and requires at least two supporting transitions and zero counterexamples. A later contradiction falsifies the rule and removes it from recall and the injected index.
+
+The ledger also accepts Chel's `retract` and `define_verb` proposals. A **verb** is a pure function used by a rule. Chel checks its syntax and runs its worked examples in an isolated Python process with CPU, address-space, file-size, and process limits. Somni requires distinct worked inputs and both outcomes for Boolean verbs. Chel tests redefinitions against active rules that use the verb. Running a verb gives it no Pi tool capabilities.
+
+Accepted proposals and their test references are committed in the Somni dream chain. Use `python3 somni/store.py --workspace W --subject-id S ledger` to replay the ledger and inspect rule states, support counts, and verb names. The CLI accepts `--learning` on `dream` and `inject` to apply proposals and preview matching rules. Replay can run recorded verbs in Chel's worker. Offline dream and wiki turns allow up to 16 Somni evidence reads and three submission attempts, with one committed pass.
 
 ### Headless runs
 
@@ -116,6 +155,9 @@ can be `null`. Claims inherit the union of run labels and tags from the records 
 | `SOMNI_RUN_LABEL` | unset | Optional label on each recorded event, up to 96 UTF-8 bytes |
 | `SOMNI_TAGS` | `[]` | JSON array of up to eight printable tags, each up to 96 UTF-8 bytes |
 | `SOMNI_PAGE_GUIDE` | domain-neutral playbook guidance | Optional replacement for the wiki-writing guide |
+| `SOMNI_CHEL_LEARNING` | off | `1` enables Chel rule and verb proposals in dreams and rule retrieval in task sessions |
+| `SOMNI_DREAM_RECORDS` | `120` | Number of recent transcript records sent to `/somni-dream`, clamped to 1–120 |
+| `SOMNI_DREAM_RECORD_BYTES` | `1500` | UTF-8 text excerpt per dream record, including the truncation marker, clamped to 64–8192. IDs, metadata, and attachments have separate bounds |
 | `SOMNI_TOOL_RESULT_BYTES` | `4096` | Tool result text budget in UTF-8 bytes, clamped to 512–8000 |
 | `SOMNI_DIGEST_TOOLS` | `stream_read` | Comma-separated tool names whose text output is recorded as a byte count and SHA-256 alongside their arguments. An empty value disables this policy |
 | `SOMNI_IMAGE_BYTES` | `262144` | Stored bytes per image, up to 2097152. Set to `0` to disable image capture |
@@ -151,6 +193,8 @@ remain visible in the vault for repair while recall and the injected index skip 
 
 The store also has a CLI: `python3 somni/store.py --workspace W --subject-id S
 {init,session-open,session-close,record,note,dream,search,inject,report,metrics,status}`.
+Use `inject --query 'your prompt'` to preview a prompt-ranked index. Pi uses up to the
+first 64 KiB of the prompt for ranking.
 
 ## Dreaming internals
 
@@ -177,7 +221,7 @@ Somni implements the memory hierarchy described by Lance Martin in
 | Transcripts as a searchable event log at the base | `transcript.jsonl` and `somni_search` |
 | Memory notes written by the agent, which judges salience | Claims with salience 1–5 (`somni_note`) |
 | Representations: pages that gather one subject and link to notes and each other (wikis) | `wiki.jsonl` pages with `[[slug]]` links and `[nXXXXXX]` citations, rendered as an Obsidian vault |
-| Small injected context loaded every session (an index) | The bounded index from `inject`: page titles, then claims by salience |
+| Small injected context loaded every session (an index) | The bounded index from `inject`, with prompt-ranked pages and claims |
 | Dreaming corrects memory against the transcript | `correct` / `retract` operations (`/somni-dream`, `somni/dream.py dream_pass`) |
 | Dreaming builds new representations | `build_wiki` / `/somni-wiki`: claims gathered into pages, iterated until nearly all are covered |
 | Dreaming promotes notes up the hierarchy | `promote` raises a claim's salience into the injected index without changing its id |

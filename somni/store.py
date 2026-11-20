@@ -23,8 +23,8 @@ Layers (all under `<workspace>/somni-v1/`):
                     retract claims and write or drop pages, each bound to the
                     transcript head it reviewed.
 
-`inject` renders a small index for the start of a session (page titles, then
-claims by salience); `recall` ranks claims and `recall_pages` ranks pages for a query.  The store is stdlib-only, makes no
+`inject` renders a small index of pages and claims ranked for the current prompt;
+`recall` and `recall_pages` retrieve full claims and pages. The store is stdlib-only, makes no
 network calls, and reads nothing outside its workspace.  A trusted adapter must
 append only text the agent itself already saw or produced.
 """
@@ -32,7 +32,9 @@ append only text the agent itself already saw or produced.
 import argparse
 import base64
 import binascii
+from collections import Counter
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -53,12 +55,15 @@ SCHEMA = 1
 ZERO_HASH = "0" * 64
 MAX_RECORD_BYTES = 8_192
 MAX_NOTE_BYTES = 4_096
+MAX_GIST_BYTES = 160
 MAX_INPUT_BYTES = 65_536
 MAX_CLAIMS = 512
 MAX_TRANSCRIPT_RECORDS = 4_096
 MAX_DREAM_PASSES = 512
 MAX_LOG_BYTES = 16 * 1024 * 1024
 MAX_INJECTION_BYTES = 8_192
+DEFAULT_DREAM_RECORD_BYTES = 1_500
+DEFAULT_DREAM_RECORDS = 120
 DEFAULT_IMAGE_BYTES = 256 * 1024
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_INPUT = 4 * 1024 * 1024  # raw before optional downscaling
@@ -133,11 +138,10 @@ def _record_context(run_label=None, tags=None):
     return {**({"run_label": run_label} if run_label else {}), **({"tags": sorted(set(tags))} if tags else {})}
 
 
-def _clip_record(text, max_bytes):
+def _clip_record(text, max_bytes, marker=b" [truncated]"):
     data = text.encode("utf-8")
     if len(data) <= max_bytes:
         return text
-    marker = b" [truncated]"
     if max_bytes <= len(marker):
         return "!" * max_bytes
     return data[:max_bytes - len(marker)].decode("utf-8", errors="ignore") + marker.decode()
@@ -745,11 +749,16 @@ class SomniMemory:
         required = {"id", "text", "status", "salience", "evidence", "links"}
         merge_fields = {"merged_from", "provenance_sha256"}
         if (not isinstance(claim, dict) or not required.issubset(claim)
-                or set(claim) - (required | {"replaces", "run_labels", "tags"} | merge_fields)):
+                or set(claim) - (required | {"gist", "replaces", "run_labels", "tags"} | merge_fields)):
             raise MemoryError("claim has invalid fields")
         text = claim["text"]
         if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_NOTE_BYTES:
             raise MemoryError("claim text is empty or too large")
+        if "gist" in claim:
+            gist = claim["gist"]
+            if (not isinstance(gist, str) or not gist.strip() or not gist.isprintable()
+                    or len(gist.encode("utf-8")) > MAX_GIST_BYTES):
+                raise MemoryError(f"claim gist must be one printable line of up to {MAX_GIST_BYTES} UTF-8 bytes")
         if (not isinstance(claim["status"], str) or claim["status"] not in STATUSES
                 or type(claim["salience"]) is not int or not 1 <= claim["salience"] <= 5):
             raise MemoryError("claim status or salience is invalid")
@@ -911,12 +920,14 @@ class SomniMemory:
         return self.record_many([(source, text)], **kwargs)[0]
 
     def record_many(self, items, *, context=None, images=(), omitted_images=0, clip=False,
-                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None):
+                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None):
         """Append several (source, text) records under one lock."""
         items = list(items)
         if not items:
             return []
         context = _record_context(**(context or {}))
+        if tool_ok is not None and (type(tool_ok) is not bool or len(items) != 1 or items[0][0] != "tool_result"):
+            raise MemoryError("tool status requires one tool result")
         if len(images) > MAX_RECORD_IMAGES or type(omitted_images) is not int or omitted_images < 0:
             raise MemoryError("invalid tool result image list or omission count")
         if type(image_bytes) is not int or not 0 <= image_bytes <= MAX_IMAGE_BYTES:
@@ -951,6 +962,8 @@ class SomniMemory:
                           "text": _clip_record(text, max_bytes) if clip else text, "prev_sha256": head, **context}
                 if clip and record["text"] != text:
                     record["original_text_bytes"] = len(text.encode("utf-8"))
+                if tool_ok is not None:
+                    record["tool_ok"] = tool_ok
                 if attachments:
                     record["images"] = attachments
                 if omitted_images:
@@ -966,18 +979,20 @@ class SomniMemory:
             self._records_by_id.update(zip(ids, records))
         return ids
 
-    def add_note(self, text, status, evidence, salience=3, links=None):
+    def add_note(self, text, status, evidence, salience=3, links=None, *, gist=None):
         with self._locked():
             self._load_locked()
             if self.state["phase"] != "open":
                 raise MemoryError("agent notes require an open subject session")
-            return self._append_claim(text, status, evidence, salience, links or [], None)
+            return self._append_claim(text, status, evidence, salience, links or [], None, gist=gist)
 
-    def _append_claim(self, text, status, evidence, salience, links, replaces):
+    def _append_claim(self, text, status, evidence, salience, links, replaces, *, gist=None):
         _require_claim_capacity(len(self.claims), self._limit("max_claims"))
         claim_id = f"n{self.state['next_claim']:06d}"
         claim = {"id": claim_id, "text": text, "status": status, "salience": salience,
                  "evidence": evidence, "links": links}
+        if gist is not None:
+            claim["gist"] = gist
         if replaces is not None:
             claim["replaces"] = replaces
         claim["evidence"] = self._validate_evidence(evidence, self._records_by_id, status)
@@ -997,7 +1012,7 @@ class SomniMemory:
             self.claims[replaces]["superseded_by"] = claim_id
         return claim_id
 
-    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None):
+    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False):
         """Apply one offline consolidation pass.
 
         By default the pass is all-or-nothing.  With ``partial=True`` an operation
@@ -1021,7 +1036,7 @@ class SomniMemory:
                 raise MemoryError("dreaming is offline-only; close the subject session first")
             if self.state["dream_count"] >= MAX_DREAM_PASSES:
                 raise MemoryError("dream pass limit reached; seal the bounded attempt")
-            prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images)
+            prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, learning)
             if not prepared and operations:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected)
@@ -1030,12 +1045,13 @@ class SomniMemory:
                 self.write_vault()
             return self.dreams[-1]
 
-    def _prepare_dream(self, operations, partial, viewed_images):
+    def _prepare_dream(self, operations, partial, viewed_images, learning):
         # Removing a broken wiki operation can expose another broken link or an
         # earlier page version. Rebuild the simulation before checking again.
         link_rejections = {}
         while True:
             simulated = {key: dict(value) for key, value in self.claims.items()}
+            ledger = None
             pages = self.pages.copy()
             page_changes = {}
             prepared = []
@@ -1045,6 +1061,17 @@ class SomniMemory:
                 if index in rejected:
                     continue
                 try:
+                    if isinstance(operation, dict) and operation.get("op") == "ledger_propose":
+                        if not learning:
+                            raise MemoryError("Chel learning is disabled")
+                        if ledger is None:
+                            ledger = deepcopy(self.learning_ledger())
+                        try:
+                            revision = ledger.check_proposal(operation)
+                        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                            raise MemoryError(str(exc)) from exc
+                        prepared.append(("ledger_propose", revision))
+                        continue
                     next_claim = self._prepare_dream_op(operation, simulated, pages, prepared, next_claim, viewed_images)
                 except (MemoryError, OSError) as exc:
                     if not partial or "claim limit reached" in str(exc):
@@ -1106,7 +1133,7 @@ class SomniMemory:
             return next_claim
         if op in {"add", "correct", "merge"}:
             _require_claim_capacity(len(simulated), self._limit("max_claims"))
-            allowed = {"op", "text", "status", "salience"}
+            allowed = {"op", "text", "gist", "status", "salience"}
             allowed |= {"claim_ids"} if op == "merge" else {"evidence", "links"}
             if op == "correct":
                 allowed.add("claim_id")
@@ -1120,6 +1147,8 @@ class SomniMemory:
             claim = {"id": claim_id, "text": operation.get("text"), "status": operation.get("status"),
                      "salience": operation.get("salience", 3), "evidence": operation.get("evidence"),
                      "links": operation.get("links", [])}
+            if "gist" in operation:
+                claim["gist"] = operation["gist"]
             if replaces is not None:
                 claim["replaces"] = replaces
             if op == "merge":
@@ -1159,6 +1188,8 @@ class SomniMemory:
         return next_claim
 
     def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected):
+        learning = [body for op, body in prepared if op == "ledger_propose"]
+        prepared = [(op, body) for op, body in prepared if op != "ledger_propose"]
         wiki_events = []
         wiki_seq, wiki_head = self.state.get("wiki_events", 0), self.state.get("wiki_head", ZERO_HASH)
         for op, body in prepared:
@@ -1187,6 +1218,9 @@ class SomniMemory:
         merged = sum(op == "add" and "merged_from" in body for op, body in prepared)
         dream["added_count"] = sum(op == "add" for op, _ in prepared) - merged
         dream["merged_count"] = merged
+        if learning:
+            dream["learning"] = learning
+            dream["operation_count"] += len(learning)
         if wiki_events:
             dream["page_operations"] = len(wiki_events)
             dream["operation_count"] += page_ops
@@ -1226,7 +1260,7 @@ class SomniMemory:
         active = [claim for claim in self.claims.values() if claim["state"] == "active"]
         if not active:
             return []
-        contexts = {claim["id"]: claim.get("run_labels", []) + claim.get("tags", []) for claim in active}
+        contexts = {claim["id"]: _claim_labels(claim) for claim in active}
         docs = [_terms(" ".join([claim["text"], *contexts[claim["id"]]])) for claim in active]
         scores = {claim["id"]: score for score, claim in _bm25(docs, active, query)}
         phrase = query.strip().casefold()
@@ -1250,45 +1284,117 @@ class SomniMemory:
         docs = [_terms(f"{p['title']} {p['title']} {p['body']}") for p in pages]
         return [{**page, "score": round(score, 4)} for score, page in _bm25(docs, pages, query)[:limit]]
 
-    def inject(self, max_bytes=DEFAULT_INJECTION_BYTES):
-        if type(max_bytes) is not int or not 256 <= max_bytes <= MAX_INJECTION_BYTES:
-            raise MemoryError(f"injection bound must be 256-{MAX_INJECTION_BYTES} bytes")
-        header = ("# Subject memory index\n"
-                  "Claims are subject-authored interpretations, not guaranteed truths. "
-                  "Use evidence IDs to inspect the immutable subject-visible transcript.\n")
+    def _index_ranks(self, claims, pages, query):
+        prompt = " ".join(query.casefold().split())
+        labels = {claim["id"]: _claim_labels(claim) for claim in claims}
+        matches = {}
+        for label in {label for values in labels.values() for label in values}:
+            phrase = " ".join(label.casefold().split())
+            # Match a whole context label inside a longer prompt. Give more specific phrases precedence.
+            if phrase in prompt and re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", prompt):
+                matches[label] = len(phrase.split())
+        claim_docs = [_terms(" ".join([c["text"], *labels[c["id"]]])) for c in claims]
+        claim_scores = {c["id"]: score for score, c in _bm25(claim_docs, claims, prompt)}
+        claim_ranks = {
+            c["id"]: (max((matches.get(label, 0) for label in labels[c["id"]]), default=0),
+                      claim_scores.get(c["id"], 0) * (1 + 0.1 * c["salience"]),
+                      max(item["ref"] for item in c["evidence"]), c["salience"], c["id"])
+            for c in claims
+        }
+        page_docs = [_terms(f"{p['title']} {p['title']} {p['slug']} {p['body']}") for p in pages]
+        page_scores = {p["slug"]: score for score, p in _bm25(page_docs, pages, prompt)}
+        page_ranks = {}
+        for page in pages:
+            cited = [claim_ranks[ref] for ref in page["claims"]]
+            salience = sum(rank[3] for rank in cited) / (len(cited) or 1)
+            page_ranks[page["slug"]] = (max((rank[0] for rank in cited), default=0),
+                                       page_scores.get(page["slug"], 0) * (1 + 0.1 * salience),
+                                       max((rank[2] for rank in cited), default=""), salience)
+        return claim_ranks, page_ranks
+
+    def learning_ledger(self):
+        # Isolated CLI invocations omit the package root from sys.path.
+        root = str(pathlib.Path(__file__).resolve().parent.parent)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from somni.learning import DreamLedger
+        # Only reuse a replay if both chains still extend its verified inputs.
+        cache = getattr(self, "_learning_cache", None)
+        if cache:
+            dream_head, record_head, ledger = cache
+            count = ledger.record_count
+            prefix_head = (self.transcript[count]["prev_sha256"] if count < len(self.transcript)
+                           else self.state["transcript_head"])
+            if dream_head == self.state["dreams_head"] and count <= len(self.transcript) and record_head == prefix_head:
+                ledger.ingest(self.transcript[count:])
+            else:
+                cache = None
+        if not cache:
+            ledger = DreamLedger.from_memory(self)
+        self._learning_cache = (self.state["dreams_head"], self.state["transcript_head"], ledger)
+        return ledger
+
+    def inject(self, max_bytes=DEFAULT_INJECTION_BYTES, *, query="", learning=False):
+        _validate_index_request(max_bytes, query)
+        header = "# Subject memory index\nClaims are interpretations. Use evidence IDs to inspect the transcript.\n"
         lines = [header]
+        remaining = max_bytes - len(header.encode("utf-8"))
+        if learning and query.strip():
+            rule_budget = remaining // 3
+            for rule in self.learning_ledger().recall(query, top_k=5):
+                line = f"- rule {rule['id']} ({rule['support']} supporting transitions): {rule['text']}\n"
+                size = len(line.encode("utf-8"))
+                if size <= rule_budget:
+                    lines.append(line)
+                    remaining -= size
+                    rule_budget -= size
+        page_budget = remaining // 2
         stale = self.stale_pages()
-        for slug, page in sorted(self.pages.items()):
-            if slug in stale:
-                continue
-            line = f"- page `{page['slug']}`: {page['title']}\n"
-            if len(("".join(lines) + line).encode("utf-8")) > max_bytes // 2:
-                break
-            lines.append(line)
-        page_lines = len(lines) - 1
+        pages = [page for slug, page in sorted(self.pages.items()) if slug not in stale]
         active = [claim for claim in self.claims.values() if claim["state"] == "active"]
-        active.sort(key=lambda claim: (-claim["salience"], claim["id"]))
+        page_ranks = {}
+        if query.strip():
+            claim_ranks, page_ranks = self._index_ranks(active, pages, query)
+            pages.sort(key=lambda page: page_ranks[page["slug"]], reverse=True)
+            active.sort(key=lambda claim: claim_ranks[claim["id"]], reverse=True)
+        else:
+            active.sort(key=lambda claim: (-claim["salience"], claim["id"]))
+
+        included_body = False
+        for page in pages:
+            line = f"- page `{page['slug']}`: {page['title']}\n"
+            size = len(line.encode("utf-8"))
+            if size > page_budget:
+                continue
+            rank = page_ranks.get(page["slug"], (0, 0))
+            if not included_body and (rank[0] or rank[1]):
+                excerpt = _page_excerpt(page["body"], page_budget - size - 3)
+                if excerpt:
+                    line += f"\n{excerpt}\n\n"
+                    size = len(line.encode("utf-8"))
+                    included_body = True
+            lines.append(line)
+            page_budget -= size
+            remaining -= size
+
+        omitted = 0
         for claim in active:
             refs = ",".join(item["ref"] for item in claim["evidence"])
-            labels = ", ".join(claim.get("run_labels", []) + claim.get("tags", []))
+            labels = ", ".join(_claim_labels(claim))
             context = f" (context: {labels[:160]})" if labels else ""
-            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {claim['text']}{context}\n"
-            if len(("".join(lines) + line).encode("utf-8")) > max_bytes:
-                break
-            lines.append(line)
-        omitted = len(active) - (len(lines) - 1 - page_lines)
-        if omitted:
-            suffix = f"- … {omitted} additional active claims omitted; search/report on demand.\n"
-            while len(lines) > 1 + page_lines and len(("".join(lines) + suffix).encode("utf-8")) > max_bytes:
-                lines.pop()
+            text = claim.get("gist", claim["text"])
+            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {text}{context}\n"
+            size = len(line.encode("utf-8"))
+            if size > remaining:
                 omitted += 1
-                suffix = f"- … {omitted} additional active claims omitted; search/report on demand.\n"
-            if len(("".join(lines) + suffix).encode("utf-8")) <= max_bytes:
+                continue
+            lines.append(line)
+            remaining -= size
+        if omitted:
+            suffix = f"- … {omitted} additional active claims omitted; use somni_recall for more.\n"
+            if len(suffix.encode("utf-8")) <= remaining:
                 lines.append(suffix)
-        result = "".join(lines)
-        if len(result.encode("utf-8")) > max_bytes:
-            raise MemoryError("fixed injection header exceeds requested bound")
-        return result
+        return "".join(lines)
 
     def metrics(self):
         transcript_bytes = sum(len((canonical(item) + "\n").encode("utf-8")) for item in self.transcript)
@@ -1354,23 +1460,56 @@ _STOP = frozenset("""a an and are as at be by can do does for from has have if i
 that the their then this to was were when which while will with you your i me my we our they them""".split())
 
 
+def _claim_labels(claim):
+    return claim.get("run_labels", []) + claim.get("tags", [])
+
+
+def _page_excerpt(body, max_bytes):
+    if len(body.encode("utf-8")) <= max_bytes:
+        return body
+    marker = "\n…"
+    remaining = max_bytes - len(marker.encode("utf-8"))
+    if remaining < 24:
+        return ""
+    headings = list(re.finditer(r"(?m)^ {0,3}(#{1,6})[ \t]+([^\n]+)", body))
+    for number, heading in enumerate(headings):
+        if re.match(r"(?:procedure|steps|workflow)\b", heading[2], re.IGNORECASE):
+            end = next((h.start() for h in headings[number + 1:] if len(h[1]) <= len(heading[1])), len(body))
+            body = body[heading.start():end]
+            break
+    sections = re.split(r"(?m)(?=^ {0,3}#{1,6}[ \t]+)", body)
+    sections = [section.strip() for section in sections if section.strip()]
+    excerpt = []
+    for section in sections:
+        size = len(section.encode("utf-8")) + (2 if excerpt else 0)
+        if size > remaining:
+            break
+        excerpt.append(section)
+        remaining -= size
+    if not excerpt:
+        prefix = sections[0].encode("utf-8")[:remaining].decode("utf-8", errors="ignore")
+        complete_lines, _, _ = prefix.rpartition("\n")
+        if complete_lines and not re.fullmatch(r"#{1,6}[ \t]+[^\n]*", complete_lines.strip()):
+            prefix = complete_lines
+        excerpt.append(prefix.rstrip())
+    return "\n\n".join(excerpt) + marker
+
+
 def _bm25(docs, items, query):
-    if not docs:
-        return []
     q_terms = set(_terms(query))
+    if not docs or not q_terms:
+        return []
     avg = (sum(len(d) for d in docs) / len(docs)) or 1.0
-    df = {}
-    for d in docs:
-        for term in set(d):
-            df[term] = df.get(term, 0) + 1
+    counts = [Counter(d) for d in docs]
+    df = Counter(term for doc in counts for term in doc.keys() & q_terms)
     scored = []
-    for item, d in zip(items, docs):
+    for item, doc, frequencies in zip(items, docs, counts):
         score = 0.0
-        for term in q_terms:
-            tf = d.count(term)
-            if tf:
-                idf = math.log(1 + (len(docs) - df[term] + 0.5) / (df[term] + 0.5))
-                score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * len(d) / avg))
+        norm = 1.2 * (0.25 + 0.75 * len(doc) / avg)
+        for term in sorted(frequencies.keys() & q_terms):
+            tf = frequencies[term]
+            idf = math.log(1 + (len(docs) - df[term] + 0.5) / (df[term] + 0.5))
+            score += idf * tf * 2.2 / (tf + norm)
         if score > 0:
             scored.append((score, item))
     scored.sort(key=lambda x: -x[0])
@@ -1422,12 +1561,18 @@ def _dream_summary(dream):
     # Legacy passes didn't record which note events belonged to them.
     default = 0 if dream["operation_count"] == dream.get("page_operations", 0) else None
     return {"id": f"d{dream['seq']:06d}", "added_count": dream.get("added_count", default),
+            **({"learning_count": len(dream["learning"])} if dream.get("learning") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
             "operation_count": dream["operation_count"], "transcript_head": dream["transcript_head"]}
 
 
-def _recent(memory, include_images, viewed):
-    records = memory.transcript[-120:]
+def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORDS,
+            record_bytes=DEFAULT_DREAM_RECORD_BYTES):
+    if type(record_limit) is not int or not 1 <= record_limit <= DEFAULT_DREAM_RECORDS:
+        raise MemoryError(f"dream record limit must be 1-{DEFAULT_DREAM_RECORDS}")
+    if type(record_bytes) is not int or not 64 <= record_bytes <= MAX_RECORD_BYTES:
+        raise MemoryError(f"dream record excerpt must be 64-{MAX_RECORD_BYTES} bytes")
+    records = memory.transcript[-record_limit:]
     attachments = []
     budget = 1024 * 1024
     viewed.clear()
@@ -1448,41 +1593,56 @@ def _recent(memory, include_images, viewed):
                     break
             if len(attachments) == MAX_RECORD_IMAGES:
                 break
-    return {"records": [{**r, "text": r["text"][:1501]} for r in records], "attachments": attachments}
+    excerpts = [{**r, "text": _clip_record(r["text"], record_bytes, b" [excerpt truncated]")} for r in records]
+    return {"records": excerpts, "attachments": attachments}
 
 
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
-                    resize=None, viewed=None):
+                    resize=None, viewed=None, learning=False):
     if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable:
         raise MemoryError("Somni memory changes require the session that owns recording")
     if method == "phase":
         memory.set_phase(args["phase"], allow_same=True)
     elif method == "record":
         index_bytes = args.get("index_bytes")
-        _validate_index_bound(index_bytes)
+        query = args.get("query", "")
+        if index_bytes is not None:
+            _validate_index_request(index_bytes, query)
         images, omitted = args.get("images", []), args.get("omitted_images", 0)
         if not isinstance(images, list):
             raise MemoryError("invalid tool result image list")
         ref = memory.record(args["source"], args["text"], context=context, images=images, omitted_images=omitted,
-                            clip=True, image_bytes=image_bytes, resize=resize)
-        return ref if index_bytes is None else memory.inject(index_bytes)
+                            clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"))
+        return ref if index_bytes is None else memory.inject(index_bytes, query=query, learning=learning)
     elif method == "note":
         if len(canonical(args).encode("utf-8")) > MAX_INPUT_BYTES:
             raise MemoryError("note input exceeds byte limit")
-        return memory.add_note(args["text"], args["status"], args["evidence"], args["salience"])
+        return memory.add_note(args["text"], args["status"], args["evidence"], args["salience"], gist=args.get("gist"))
     elif method == "dream":
-        dream = memory.dream(json.loads(args["proposal_json"]), partial=True, allow_empty=True, viewed_images=viewed)
+        proposal = args["proposal_json"]
+        if not isinstance(proposal, str) or len(proposal.encode()) > MAX_INPUT_BYTES:
+            raise MemoryError("dream proposal exceeds byte limit")
+        dream = memory.dream(json.loads(proposal), partial=True, allow_empty=True, viewed_images=viewed,
+                             learning=learning)
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
-        return memory.load().inject(args["index_bytes"])
+        return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning)
     elif method == "search":
         return memory.load().search(args["query"], args["limit"])
     elif method == "recall":
         memory.load()
         query, limit = args["query"], args["limit"]
-        return memory.recall_pages(query, limit) + memory.recall(query, limit)
+        hits = memory.recall_pages(query, limit) + memory.recall(query, limit)
+        if learning:
+            rules = memory.learning_ledger().recall(query, top_k=limit)
+            return [{**rule, "kind": "rule"} for rule in rules] + hits
+        return hits
+    elif method == "ledger" and learning:
+        return memory.load().learning_ledger().description()
     elif method == "recent":
-        return _recent(memory.load(), args.get("include_images", False), viewed)
+        return _recent(memory.load(), args.get("include_images", False), viewed,
+                       record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
+                       record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES))
     elif method == "image":
         ref, digest = args["ref"], args["sha256"]
         image = memory.load().image(ref, digest)
@@ -1509,7 +1669,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         raise MemoryError(f"unknown Somni backend method: {method}")
 
 
-def _serve(memory, record, *, context, image_bytes, image_max_edge):
+def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
 
@@ -1541,18 +1701,20 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge):
                     request = json.loads(line)
                     request_id = request["id"]
                     result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
-                                             image_bytes=image_bytes, resize=resize, viewed=viewed)
+                                             image_bytes=image_bytes, resize=resize, viewed=viewed, learning=learning)
                     reply(request_id, result=result)
-                except (MemoryError, OSError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                     reply(request_id, error=str(exc))
         finally:
             if owner and record:
                 memory.set_phase("closed", allow_same=True)
 
 
-def _validate_index_bound(bound):
-    if bound is not None and (type(bound) is not int or not 256 <= bound <= MAX_INJECTION_BYTES):
+def _validate_index_request(bound, query=""):
+    if type(bound) is not int or not 256 <= bound <= MAX_INJECTION_BYTES:
         raise MemoryError(f"injection bound must be 256-{MAX_INJECTION_BYTES} bytes")
+    if not isinstance(query, str):
+        raise MemoryError("injection query must be text")
 
 
 def _input_json(memory, value):
@@ -1585,6 +1747,7 @@ def parser():
     init = commands.add_parser("init"); init.add_argument("--lineage-id", required=True); init.add_argument("--attempt-id", required=True)
     commands.add_parser("session-open"); commands.add_parser("session-close")
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
+    serve.add_argument("--learning", action="store_true")
     serve.add_argument("--record", action="store_true")
     serve.add_argument("--run-label")
     serve.add_argument("--tags", default="[]")
@@ -1594,8 +1757,12 @@ def parser():
     record.add_argument("--inject-max-bytes", type=int, help="emit the updated index instead of the record ID")
     note = commands.add_parser("note"); note.add_argument("--input", required=True, help="claim JSON relative to workspace, or - for stdin")
     dream = commands.add_parser("dream"); dream.add_argument("--input", required=True, help="proposal JSON relative to workspace, or - for stdin")
+    dream.add_argument("--learning", action="store_true", help="allow Chel rule and verb proposals")
     search = commands.add_parser("search"); search.add_argument("query"); search.add_argument("--limit", type=int, default=20)
     inject = commands.add_parser("inject"); inject.add_argument("--max-bytes", type=int, default=DEFAULT_INJECTION_BYTES)
+    inject.add_argument("--learning", action="store_true", help="include matching active Chel rules")
+    inject.add_argument("--query", default="", help="rank the index for a prompt")
+    commands.add_parser("ledger", help="inspect the replayed Chel rules and verbs")
     commands.add_parser("report"); commands.add_parser("metrics")
     commands.add_parser("status").add_argument("--json", action="store_true", help="emit the machine-readable status")
     return ap
@@ -1611,14 +1778,15 @@ def main():
         memory = SomniMemory(args.workspace, args.subject_id)
         if args.command == "serve":
             _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
-                   image_bytes=args.image_bytes, image_max_edge=args.image_max_edge)
+                   image_bytes=args.image_bytes, image_max_edge=args.image_max_edge, learning=args.learning)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":
             memory.set_phase("closed"); print("LAYERED_MEMORY_SESSION_CLOSED")
         elif args.command == "record":
             bound = args.inject_max_bytes
-            _validate_index_bound(bound)
+            if bound is not None:
+                _validate_index_request(bound)
             record = memory.record(args.source, args.text)
             if bound is None:
                 print(record)
@@ -1626,15 +1794,18 @@ def main():
                 sys.stdout.write(memory.inject(bound))
         elif args.command == "note":
             claim = _input_json(memory, args.input)
-            if not isinstance(claim, dict) or set(claim) - {"text", "status", "evidence", "salience", "links"}:
+            if not isinstance(claim, dict) or set(claim) - {"text", "gist", "status", "evidence", "salience", "links"}:
                 raise MemoryError("note input has invalid fields")
-            print(memory.add_note(claim.get("text"), claim.get("status"), claim.get("evidence"), claim.get("salience", 3), claim.get("links", [])))
+            print(memory.add_note(claim.get("text"), claim.get("status"), claim.get("evidence"), claim.get("salience", 3),
+                                  claim.get("links", []), gist=claim.get("gist")))
         elif args.command == "dream":
-            print(canonical(memory.dream(_input_json(memory, args.input))))
+            print(canonical(memory.dream(_input_json(memory, args.input), learning=args.learning)))
         elif args.command == "search":
             print(json.dumps(memory.load().search(args.query, args.limit), ensure_ascii=False, indent=2, sort_keys=True))
         elif args.command == "inject":
-            sys.stdout.write(memory.load().inject(args.max_bytes))
+            sys.stdout.write(memory.load().inject(args.max_bytes, query=args.query, learning=args.learning))
+        elif args.command == "ledger":
+            print(canonical(memory.load().learning_ledger().description()))
         elif args.command == "report":
             sys.stdout.write(memory.load().report())
         elif args.command == "metrics":

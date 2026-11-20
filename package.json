@@ -7,7 +7,7 @@
   "type": "module",
   "repository": {"type": "git", "url": "git+https://github.com/Mechanacor3/pi-somni.git"},
   "files": [
-    "extensions/", "somni/*.py", "adapters/**/*.py",
+    "extensions/", "somni/*.py", "somni/chel/*.py", "adapters/**/*.py",
     "evals/__init__.py", "evals/state_bench/__init__.py", "evals/state_bench/somni_state_bench.py",
     "README.md", "EVALUATION.md", "LICENSE"
   ],

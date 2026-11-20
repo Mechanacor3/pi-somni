@@ -72,6 +72,43 @@ class FeatureTest(unittest.TestCase):
             self.memory.add_note("look for landmarks", "uncertain", [{"ref": ref}], salience)
         self.assertEqual(self.memory.recall("world B", 1)[0]["tags"], ["world B"])
 
+    def test_injection_skips_an_oversized_claim_and_uses_available_space(self):
+        self.memory.set_phase("open")
+        ref = self.memory.record("tool_result", "Evidence for all three claims.")
+        evidence = [{"ref": ref}]
+        self.memory.add_note("長" * 300, "uncertain", evidence, 5)
+        self.memory.add_note("Keep the receipt.", "uncertain", evidence, 4)
+        self.memory.add_note("Check the date.", "uncertain", evidence, 3)
+        index = self.memory.inject(256)
+        self.assertLessEqual(len(index.encode("utf-8")), 256)
+        self.assertNotIn("n000001", index)
+        self.assertIn("Keep the receipt.", index)
+        self.assertIn("Check the date.", index)
+
+    def test_injection_breaks_lexical_ties_with_recent_evidence(self):
+        self.memory.set_phase("open")
+        older, newer = self.memory.record_many([("tool_result", "Receipt"), ("tool_result", "New receipt")])
+        new_claim = self.memory.add_note("Keep the receipt.", "uncertain", [{"ref": newer}])
+        old_claim = self.memory.add_note("Keep the receipt.", "uncertain", [{"ref": older}])
+        index = self.memory.inject(query="How should I handle the receipt?")
+        self.assertLess(index.index(new_claim), index.index(old_claim))
+
+    def test_dream_gist_is_bounded_and_full_text_survives_reload(self):
+        self.memory.set_phase("open")
+        ref = self.memory.record("tool_result", "The original payment method received the refund.")
+        full = "Refund to the original payment method and check the settlement record."
+        self.memory.set_phase("closed")
+        add = {"op": "add", "text": full, "status": "uncertain", "evidence": [{"ref": ref}]}
+        gist = "é" * 80
+        dream = self.memory.dream({"schema": 1, "operations": [
+            {**add, "gist": gist + "x"}, {**add, "gist": "Two\nlines"}, {**add, "gist": gist},
+        ]}, partial=True)
+        self.assertEqual([op["index"] for op in dream["rejected"]], [0, 1])
+        memory = SomniMemory(self.ws, "s").load()
+        self.assertIn(gist, memory.inject())
+        self.assertNotIn(full, memory.inject())
+        self.assertEqual(memory.recall("settlement")[0]["text"], full)
+
     def test_images_are_deduplicated_and_bound_to_cited_records(self):
         memory = self.memory
         memory.set_phase("open")
