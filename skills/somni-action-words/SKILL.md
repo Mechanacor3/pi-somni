@@ -14,6 +14,7 @@ Call it like any tool. It returns JSON: whatever the function returns.
 - Each call it makes goes through Pi like your own calls do: the same argument checks, the same permission hooks, and the same recording.
 - If one of its calls fails, the word stops and the error names the calls that already ran. Those calls' effects stay in place. Check the state before you retry.
 - A word encodes what worked before. When your situation differs from its description, make the calls yourself.
+- The return value is whatever the word's author chose to report. If it reports only the word's own steps, such as how many calls it made, it does not show that anything changed. Check the effect with a tool before you say the work is done.
 
 ## Reading a word
 
@@ -63,6 +64,20 @@ Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the c
            {"params": {"booking_id": "BK-2"}, "refs": ["t000003"]}]}
 ```
 
+A good word does two things beyond replaying calls:
+
+- **It checks preconditions it can read cheaply.** If a status or lookup tool returns structured state, branch on it before acting. For example, `if not rpc.status()["ready"]: rpc.prepare()`.
+- **It returns evidence of its effect.** Return state read back after the change, such as the new status, a count the tool reports, or the changed record. Do not return a count of the word's own steps. An agent will take the return value as the outcome.
+
+```python
+def restock(item: str, amount: int):
+    """Order stock for one item and report the level the inventory tool shows afterwards."""
+    before = rpc.inventory(item=item)["level"]
+    rpc.place_order(item=item, amount=amount)
+    after = rpc.inventory(item=item)["level"]
+    return {"before": before, "after": after, "added": after - before}
+```
+
 To repair a word, use `{"op":"revise_action","source":...,"tests":...}`. Omit `tests` to keep the stored ones. To remove a word, use `{"op":"retire_action","name":...,"reason":...}`. A rejected operation comes back with a reason. Fix it and resubmit while attempts remain.
 
 Common rejections:
@@ -71,3 +86,5 @@ Common rejections:
 - **The record is truncated or failed.** Cite only complete, successful results.
 - **A tool is never exercised.** Add a test that reaches that call.
 - **Name clash.** A word cannot share a name with an existing tool, and cannot call itself, directly or through another word.
+
+When the transcript shows a word ran without the effect it promised, revise it or retire it. Its calls are recorded under its own tool call, so you can see what it actually did.

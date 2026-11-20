@@ -362,8 +362,11 @@ export default function (pi: ExtensionAPI) {
 			"Each test replays recorded calls: given params, the word must make exactly the calls in refs (same tools, same " +
 			"arguments, in order; each ref a successful tool_result) and then return. Together the tests must exercise every " +
 			"tool the word calls; add a test with fewer refs for each branch that stops early. Generalize with parameters, not " +
-			"constants copied from one episode. Use revise_action {source, tests?} to repair a word and retire_action " +
-			`{name, reason} to remove one.\n\nCallable tools:\n${tools.join("\n")}\n\nCurrent action words:\n${lexicon}\n`;
+			"constants copied from one episode. Return an observation that shows whether the word worked, such as state read " +
+			"back by a tool after the change, not a count of the word's own steps: an agent will take the return value as " +
+			"the outcome. Check cheap preconditions (a status or lookup tool) before acting, and branch on them. Use " +
+			"revise_action {source, tests?} to repair a word and retire_action {name, reason} to remove one; do so when " +
+			`the transcript shows a word ran but its effect did not happen.\n\nCallable tools:\n${tools.join("\n")}\n\nCurrent action words:\n${lexicon}\n`;
 	}
 
 	pi.registerTool({
