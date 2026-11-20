@@ -124,6 +124,28 @@ The ledger also accepts Chel's `retract` and `define_verb` proposals. A **verb**
 
 Accepted proposals and their test references are committed in the Somni dream chain. Use `python3 somni/store.py --workspace W --subject-id S ledger` to replay the ledger and inspect rule states, support counts, and verb names. The CLI accepts `--learning` on `dream` and `inject` to apply proposals and preview matching rules. Replay can run recorded verbs in Chel's worker. Offline dream and wiki turns allow up to 16 Somni evidence reads and three submission attempts, with one committed pass.
 
+### Action words (experimental)
+
+Set `SOMNI_ACTIONS=1` to let dreams turn a recurring sequence of tool calls into an **action word**: one Python function that the agent then calls as a single tool. A word extends Chel's verbs, using the same syntax policy, builtins, and sandboxed worker, with one capability: `rpc`.
+
+```python
+def cancel_if_refundable(booking_id: str):
+    """Cancel a booking only when it is refundable, and report what happened."""
+    booking = rpc.get_booking(booking_id=booking_id)
+    if not booking["refundable"]:
+        return {"cancelled": False, "reason": "not refundable"}
+    result = rpc.cancel_booking({"booking_id": booking_id, "reason": "customer request"})
+    return {"cancelled": result["status"] == "cancelled"}
+```
+
+- **Calls.** `rpc.TOOL(...)` and `rpc.pi.TOOL(...)` call the Pi tool named `TOOL`, which may be a built-in tool, an extension tool, or another action word. `rpc.mcp.SERVER.TOOL(...)` calls `mcp__SERVER__TOOL`. A call takes keyword arguments or one dict and returns the tool's result as parsed JSON, or as text if the result is not JSON.
+- **Shape.** A word is exactly one `def`. Its docstring is the tool description. Each parameter is annotated with `str`, `int`, `float`, `bool`, `list`, or `dict`. Imports, `while`, `try`, lambdas, classes, and I/O are rejected, as they are for Chel verbs.
+- **Execution.** Somni registers each word as a Pi tool and runs it one call at a time. The backend replays the word from the start with the results so far and returns either its next call or its value. The extension dispatches each call through `ctx.executeTool()`, so it passes the same argument validation and `tool_call` guards as a call from the agent. A failed call stops the word, and its error names the calls that already ran. Words nest at most four deep and make at most 16 calls per run. The calls a word makes are recorded in the transcript like any other tool result.
+- **The dream gate.** A dream submits `{"op":"define_action","source":"...","tests":[{"params":{...},"refs":["t000004","t000005"],"result":...}]}`. Each test must reproduce the cited successful tool calls exactly, with the same tools and arguments in the same order, and then return. Together the tests must exercise every tool the word calls. `revise_action` (`source`, optional `tests`) repairs a word against the same gate, and `retire_action` (`name`, `reason`) removes one. A store holds up to 32 words.
+- **Files a human can edit.** Somni writes each word to `somni-v1/actions/<name>.py`, with generated `# somni:` lines listing its evidence and tests. Edit a file to revise the word, add a file to define one, or delete it to retire one. The next recording session records these edits as a pass authored by `human`. Human edits must pass the syntax policy. A stored test that an edit breaks is dropped and listed in the pass instead of blocking the edit. The hash-chained dream log holds every version, and `status --json` lists the current words.
+
+`SOMNI_ACTION_TOOLS=a,b` restricts which tools words may call. Words can never call Somni's own tools. The dream prompt lists the callable tools and current words. Dream sessions cannot call words, because offline dreams block every tool except Somni's evidence tools.
+
 ### Headless runs
 
 Use Pi's normal model and login configuration. Point each task and its dream at the same store.
@@ -156,6 +178,8 @@ can be `null`. Claims inherit the union of run labels and tags from the records 
 | `SOMNI_TAGS` | `[]` | JSON array of up to eight printable tags, each up to 96 UTF-8 bytes |
 | `SOMNI_PAGE_GUIDE` | domain-neutral playbook guidance | Optional replacement for the wiki-writing guide |
 | `SOMNI_CHEL_LEARNING` | off | `1` enables Chel rule and verb proposals in dreams and rule retrieval in task sessions |
+| `SOMNI_ACTIONS` | off | `1` enables [action words](#action-words-experimental): dreamed Python functions that call session tools, registered as Pi tools |
+| `SOMNI_ACTION_TOOLS` | all non-Somni tools | Comma-separated tools that action words may call |
 | `SOMNI_DREAM_RECORDS` | `120` | Number of recent transcript records sent to `/somni-dream`, clamped to 1–120 |
 | `SOMNI_DREAM_RECORD_BYTES` | `1500` | UTF-8 text excerpt per dream record, including the truncation marker, clamped to 64–8192. IDs, metadata, and attachments have separate bounds |
 | `SOMNI_TOOL_RESULT_BYTES` | `4096` | Tool result text budget in UTF-8 bytes, clamped to 512–8000 |
@@ -209,6 +233,8 @@ imports, build recipes, and benchmark details, see [Evaluation](EVALUATION.md).
 - Record only what the agent itself saw or produced. Hash chains detect accidental or
   out-of-band edits on load; they are not signatures against an agent that owns the files.
 - `verified` means Somni checked the cited excerpt or image against the transcript.
+- An action word can do nothing the agent could not do with the same tools. Each of its calls goes
+  through Pi's guards, but an earlier call's effects stay in place when a later call fails or is blocked.
 
 ## Background and credits
 

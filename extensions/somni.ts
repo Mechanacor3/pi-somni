@@ -21,6 +21,12 @@
  *     claims not yet on any page into linked wiki pages ([[slug]] links, [nXXXXXX]
  *     citations). The store renders a readable Obsidian vault in somni-v1/vault/.
  *   - session_shutdown: close the session.
+ *   - SOMNI_ACTIONS=1: action words. Dreams may define small Python functions that
+ *     call this session's tools as rpc.TOOL(...), rpc.pi.TOOL(...) or
+ *     rpc.mcp.SERVER.TOOL(...) (somni/actions.py). Each word is registered as a Pi
+ *     tool; its calls run one at a time through ctx.executeTool(), so they pass the
+ *     same validation and tool_call guards as the agent's own calls. Words live as
+ *     editable files in somni-v1/actions/; edits are recorded at the next session.
  *
  * Testbed mode (SOMNI_RECORD=0): nothing is recorded automatically; a trusted driver
  * records exactly the text it delivered, using somni/store.py's CLI.
@@ -42,6 +48,9 @@ const RECORD = process.env.SOMNI_RECORD !== "0";
 const configuredBytes = Number(process.env.SOMNI_INJECT_BYTES ?? 4096);
 const INJECT_BYTES = Number.isInteger(configuredBytes) ? Math.min(Math.max(configuredBytes, 256), 8192) : 4096;
 const LEARNING = process.env.SOMNI_CHEL_LEARNING === "1";
+const ACTIONS = process.env.SOMNI_ACTIONS === "1";
+const ACTION_ALLOW = process.env.SOMNI_ACTION_TOOLS?.split(",").map((name) => name.trim()).filter(Boolean);
+const MAX_ACTION_DEPTH = 4;
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream"]);
 const MAX_INDEX_QUERY_BYTES = 65_536;
 const MAX_RECORD_BYTES = 8000;
@@ -65,12 +74,19 @@ type TranscriptRecord = RecordContext & {
 	id: string; source: string; text: string; tool_ok?: boolean; images?: { sha256: string }[]; omitted_images?: number;
 };
 type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[] };
-type DreamResult = { id: string; learning_count?: number; added_count: number; merged_count: number; rejected_count: number };
+type DreamResult = {
+	id: string; learning_count?: number; action_count?: number; added_count: number; merged_count: number; rejected_count: number;
+	rejected?: { index: number; reason: string }[];
+};
+type ActionWord = { name: string; description: string; params: Record<string, string>; uses: string[]; source: string };
+type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; result?: unknown };
 type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string };
 const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
 	backend: undefined as Backend | undefined,
 	recordWarning: false, indexWarning: false,
+	words: new Map<string, string>(), // registered action word -> source
+	wordCalls: new Set<string>(), // tool call IDs of running action words
 };
 
 function getBackend() {
@@ -181,7 +197,23 @@ function describeRecord(record: TranscriptRecord, chars = record.text.length) {
 
 function summary(result: DreamResult) {
 	const learning = result.learning_count ? ` ${result.learning_count} ledger revision(s) accepted.` : "";
-	return `Somni dream ${result.id}: ${result.added_count} added, ${result.rejected_count} rejected, ${result.merged_count} merged.${learning}`;
+	const actions = result.action_count ? ` ${result.action_count} action word change(s).` : "";
+	return `Somni dream ${result.id}: ${result.added_count} added, ${result.rejected_count} rejected, ${result.merged_count} merged.${learning}${actions}`;
+}
+
+const PARAM_TYPES: Record<string, () => any> = {
+	string: () => Type.String(), integer: () => Type.Integer(), number: () => Type.Number(), boolean: () => Type.Boolean(),
+	array: () => Type.Array(Type.Any()), object: () => Type.Record(Type.String(), Type.Any()),
+};
+
+function resultValue(content: (TextContent | ImageContent)[]) {
+	// Must match how toolRecord() writes the body, so recorded calls replay exactly.
+	const text = content.filter((part) => part.type === "text").map((part) => part.text).join("");
+	try {
+		return JSON.parse(text) as unknown;
+	} catch {
+		return text;
+	}
 }
 
 function asText(value: unknown) {
@@ -189,6 +221,7 @@ function asText(value: unknown) {
 }
 
 export default function (pi: ExtensionAPI) {
+	let lastCtx: ExtensionContext | undefined;
 	async function finishDream(run: DreamRun) {
 		if (state.dream !== run) return;
 		try {
@@ -196,6 +229,7 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			state.dream = undefined;
 		}
+		if (run.result?.action_count && lastCtx) await registerWords(lastCtx);
 	}
 
 	async function startDream(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>) {
@@ -229,6 +263,105 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.mode === "json" || ctx.mode === "print") return task;
 		// RPC clients get the handled reply first and can then wait for agent_settled.
 		void task.catch((error: Error) => notify(ctx, `Somni dream cleanup failed. ${error.message}`));
+	}
+
+	/** Tools an action word may call: everything callable except Somni's own tools (and SOMNI_ACTION_TOOLS, if set). */
+	function actionTargets() {
+		return pi.getAllTools().filter((tool) => !tool.name.startsWith("somni_")
+			&& !["hidden", "model-only"].includes((tool as { exposure?: string }).exposure ?? "direct")
+			&& (!ACTION_ALLOW || ACTION_ALLOW.includes(tool.name) || state.words.has(tool.name)));
+	}
+
+	async function runWord(word: ActionWord, params: Record<string, unknown>, toolCallId: string,
+			signal: AbortSignal | undefined, ctx: any) {
+		if (toolCallId.split("/").length > MAX_ACTION_DEPTH) throw new Error(`Action words nest at most ${MAX_ACTION_DEPTH} deep.`);
+		const history: { tool: string; args: Record<string, unknown>; result: unknown }[] = [];
+		const calls: { tool: string; args: Record<string, unknown>; ok: boolean }[] = [];
+		state.wordCalls.add(toolCallId);
+		try {
+			for (;;) {
+				const step = await getBackend().request<ActionStep>("action_step", { name: word.name, params, history });
+				if (!step.call) {
+					return { content: asText(JSON.stringify(step.result ?? null)), details: { word: word.name, calls } };
+				}
+				const { tool, args } = step.call;
+				if (ACTION_ALLOW && !ACTION_ALLOW.includes(tool) && !state.words.has(tool)) {
+					throw new Error(`${word.name} may not call ${tool} (SOMNI_ACTION_TOOLS).`);
+				}
+				// Resolves to { toolCall, result: { content, details }, isError, durationMs }; never rejects.
+				const outcome = await ctx.executeTool(tool, args, { signal });
+				const value = resultValue(outcome.result?.content ?? []);
+				calls.push({ tool, args, ok: !outcome.isError });
+				if (outcome.isError) {
+					const done = calls.slice(0, -1).map((call) => call.tool).join(", ") || "none";
+					throw new Error(`${word.name} stopped at call ${calls.length} (${tool}): ` +
+						`${clip(typeof value === "string" ? value : JSON.stringify(value), 600)}. Earlier calls already ran: ${done}.`);
+				}
+				history.push({ tool, args, result: value });
+			}
+		} finally {
+			state.wordCalls.delete(toolCallId);
+		}
+	}
+
+	/** Register each stored word as a Pi tool once the tools it calls exist (MCP tools may connect later). */
+	async function registerWords(ctx: ExtensionContext) {
+		if (!ACTIONS || !state.backend) return;
+		let words: ActionWord[];
+		try {
+			words = await getBackend().request<ActionWord[]>("action_list");
+		} catch (error) {
+			notify(ctx, `Somni could not load its action words. ${(error as Error).message}`);
+			return;
+		}
+		const others = new Set(pi.getAllTools().map((tool) => tool.name).filter((name) => !state.words.has(name)));
+		const pending = new Map(words.map((word) => [word.name, word]));
+		for (let changed = true; changed;) {
+			changed = false;
+			for (const [name, word] of pending) {
+				if (others.has(name)) {
+					pending.delete(name);
+					notify(ctx, `Somni action word ${name} is shadowed by a tool of the same name.`);
+					continue;
+				}
+				const ready = word.uses.every((use) => use.startsWith("mcp__") || others.has(use) || state.words.has(use));
+				if (!ready) continue;
+				pending.delete(name);
+				changed = true;
+				if (state.words.get(name) === word.source) continue;
+				const description = `${word.description} (Learned action word: calls ${word.uses.join(", ")}. ` +
+					"Returns JSON. Its source is in Somni's actions folder.)";
+				pi.registerTool({
+					name, label: name, description,
+					parameters: Type.Object(Object.fromEntries(Object.entries(word.params).map(([key, kind]) => [key, PARAM_TYPES[kind]()]))),
+					reachesTools: () => word.uses,
+					async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, _onUpdate: unknown, toolCtx: any) {
+						return runWord(word, params, toolCallId, signal, toolCtx);
+					},
+				} as any);
+				state.words.set(name, word.source);
+				if (!pi.getActiveTools().includes(name)) pi.setActiveTools([...pi.getActiveTools(), name]);
+			}
+		}
+	}
+
+	function actionGuide(words: ActionWord[]) {
+		const tools = actionTargets().filter((tool) => !state.words.has(tool.name)).map((tool) =>
+			`- ${tool.name}: ${clip((tool.description ?? "").replace(/\s+/g, " "), 160)} params ${clip(JSON.stringify(tool.parameters ?? {}), 300)}`);
+		const lexicon = words.map((word) => `### ${word.name}\n${word.source}`).join("\n\n") || "(none yet)";
+		return "\n\nAction words. When the transcript shows the same sequence of tool calls recurring, you may capture it as an " +
+			"action word: one Python function the agent can then call as a single tool. Submit " +
+			'{"op":"define_action","source":"<python>","tests":[{"params":{...},"refs":["tXXXXXX",...],"result":<optional>}]}. ' +
+			"The source is one `def name(param: str|int|float|bool|list|dict, ...)` whose body starts with a one-line " +
+			"docstring. Call tools as rpc.TOOL(key=value) or rpc.TOOL({...}) (rpc.pi.TOOL and rpc.mcp.SERVER.TOOL also work); " +
+			"a call returns the tool's parsed JSON result. Allowed: assignments, if, for over lists or range, comprehensions, " +
+			"arithmetic, dict/list indexing, .get/.items/.keys/.values/.lower/.split and similar, and abs min max round int " +
+			"float str len bool sorted sum any all range divmod. No imports, while, try, lambda, classes or I/O. " +
+			"Each test replays recorded calls: given params, the word must make exactly the calls in refs (same tools, same " +
+			"arguments, in order; each ref a successful tool_result) and then return. Together the tests must exercise every " +
+			"tool the word calls; add a test with fewer refs for each branch that stops early. Generalize with parameters, not " +
+			"constants copied from one episode. Use revise_action {source, tests?} to repair a word and retire_action " +
+			`{name, reason} to remove one.\n\nCallable tools:\n${tools.join("\n")}\n\nCurrent action words:\n${lexicon}\n`;
 	}
 
 	pi.registerTool({
@@ -293,7 +426,9 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Only during /somni-dream or /somni-wiki: submit one consolidation pass as JSON text " +
 			'{"schema":1,"operations":[...]} with add/correct/merge/retract/promote claim operations and page/drop_page wiki ' +
-			'operations. A merge takes {"op":"merge","claim_ids":["n000001","n000002"],"text":"combined guidance"} and inherits their evidence.',
+			'operations. A merge takes {"op":"merge","claim_ids":["n000001","n000002"],"text":"combined guidance"} and inherits their evidence.' +
+			(ACTIONS ? " With action words enabled, define_action/revise_action/retire_action operations are also accepted." : "") +
+			" Rejected operations are listed with reasons; fix them and resubmit if attempts remain.",
 		parameters: Type.Object({ proposal_json: Type.String() }),
 		async execute(_id: string, params: { proposal_json: string }) {
 			const backend = requireWriteAccess();
@@ -302,7 +437,13 @@ export default function (pi: ExtensionAPI) {
 			if (run.result || run.submitting) throw new Error("Only one dream pass can be committed per command.");
 			run.submitting = true;
 			try {
-				const out = await backend.request<DreamResult>("dream", { proposal_json: params.proposal_json });
+				const out = await backend.request<DreamResult>("dream", {
+					proposal_json: params.proposal_json,
+					...(ACTIONS ? {
+						tools: pi.getAllTools().map((tool) => tool.name).filter((name) => !state.words.has(name)),
+						action_allow: ACTION_ALLOW ?? null,
+					} : {}),
+				});
 				run.result = out;
 				return { content: asText(out), details: out };
 			} catch (error) {
@@ -333,6 +474,7 @@ export default function (pi: ExtensionAPI) {
 					"(verb:{name,params,doc,source,examples:[{args,result}]}). Verbs are pure Python with 2–32 worked examples on distinct inputs. Boolean verbs need true and false results. " +
 					"Current ledger: " + clip(JSON.stringify(ledger), 4096) + ". ";
 			}
+			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list")) : "";
 			const focus = args?.trim() || "lessons that will help in future sessions";
 			const prompt = `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
@@ -341,7 +483,7 @@ export default function (pi: ExtensionAPI) {
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
 				`Reserve 5 for at most two claims that matter in most future runs. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
-				learningGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
+				learningGuide + actionsGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				recent.records.map((r) => describeRecord(r)).join("\n");
 			const content: (TextContent | ImageContent)[] = asText(prompt);
 			for (const { ref, sha256, image } of recent.attachments) {
@@ -376,6 +518,7 @@ export default function (pi: ExtensionAPI) {
 		const workspace = process.env.SOMNI_WORKSPACE ?? join(ctx.cwd, ".pi", "somni");
 		state.dream = undefined;
 		state.writable = state.recordWarning = state.indexWarning = false;
+		state.wordCalls.clear();
 		mkdirSync(workspace, { recursive: true });
 		// Isolate imports and avoid bytecode writes beside the extension.
 		const args = ["-I", "-B", STORE_PY, "--workspace", workspace, "--subject-id", SUBJECT, "serve",
@@ -384,6 +527,7 @@ export default function (pi: ExtensionAPI) {
 		if (process.env.SOMNI_TAGS !== undefined) args.push(`--tags=${process.env.SOMNI_TAGS}`);
 		if (RECORD) args.push("--record");
 		if (LEARNING) args.push("--learning");
+		if (ACTIONS) args.push("--actions");
 		const backend = new Backend(PYTHON, args, (error) => {
 			if (state.backend !== backend) return;
 			state.backend = undefined;
@@ -392,9 +536,17 @@ export default function (pi: ExtensionAPI) {
 			notify(ctx, `Somni backend stopped. ${error.message}`);
 		});
 		try {
-			const { writable } = await backend.ready;
+			const { writable, action_sync: synced } = await backend.ready as { writable: boolean; action_sync?: any };
 			state.backend = backend;
 			state.writable = writable;
+			lastCtx = ctx;
+			if (synced?.error) notify(ctx, `Somni could not record your action word edits. ${synced.error}`);
+			else if (synced) {
+				const rejected = (synced.rejected ?? []).map((r: { reason: string }) => r.reason).join("; ");
+				notify(ctx, `Somni recorded ${synced.action_count ?? 0} action word edit(s) as pass ${synced.id}.` +
+					(rejected ? ` Rejected: ${rejected}` : ""));
+			}
+			await registerWords(ctx);
 			if (RECORD && !writable) {
 				notify(ctx, "Somni opened without recording because another Pi session is recording in this Somni workspace.");
 			}
@@ -414,6 +566,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.backend || state.dream) return undefined;
+		if (ACTIONS) await registerWords(ctx);
 		const prompt = event.messageType === "custom" ? undefined : event.prompt;
 		const options = { index_bytes: INJECT_BYTES, query: prompt ? utf8Prefix(prompt, MAX_INDEX_QUERY_BYTES) : undefined };
 		let index = prompt ? await record("ordinary_observation", `USER: ${prompt}`, ctx, options) : undefined;
@@ -445,7 +598,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (!canRecord() || event.parentToolCallId || event.toolName.startsWith("somni_")) return;
+		// Calls an action word makes are recorded too: they are the evidence for revising or composing words.
+		if (event.parentToolCallId && !state.wordCalls.has(event.parentToolCallId)) return;
+		if (!canRecord() || event.toolName.startsWith("somni_")) return;
 		const { text, options } = toolRecord(event.toolName, event.input, event.content);
 		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false });
 	});

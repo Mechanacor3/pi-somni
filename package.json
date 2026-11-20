@@ -1,17 +1,17 @@
 {
   "name": "pi-somni",
-  "version": "0.3.0",
+  "version": "0.4.0-rc.1",
   "description": "Somni: layered memory with offline dreaming for the Pi coding agent. Every claim cites the transcript.",
   "keywords": ["pi-package", "pi", "memory", "agent-memory", "dreaming"],
   "license": "MIT",
   "type": "module",
   "repository": {"type": "git", "url": "git+https://github.com/Mechanacor3/pi-somni.git"},
   "files": [
-    "extensions/", "somni/*.py", "somni/chel/*.py", "adapters/**/*.py",
+    "extensions/", "skills/", "somni/*.py", "somni/chel/*.py", "adapters/**/*.py",
     "evals/__init__.py", "evals/state_bench/__init__.py", "evals/state_bench/somni_state_bench.py",
     "README.md", "EVALUATION.md", "LICENSE"
   ],
-  "pi": {"extensions": ["./extensions/somni.ts"]},
+  "pi": {"extensions": ["./extensions/somni.ts"], "skills": ["./skills"]},
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"

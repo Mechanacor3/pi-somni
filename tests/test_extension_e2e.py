@@ -170,6 +170,61 @@ class SomniPiEndToEnd(unittest.TestCase):
         recall = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_recall")
         self.assertIn("Rule economy_fee", text_of(recall["result"]["content"]))
 
+    def test_action_word_is_dreamed_registered_run_through_pi_and_human_edited(self):
+        self.pi.close()
+        env = {"SOMNI_ACTIONS": "1"}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        plans = {cabin: [[("lookup_fee", {"cabin": cabin, "price": 300})]] for cabin in ("economy", "business")}
+        self.upstream.script = plan_script(plans)
+        for cabin in ("economy", "business"):
+            self.pi.prompt(cabin)
+        store = self.work / ".pi" / "somni"
+        memory = SomniMemory(store, "pi").load()
+        refs = [r["id"] for r in memory.transcript if r["source"] == "tool_result"]
+        source = ('def quote_fees(price: float):\n    """Quote economy and business cancellation fees for one fare."""\n'
+                  '    economy = rpc.lookup_fee(cabin="economy", price=price)\n'
+                  '    business = rpc.pi.lookup_fee({"cabin": "business", "price": price})\n'
+                  '    return {"economy": economy["fee"], "business": business["fee"]}')
+        op = {"op": "define_action", "source": source,
+              "tests": [{"params": {"price": 300}, "refs": refs, "result": {"economy": 50, "business": 24}}]}
+        plans["Dream pass."] = [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [op]})})]]
+        self.pi.prompt("/somni-dream recurring tool sequences")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        dream_prompt = next(text_of(m.get("content")) for m in self.upstream.requests[-2]["messages"]
+                            if text_of(m.get("content")).startswith("Dream pass."))
+        self.assertIn("- lookup_fee: Return the cancellation fee", dream_prompt)
+        self.assertNotIn("- somni_note", dream_prompt)
+        self.assertEqual(sorted(memory.load().action_words()), ["quote_fees"])
+        self.assertIn("rpc.pi.lookup_fee", (store / "somni-v1" / "actions" / "quote_fees.py").read_text())
+
+        # Registered in the same session after the dream; its calls go through Pi.
+        plans["Quote both"] = [[("quote_fees", {"price": 200})]]
+        self.pi.prompt("Quote both fees for 200")
+        declared = [t["function"]["name"] for t in self.upstream.requests[-1].get("tools", [])]
+        self.assertIn("quote_fees", declared)
+        ends = self.pi.tool_ends()
+        word = next(e for e in ends if e["toolName"] == "quote_fees")
+        self.assertFalse(word["isError"], text_of(word["result"]["content"]))
+        self.assertEqual(json.loads(text_of(word["result"]["content"])), {"economy": 50, "business": 16})
+        nested = [e for e in ends if e.get("parentToolCallId") == word["toolCallId"]]
+        self.assertEqual([e["toolName"] for e in nested], ["lookup_fee", "lookup_fee"])
+        texts = [r["text"] for r in memory.load().transcript if r["source"] == "tool_result"]
+        self.assertTrue(texts[-3].startswith('TOOL lookup_fee({"cabin":"economy","price":200})'))
+        self.assertTrue(texts[-1].startswith('TOOL quote_fees({"price":200}) -> {"economy":50,"business":16}'))
+
+        # A human edits the file; the next session records the edit and runs the new version.
+        self.pi.close()
+        path = store / "somni-v1" / "actions" / "quote_fees.py"
+        path.write_text(path.read_text().replace('return {"economy": economy["fee"], "business": business["fee"]}',
+                                                 'return economy["fee"] + business["fee"]'))
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        self.pi.prompt("Quote both fees for 200")
+        word = [e for e in self.pi.tool_ends() if e["toolName"] == "quote_fees"][-1]
+        self.assertEqual(json.loads(text_of(word["result"]["content"])), 66)
+        last = memory.load().dreams[-1]
+        self.assertEqual((last["author"], last["actions"][0]["op"]), ("human", "revise"))
+        self.assertEqual(len(last["actions"][0]["dropped_tests"]), 1)
+
     def test_dream_record_settings_bound_the_prompt(self):
         self.pi.close()
         store = self.work / "dream-memory"

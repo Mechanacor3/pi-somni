@@ -1,0 +1,73 @@
+---
+name: somni-action-words
+description: Somni action words are learned Python functions that call this session's tools as rpc.TOOL(...) and appear as ordinary tools. Use when a tool says "Learned action word", when writing or repairing one in a Somni dream (define_action, revise_action, retire_action), or when reading or editing files in Somni's actions folder.
+---
+
+# Somni action words
+
+An action word is a short Python function that Somni learned from your own transcript. It runs a sequence of tool calls that recurred, so you can make the whole sequence with one tool call instead of one turn per call. Each word appears in your tool list under its own name, with a description ending in "Learned action word: calls ...".
+
+## Using a word
+
+Call it like any tool. It returns JSON: whatever the function returns.
+
+- Each call it makes goes through Pi like your own calls do: the same argument checks, the same permission hooks, and the same recording.
+- If one of its calls fails, the word stops and the error names the calls that already ran. Those calls' effects stay in place. Check the state before you retry.
+- A word encodes what worked before. When your situation differs from its description, make the calls yourself.
+
+## Reading a word
+
+Words live as files in `<somni workspace>/somni-v1/actions/<name>.py`:
+
+```python
+# somni: action word. Edit freely; the next Pi session re-checks this file and records the change.
+# somni: delete the file to retire the word. Lines starting with `# somni:` are regenerated.
+# somni: calls cancel_booking, get_booking; evidence t000001, t000002, t000003
+# somni: test cancel_if_refundable(booking_id='BK-1') replays t000001 t000002 -> {'cancelled': True}
+
+def cancel_if_refundable(booking_id: str):
+    """Cancel a booking only when it is refundable, and report what happened."""
+    booking = rpc.get_booking(booking_id=booking_id)
+    if not booking["refundable"]:
+        return {"cancelled": False, "reason": "not refundable"}
+    result = rpc.cancel_booking({"booking_id": booking_id, "reason": "customer request"})
+    return {"cancelled": result["status"] == "cancelled"}
+```
+
+- The docstring becomes the tool description. The parameter annotations, which must be `str`, `int`, `float`, `bool`, `list`, or `dict`, become its schema.
+- `rpc.TOOL(...)` and `rpc.pi.TOOL(...)` call a Pi tool, which may be another word. `rpc.mcp.SERVER.TOOL(...)` calls the MCP tool `mcp__SERVER__TOOL`. Pass keyword arguments or one dict. The call returns the tool's result as parsed JSON, or as text if it is not JSON.
+- Allowed: assignments, `if`, `for` over lists or `range`, comprehensions, arithmetic, indexing, and string and dict methods such as `.get`, `.items`, `.lower`, and `.split`. The allowed builtins are `abs min max round int float str len bool sorted sum any all range divmod`. `date`, `datetime`, `timedelta`, `floor`, and `ceil` are also available.
+- Rejected: imports, `while`, `try`, `lambda`, classes, names starting with `_`, and any I/O except `rpc`.
+
+## Editing a word (humans)
+
+Edit the file and save it. The next Pi session that records to this store checks the edit and records it in the store's hash-chained history as a pass authored by `human`.
+
+- To add a word, create a new `.py` file containing one `def`. To retire one, delete its file.
+- The edit must pass the syntax rules above. If it does not, Pi warns at session start, and the previous version stays active until you fix the file.
+- A stored test that your edit breaks is dropped and listed in the pass. It does not block the edit.
+- Keep the file name and the function name the same.
+
+## Writing a word in a dream
+
+Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the callable tools and the current words.
+
+1. Find the same sequence of tool calls in two or more places in the transcript.
+2. Write one function that makes that sequence. Turn the values that vary between occurrences into parameters, and branch with `if` where the occurrences differ.
+3. Add tests. Each test gives `params` and `refs`: the transcript IDs of the successful tool calls the word must reproduce, in order, with exactly the recorded arguments. After the last ref, the word must return. An optional `result` checks what it returns. Together the tests must exercise every tool the word calls. A branch that stops early needs its own test with fewer refs.
+
+```json
+{"op": "define_action",
+ "source": "def cancel_if_refundable(booking_id: str):\n    \"\"\"Cancel a booking only when it is refundable.\"\"\"\n    ...",
+ "tests": [{"params": {"booking_id": "BK-1"}, "refs": ["t000001", "t000002"], "result": {"cancelled": true}},
+           {"params": {"booking_id": "BK-2"}, "refs": ["t000003"]}]}
+```
+
+To repair a word, use `{"op":"revise_action","source":...,"tests":...}`. Omit `tests` to keep the stored ones. To remove a word, use `{"op":"retire_action","name":...,"reason":...}`. A rejected operation comes back with a reason. Fix it and resubmit while attempts remain.
+
+Common rejections:
+
+- **Arguments differ from the record.** Key order does not matter, but values and types do: `300` and `"300"` differ.
+- **The record is truncated or failed.** Cite only complete, successful results.
+- **A tool is never exercised.** Add a test that reaches that call.
+- **Name clash.** A word cannot share a name with an existing tool, and cannot call itself, directly or through another word.

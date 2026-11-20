@@ -83,6 +83,9 @@ MAX_PAGE_BYTES = 6_144
 WIKILINK = re.compile(r"\[\[([a-z0-9][a-z0-9-]{0,63})(?:\|[^\]\n]{1,160})?\]\]")
 CLAIM_CITE = re.compile(r"\[(n[0-9]{6})\]")
 VAULT_DIR = "vault"
+ACTIONS_DIR = "actions"
+ACTION_OPS = frozenset({"define_action", "revise_action", "retire_action"})
+MAX_ACTION_FILE_BYTES = 16384
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output"}
 STATUSES = {"verified", "uncertain"}
@@ -241,6 +244,18 @@ def _read_regular(path, limit=MAX_INPUT_BYTES):
         return data
     finally:
         os.close(fd)
+
+
+def _write_text_atomic(path, text):
+    _no_symlink(path)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _atomic_json(path, value, *, create=False):
@@ -1012,7 +1027,7 @@ class SomniMemory:
             self.claims[replaces]["superseded_by"] = claim_id
         return claim_id
 
-    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False):
+    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False, actions=None):
         """Apply one offline consolidation pass.
 
         By default the pass is all-or-nothing.  With ``partial=True`` an operation
@@ -1020,6 +1035,9 @@ class SomniMemory:
         ``rejected`` field (index and reason), so a model-authored pass keeps its
         valid operations and the rejection itself becomes part of the trace.  At
         least one operation must still be accepted.
+
+        ``actions`` enables action-word operations: ``{"allow": names or None,
+        "reserved": session tool names, "author": "dream" or "human"}``.
         """
         if not isinstance(proposal, dict) or proposal.get("schema") != SCHEMA or set(proposal) != {"schema", "operations"}:
             raise MemoryError("dream proposal must contain schema and operations")
@@ -1036,21 +1054,25 @@ class SomniMemory:
                 raise MemoryError("dreaming is offline-only; close the subject session first")
             if self.state["dream_count"] >= MAX_DREAM_PASSES:
                 raise MemoryError("dream pass limit reached; seal the bounded attempt")
-            prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, learning)
+            prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, learning, actions)
             if not prepared and operations:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
-            self._commit_dream(proposal_bytes, prepared, next_claim, rejected)
+            self._commit_dream(proposal_bytes, prepared, next_claim, rejected,
+                               author=(actions or {}).get("author", "dream"))
             self._load_locked(force=True)
+            if self.dreams[-1].get("actions"):
+                self.write_action_files(self.dreams[-1]["actions"])
             if self.pages or os.path.isdir(self.store / VAULT_DIR):
                 self.write_vault()
             return self.dreams[-1]
 
-    def _prepare_dream(self, operations, partial, viewed_images, learning):
+    def _prepare_dream(self, operations, partial, viewed_images, learning, actions):
         # Removing a broken wiki operation can expose another broken link or an
         # earlier page version. Rebuild the simulation before checking again.
         link_rejections = {}
         while True:
             simulated = {key: dict(value) for key, value in self.claims.items()}
+            words = None
             ledger = None
             pages = self.pages.copy()
             page_changes = {}
@@ -1061,6 +1083,13 @@ class SomniMemory:
                 if index in rejected:
                     continue
                 try:
+                    if isinstance(operation, dict) and isinstance(operation.get("op"), str) and operation["op"] in ACTION_OPS:
+                        if actions is None:
+                            raise MemoryError("action words are disabled (SOMNI_ACTIONS=1 enables them)")
+                        if words is None:
+                            words = self.action_words()
+                        prepared.append(("action", self._prepare_action(operation, words, actions)))
+                        continue
                     if isinstance(operation, dict) and operation.get("op") == "ledger_propose":
                         if not learning:
                             raise MemoryError("Chel learning is disabled")
@@ -1088,6 +1117,35 @@ class SomniMemory:
             if not partial:
                 raise MemoryError(reason)
             link_rejections[index] = reason
+
+    def _prepare_action(self, operation, words, actions):
+        A = _action_module()
+        kind = operation["op"]
+        try:
+            if kind == "retire_action":
+                body = A.check_retire(operation, words)
+                del words[body["name"]]
+                return {"op": "retire", **body}
+            if kind == "define_action":
+                if set(operation) != {"op", "source", "tests"}:
+                    raise MemoryError("define_action needs exactly source and tests")
+                source, tests, replacing = A.normalize(operation["source"]), operation["tests"], None
+            else:
+                if not {"op", "source"} <= set(operation) <= {"op", "source", "tests"}:
+                    raise MemoryError("revise_action needs source and optionally tests")
+                source = A.normalize(operation["source"])
+                replacing = A.parse(source)["name"]
+                if replacing not in words:
+                    raise MemoryError(f"revise_action targets unknown action word {replacing}")
+                tests = operation.get("tests", words[replacing]["tests"])
+            word, dropped = A.build(source, tests, self._records_by_id, words, allow=actions.get("allow"),
+                                    reserved=set(actions.get("reserved", ())), replacing=replacing,
+                                    lenient=actions.get("author") == "human")
+        except (ValueError, TypeError, KeyError, RecursionError) as exc:
+            raise MemoryError(str(exc)[:600]) from exc
+        words[word["name"]] = word
+        return {"op": "define" if replacing is None else "revise", **word,
+                **({"dropped_tests": dropped} if dropped else {})}
 
     def _wiki_link_conflict(self, pages, page_changes):
         blocked_drop = None
@@ -1187,9 +1245,10 @@ class SomniMemory:
             raise MemoryError("unknown dream operation")
         return next_claim
 
-    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected):
+    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream"):
         learning = [body for op, body in prepared if op == "ledger_propose"]
-        prepared = [(op, body) for op, body in prepared if op != "ledger_propose"]
+        words = [body for op, body in prepared if op == "action"]
+        prepared = [(op, body) for op, body in prepared if op not in {"ledger_propose", "action"}]
         wiki_events = []
         wiki_seq, wiki_head = self.state.get("wiki_events", 0), self.state.get("wiki_head", ZERO_HASH)
         for op, body in prepared:
@@ -1218,6 +1277,11 @@ class SomniMemory:
         merged = sum(op == "add" and "merged_from" in body for op, body in prepared)
         dream["added_count"] = sum(op == "add" for op, _ in prepared) - merged
         dream["merged_count"] = merged
+        if words:
+            dream["actions"] = words
+            dream["operation_count"] += len(words)
+        if author != "dream":
+            dream["author"] = author
         if learning:
             dream["learning"] = learning
             dream["operation_count"] += len(learning)
@@ -1311,6 +1375,65 @@ class SomniMemory:
                                        page_scores.get(page["slug"], 0) * (1 + 0.1 * salience),
                                        max((rank[2] for rank in cited), default=""), salience)
         return claim_ranks, page_ranks
+
+    def action_words(self):
+        """The current lexicon: define/revise/retire events from every committed pass, in order."""
+        return _action_module().fold(event for dream in self.dreams for event in dream.get("actions", ()))
+
+    def write_action_files(self, events=None):
+        """Render words as editable files in somni-v1/actions/.
+
+        Only words a pass changed are rewritten (all words when the folder is new), so
+        a human edit that has not been synced yet is never overwritten by another pass.
+        """
+        A = _action_module()
+        folder = self.store / ACTIONS_DIR
+        _no_symlink(folder)
+        words = self.action_words()
+        if not os.path.isdir(folder):
+            if not words:
+                return
+            os.mkdir(folder, 0o700)
+            events = [{"op": "define", "name": name} for name in words]
+        for event in events or ():
+            path = folder / f"{event['name']}.py"
+            if event["op"] == "retire":
+                if os.path.isfile(path):
+                    os.unlink(path)
+            elif event["name"] in words:
+                _write_text_atomic(path, A.render(words[event["name"]]))
+
+    def sync_action_files(self, *, reserved=(), allow=None):
+        """Record human edits to somni-v1/actions/ as a pass authored by "human".
+
+        A changed file revises its word, a new file defines one, and a deleted file
+        retires one.  Edits must pass the syntax policy; tests they break are dropped
+        and listed in the pass.  Returns the pass, or None when nothing changed.
+        """
+        A = _action_module()
+        self.load()
+        folder = self.store / ACTIONS_DIR
+        if not os.path.isdir(folder):
+            self.write_action_files()
+            return None
+        words = self.action_words()
+        operations = []
+        _no_symlink(folder)
+        for path in sorted(folder.glob("*.py")):
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_ACTION_FILE_BYTES:
+                raise MemoryError(f"{path.name} must be a regular file of at most {MAX_ACTION_FILE_BYTES} bytes")
+            source = A.source_of(path.read_text(encoding="utf-8"))
+            if path.stem not in words:
+                operations.append({"op": "define_action", "source": source, "tests": []})
+            elif source != words[path.stem]["source"]:
+                operations.append({"op": "revise_action", "source": source})
+        for name in sorted(words):
+            if not os.path.exists(folder / f"{name}.py"):
+                operations.append({"op": "retire_action", "name": name, "reason": "file deleted by a human"})
+        if not operations:
+            return None
+        return self.dream({"schema": SCHEMA, "operations": operations[:32]}, partial=True,
+                          actions={"author": "human", "reserved": reserved, "allow": allow})
 
     def learning_ledger(self):
         # Isolated CLI invocations omit the package root from sys.path.
@@ -1421,6 +1544,7 @@ class SomniMemory:
             "transcript_head": self.state["transcript_head"], "active_claims_by_status": active,
             "claim_count": len(self.claims), "dream_count": self.state["dream_count"],
             "last_pass": _dream_summary(self.dreams[-1]) if self.dreams else None,
+            "action_words": sorted(self.action_words()),
         }
 
     def report(self):
@@ -1562,6 +1686,8 @@ def _dream_summary(dream):
     default = 0 if dream["operation_count"] == dream.get("page_operations", 0) else None
     return {"id": f"d{dream['seq']:06d}", "added_count": dream.get("added_count", default),
             **({"learning_count": len(dream["learning"])} if dream.get("learning") else {}),
+            **({"action_count": len(dream["actions"])} if dream.get("actions") else {}),
+            **({"rejected": dream["rejected"]} if dream.get("rejected") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
             "operation_count": dream["operation_count"], "transcript_head": dream["transcript_head"]}
 
@@ -1597,8 +1723,16 @@ def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORD
     return {"records": excerpts, "attachments": attachments}
 
 
+def _action_module():
+    root = str(pathlib.Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from somni import actions
+    return actions
+
+
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
-                    resize=None, viewed=None, learning=False):
+                    resize=None, viewed=None, learning=False, actions=False):
     if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable:
         raise MemoryError("Somni memory changes require the session that owns recording")
     if method == "phase":
@@ -1623,7 +1757,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         if not isinstance(proposal, str) or len(proposal.encode()) > MAX_INPUT_BYTES:
             raise MemoryError("dream proposal exceeds byte limit")
         dream = memory.dream(json.loads(proposal), partial=True, allow_empty=True, viewed_images=viewed,
-                             learning=learning)
+                             learning=learning, actions=_dream_actions(args) if actions else None)
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
         return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning)
@@ -1637,6 +1771,15 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             rules = memory.learning_ledger().recall(query, top_k=limit)
             return [{**rule, "kind": "rule"} for rule in rules] + hits
         return hits
+    elif method == "action_list" and actions:
+        return [{key: word[key] for key in ("name", "description", "params", "uses", "source")}
+                for word in memory.load().action_words().values()]
+    elif method == "action_step" and actions:
+        words = memory.load().action_words()
+        if args.get("name") not in words:
+            raise MemoryError(f"unknown action word {args.get('name')}")
+        A = _action_module()
+        return A.step(A.shared_runtime(words), words[args["name"]], args["params"], args["history"])
     elif method == "ledger" and learning:
         return memory.load().learning_ledger().description()
     elif method == "recent":
@@ -1669,7 +1812,17 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         raise MemoryError(f"unknown Somni backend method: {method}")
 
 
-def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False):
+def _dream_actions(args):
+    allow = args.get("action_allow")
+    if allow is not None and not (isinstance(allow, list) and all(isinstance(n, str) for n in allow)):
+        raise MemoryError("action_allow must be a list of tool names")
+    reserved = args.get("tools", [])
+    if not (isinstance(reserved, list) and all(isinstance(n, str) for n in reserved)):
+        raise MemoryError("tools must be a list of tool names")
+    return {"author": "dream", "allow": allow, "reserved": reserved}
+
+
+def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False, actions=False):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
 
@@ -1687,12 +1840,21 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
         if owner is not False and not os.path.lexists(memory.store):
             SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
         memory = SomniMemory(memory.workspace, memory.subject_id, scheduled_verification=True)
+        synced = None
+        if owner and record and actions:
+            memory.load()
+            if memory.state["phase"] == "closed":
+                try:
+                    synced = memory.sync_action_files()
+                    synced = synced and {**_dream_summary(synced), "author": "human"}
+                except (ValueError, OSError) as exc:
+                    synced = {"error": str(exc)[:600]}
         if owner and record:
             memory.set_phase("open", allow_same=True)
         else:
             memory.load()
         try:
-            reply(0, result={"writable": owner is not False})
+            reply(0, result={"writable": owner is not False, **({"action_sync": synced} if synced else {})})
             while line := sys.stdin.buffer.readline(MAX_BACKEND_REQUEST + 1):
                 if len(line) > MAX_BACKEND_REQUEST:
                     raise MemoryError("Somni backend request exceeds byte limit")
@@ -1701,7 +1863,8 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
                     request = json.loads(line)
                     request_id = request["id"]
                     result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
-                                             image_bytes=image_bytes, resize=resize, viewed=viewed, learning=learning)
+                                             image_bytes=image_bytes, resize=resize, viewed=viewed, learning=learning,
+                                             actions=actions)
                     reply(request_id, result=result)
                 except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                     reply(request_id, error=str(exc))
@@ -1747,6 +1910,7 @@ def parser():
     init = commands.add_parser("init"); init.add_argument("--lineage-id", required=True); init.add_argument("--attempt-id", required=True)
     commands.add_parser("session-open"); commands.add_parser("session-close")
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
+    serve.add_argument("--actions", action="store_true")
     serve.add_argument("--learning", action="store_true")
     serve.add_argument("--record", action="store_true")
     serve.add_argument("--run-label")
@@ -1778,7 +1942,8 @@ def main():
         memory = SomniMemory(args.workspace, args.subject_id)
         if args.command == "serve":
             _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
-                   image_bytes=args.image_bytes, image_max_edge=args.image_max_edge, learning=args.learning)
+                   image_bytes=args.image_bytes, image_max_edge=args.image_max_edge, learning=args.learning,
+                   actions=args.actions)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":
