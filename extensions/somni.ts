@@ -51,6 +51,8 @@ const LEARNING = process.env.SOMNI_CHEL_LEARNING === "1";
 const ACTIONS = process.env.SOMNI_ACTIONS === "1";
 const ACTION_ALLOW = process.env.SOMNI_ACTION_TOOLS?.split(",").map((name) => name.trim()).filter(Boolean);
 const MAX_ACTION_DEPTH = 4;
+const configuredActionCalls = Number(process.env.SOMNI_ACTION_MAX_CALLS ?? 16);
+const ACTION_MAX_CALLS = Number.isInteger(configuredActionCalls) ? Math.min(64, Math.max(1, configuredActionCalls)) : 16;
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream"]);
 const MAX_INDEX_QUERY_BYTES = 65_536;
 const MAX_RECORD_BYTES = 8000;
@@ -280,7 +282,7 @@ export default function (pi: ExtensionAPI) {
 		state.wordCalls.add(toolCallId);
 		try {
 			for (;;) {
-				const step = await getBackend().request<ActionStep>("action_step", { name: word.name, params, history });
+				const step = await getBackend().request<ActionStep>("action_step", { name: word.name, params, history, max_calls: ACTION_MAX_CALLS });
 				if (!step.call) {
 					return { content: asText(JSON.stringify(step.result ?? null)), details: { word: word.name, calls } };
 				}

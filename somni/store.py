@@ -246,6 +246,16 @@ def _read_regular(path, limit=MAX_INPUT_BYTES):
         os.close(fd)
 
 
+def _seeded_only(store):
+    """True when the store folder holds nothing but a human-seeded actions/ folder."""
+    store = pathlib.Path(store)
+    if store.is_symlink() or not store.is_dir():
+        return False
+    entries = list(store.iterdir())
+    return (len(entries) == 1 and entries[0].name == ACTIONS_DIR
+            and entries[0].is_dir() and not entries[0].is_symlink())
+
+
 def _write_text_atomic(path, text):
     _no_symlink(path)
     fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
@@ -365,9 +375,12 @@ class SomniMemory:
     def create(cls, workspace, subject_id, lineage_id, attempt_id, limits=None):
         memory = cls(workspace, subject_id)
         limits = _validate_limits(limits) if limits else None
-        if memory.store.exists() or os.path.lexists(memory.store):
+        if _seeded_only(memory.store):
+            pass  # a human seeded action word files before the first session
+        elif memory.store.exists() or os.path.lexists(memory.store):
             raise MemoryError(f"create-only store already exists: {memory.store}")
-        memory.store.mkdir(mode=0o700)
+        else:
+            memory.store.mkdir(mode=0o700)
         manifest = {
             "schema": SCHEMA,
             "condition": "somni-v1",
@@ -1779,7 +1792,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         if args.get("name") not in words:
             raise MemoryError(f"unknown action word {args.get('name')}")
         A = _action_module()
-        return A.step(A.shared_runtime(words), words[args["name"]], args["params"], args["history"])
+        return A.step(A.shared_runtime(words), words[args["name"]], args["params"], args["history"],
+                      max_calls=args.get("max_calls", A.MAX_CALLS))
     elif method == "ledger" and learning:
         return memory.load().learning_ledger().description()
     elif method == "recent":
@@ -1837,7 +1851,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
         resize = (Image, image_max_edge)
     viewed = set()
     with _recording_lease(memory) as owner:
-        if owner is not False and not os.path.lexists(memory.store):
+        if owner is not False and (not os.path.lexists(memory.store) or _seeded_only(memory.store)):
             SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
         memory = SomniMemory(memory.workspace, memory.subject_id, scheduled_verification=True)
         synced = None

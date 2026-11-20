@@ -52,7 +52,8 @@ ANNOTATIONS = {"str": "string", "int": "integer", "float": "number", "bool": "bo
 HEADER = "# somni:"
 MAX_WORDS = 32
 MAX_USES = 8
-MAX_CALLS = 16
+MAX_CALLS = 16  # default per run; SOMNI_ACTION_MAX_CALLS raises it up to CALL_LIMIT
+CALL_LIMIT = 64
 MAX_TESTS = 8
 MAX_DESCRIPTION = 300
 VALUE_BYTES = 16_384
@@ -323,10 +324,11 @@ def check_params(word, params):
     require(size(params) <= VALUE_BYTES, "action parameters exceed 16 KiB")
 
 
-def step(runtime, word, params, history):
+def step(runtime, word, params, history, *, max_calls=MAX_CALLS):
     """Replay `word` over `history` ([{tool, args, result}]).  Returns {call: {tool, args}} or {result}."""
+    require(type(max_calls) is int and 1 <= max_calls <= CALL_LIMIT, f"max_calls must be 1-{CALL_LIMIT}")
     check_params(word, params)
-    require(isinstance(history, list) and len(history) <= MAX_CALLS, f"an action run makes at most {MAX_CALLS} calls")
+    require(isinstance(history, list) and len(history) <= max_calls, f"an action run makes at most {max_calls} calls")
     require(size(history) <= HISTORY_BYTES, "action history exceeds 256 KiB")
     for item in history:
         require(isinstance(item, dict) and {"tool", "args", "result"} <= set(item), "malformed action history")
@@ -341,7 +343,7 @@ def step(runtime, word, params, history):
         require(size(reply["value"]) <= VALUE_BYTES, "action result exceeds 16 KiB")
         return {"result": reply["value"]}
     require(len(calls) == len(history) + 1, "action word made an unexpected call")
-    require(len(history) < MAX_CALLS, f"action word exceeded {MAX_CALLS} tool calls")
+    require(len(history) < max_calls, f"action word exceeded {max_calls} tool calls (SOMNI_ACTION_MAX_CALLS)")
     tool, args = calls[-1]
     require(tool in word["uses"], f"action word called undeclared tool {tool}")
     require(size(args) <= VALUE_BYTES, "tool arguments exceed 16 KiB")
@@ -425,18 +427,18 @@ def _replay(runtime, word, case, records, number):
     require(isinstance(case, dict) and {"params", "refs"} <= set(case) <= {"params", "refs", "result"},
             f"test {number} needs params, refs and optionally result")
     refs = case["refs"]
-    require(isinstance(refs, list) and len(refs) <= MAX_CALLS and all(isinstance(r, str) for r in refs)
+    require(isinstance(refs, list) and len(refs) <= CALL_LIMIT and all(isinstance(r, str) for r in refs)
             and refs == sorted(set(refs)), f"test {number} refs must be distinct transcript IDs in order")
     history, used = [], set()
     for ref in refs:
         tool, args, result = parse_record(records.get(ref), ref)
-        out = step(runtime, word, case["params"], history)
+        out = step(runtime, word, case["params"], history, max_calls=CALL_LIMIT)
         require(out.get("call") == {"tool": tool, "args": args},
                 f"test {number}: at {ref} the word {_describe(out)}, but the record shows "
                 f"{tool}({json.dumps(args)[:200]})")
         history.append({"tool": tool, "args": args, "result": result})
         used.add(tool)
-    out = step(runtime, word, case["params"], history)
+    out = step(runtime, word, case["params"], history, max_calls=CALL_LIMIT)
     require("result" in out, f"test {number}: after {len(refs)} recorded call(s) the word {_describe(out)}")
     if "result" in case:
         require(out["result"] == case["result"],

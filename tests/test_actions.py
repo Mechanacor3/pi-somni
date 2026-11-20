@@ -170,6 +170,33 @@ class ActionWordTest(unittest.TestCase):
             self.m.sync_action_files()
         self.assertEqual(sorted(self.m.load().action_words()), ["lookup"])
 
+    def test_call_cap_is_configurable(self):
+        source = ('def lookups(n: int):\n    """Look up n bookings."""\n'
+                  '    return [rpc.get_booking(booking_id=str(i)) for i in range(n)]')
+        word = {"name": "lookups", "params": {"n": "integer"}, "uses": ["get_booking"], "source": source}
+        history = [{"tool": "get_booking", "args": {"booking_id": str(i)}, "result": {}} for i in range(16)]
+        with A.ActionRuntime({"lookups": word}) as runtime:
+            with self.assertRaisesRegex(A.ActionError, "exceeded 16 tool calls"):
+                A.step(runtime, word, {"n": 20}, history[:16])
+            self.assertEqual(A.step(runtime, word, {"n": 20}, history, max_calls=20)["call"]["args"],
+                             {"booking_id": "16"})
+            with self.assertRaisesRegex(A.ActionError, "max_calls"):
+                A.step(runtime, word, {"n": 1}, [], max_calls=65)
+
+    def test_words_seeded_before_the_first_session_are_adopted(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = SomniMemory(tmp.name, "s").store / "actions"
+        folder.mkdir(parents=True)
+        (folder / "lookup.py").write_text('def lookup(b: str):\n    """Fetch a booking."""\n'
+                                          '    return rpc.get_booking(booking_id=b)\n')
+        memory = SomniMemory.create(tmp.name, "s", "l", "a")
+        self.assertEqual(memory.sync_action_files()["author"], "human")
+        self.assertEqual(sorted(memory.load().action_words()), ["lookup"])
+        (folder / "other.py").write_text("x = 1\n")
+        with self.assertRaisesRegex(SomniError, "already exists"):
+            SomniMemory.create(tmp.name, "s", "l", "a")
+
     def test_truncated_or_failed_records_are_not_evidence(self):
         self.m.set_phase("open")
         self.m.record("tool_result", 'TOOL get_booking({"booking_id": "BK-4"}) -> {"x": 1 [body truncated: 9 UTF-8 bytes '
