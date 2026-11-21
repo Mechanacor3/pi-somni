@@ -271,6 +271,10 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.pi.prompt("Quote both fees for 200")
         word = next(e for e in self.pi.tool_ends() if e["toolName"] == "quote_fees")
         self.assertEqual(json.loads(text_of(word["result"]["content"])), [50, 16])
+        # The actor's injected index names the word, not only its tool declaration.
+        index = "\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"])
+        self.assertIn(f"- word `quote_fees(price: float)`: Quote economy and business cancellation fees for one fare. "
+                      f"(a tool; calls lookup_fee; replays {refs[0]}..{refs[1]})", index)
 
     def test_word_passes_on_images_from_its_final_call_only(self):
         self.pi.close()

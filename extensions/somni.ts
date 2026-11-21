@@ -128,7 +128,8 @@ function notify(ctx: ExtensionContext, message: string) {
 }
 
 async function record(source: "ordinary_observation" | "tool_result" | "agent_output", text: string, ctx: ExtensionContext,
-		options: { tool_ok?: boolean; index_bytes?: number; query?: string; images?: ImageContent[]; omitted_images?: number } = {}) {
+		options: { tool_ok?: boolean; index_bytes?: number; query?: string; images?: ImageContent[]; omitted_images?: number;
+			action_words?: string[] } = {}) {
 	if (!canRecord() || !text.trim()) return;
 	try {
 		const output = await getBackend().request<string>("record", {
@@ -638,7 +639,8 @@ export default function (pi: ExtensionAPI) {
 			await recordToolCatalog(ctx); // MCP tools often register after session_start
 		}
 		const prompt = event.messageType === "custom" ? undefined : event.prompt;
-		const options = { index_bytes: INJECT_BYTES, query: prompt ? utf8Prefix(prompt, MAX_INDEX_QUERY_BYTES) : undefined };
+		const options = { index_bytes: INJECT_BYTES, query: prompt ? utf8Prefix(prompt, MAX_INDEX_QUERY_BYTES) : undefined,
+			...(ACTIONS && state.words.size ? { action_words: [...state.words.keys()] } : {}) };
 		let index = prompt ? await record("ordinary_observation", `USER: ${prompt}`, ctx, options) : undefined;
 		try {
 			index ??= await getBackend().request<string>("inject", options);
@@ -650,7 +652,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return undefined;
 		}
-		if (!/^-(?: n\d{6} | rule | page `)/m.test(index)) return undefined;
+		if (!/^-(?: n\d{6} | rule | page `| word `)/m.test(index)) return undefined;
 		return { message: { customType: "somni-index", content: index, display: false } };
 	});
 

@@ -1522,11 +1522,48 @@ class SomniMemory:
         self._learning_cache = (self.state["dreams_head"], self.state["transcript_head"], ledger)
         return ledger
 
-    def inject(self, max_bytes=DEFAULT_INJECTION_BYTES, *, query="", learning=False):
+    def _index_words(self, names, query, budget):
+        A = _action_module()
+        python = {kind: name for name, kind in A.ANNOTATIONS.items()}
+        lexicon = self.action_words()
+        words = [lexicon[name] for name in dict.fromkeys(names) if name in lexicon]
+        # Most relevant to the prompt first, then the words with the most recent evidence.
+        words.sort(key=lambda w: max(w.get("evidence") or [""]), reverse=True)
+        if query.strip():
+            scores = {id(w): score for score, w in
+                      _bm25([_terms(f"{w['name']} {w['name']} {w['description']}") for w in words], words, query)}
+            words.sort(key=lambda w: scores.get(id(w), 0), reverse=True)
+        lines = []
+        for word in words[:5]:
+            params = ", ".join(f"{key}: {python.get(kind, kind)}" for key, kind in word["params"].items())
+            evidence = word.get("evidence") or []
+            proof = f"; replays {evidence[0]}..{evidence[-1]}" if len(evidence) > 1 else \
+                f"; replays {evidence[0]}" if evidence else "; edited by a human, no tests"
+            line = f"- word `{word['name']}({params})`: {word['description'][:200]} (a tool; calls {', '.join(word['uses'])}{proof})\n"
+            size = len(line.encode("utf-8"))
+            if size > budget:
+                break
+            if not lines:
+                intro = "Learned action words: call one as a tool to run its whole sequence in one step.\n"
+                if size + len(intro.encode("utf-8")) > budget:
+                    break
+                lines.append(intro)
+                budget -= len(intro.encode("utf-8"))
+            lines.append(line)
+            budget -= size
+        return lines
+
+    def inject(self, max_bytes=DEFAULT_INJECTION_BYTES, *, query="", learning=False, words=None):
+        """The bounded index injected before each agent turn.  ``words`` names the action
+        words registered as tools in this session; up to five are listed, ranked by the query."""
         _validate_index_request(max_bytes, query)
         header = "# Subject memory index\nClaims are interpretations. Use evidence IDs to inspect the transcript.\n"
         lines = [header]
         remaining = max_bytes - len(header.encode("utf-8"))
+        if words:
+            word_lines = self._index_words(words, query, min(remaining // 4, 1536))
+            lines += word_lines
+            remaining -= sum(len(line.encode("utf-8")) for line in word_lines)
         if learning and query.strip():
             rule_budget = remaining // 3
             for rule in self.learning_ledger().recall(query, top_k=5):
@@ -1812,7 +1849,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             raise MemoryError("invalid tool result image list")
         ref = memory.record(args["source"], args["text"], context=context, images=images, omitted_images=omitted,
                             clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"))
-        return ref if index_bytes is None else memory.inject(index_bytes, query=query, learning=learning)
+        return ref if index_bytes is None else memory.inject(index_bytes, query=query, learning=learning,
+                                                            words=_index_word_names(args) if actions else None)
     elif method == "note":
         if len(canonical(args).encode("utf-8")) > MAX_INPUT_BYTES:
             raise MemoryError("note input exceeds byte limit")
@@ -1829,7 +1867,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
                              learning=learning, actions=options)
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
-        return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning)
+        return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning,
+                                    words=_index_word_names(args) if actions else None)
     elif method == "search":
         return memory.load().search(args["query"], args["limit"])
     elif method == "recall":
@@ -1889,6 +1928,13 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         }
     else:
         raise MemoryError(f"unknown Somni backend method: {method}")
+
+
+def _index_word_names(args):
+    names = args.get("action_words") or []
+    if not (isinstance(names, list) and len(names) <= 64 and all(isinstance(n, str) for n in names)):
+        raise MemoryError("action_words must be a list of at most 64 tool names")
+    return names
 
 
 def _dream_actions(args):

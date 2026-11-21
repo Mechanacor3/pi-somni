@@ -234,6 +234,26 @@ class ActionWordTest(unittest.TestCase):
                  for refs in top["refs"]]
         self.assertEqual(self.define(word, tests)["actions"][0]["name"], "cancel")
 
+    def test_index_lists_registered_words_ranked_by_the_prompt(self):
+        self.define()
+        self.dream({"op": "define_action", "tests": [{"params": {"booking_id": "BK-2"}, "refs": ["t000003"]}],
+                    "source": 'def check_booking(booking_id: str):\n    """Look up whether a booking is refundable."""\n'
+                              '    return rpc.get_booking(booking_id=booking_id)["refundable"]'})
+        memory = self.m.load()
+        both = ["cancel_if_refundable", "check_booking"]
+        index = memory.inject(4096, query="please cancel my booking", words=both)
+        lines = [line for line in index.splitlines() if line.startswith("- word ")]
+        self.assertEqual(lines[0], "- word `cancel_if_refundable(booking_id: str)`: Cancel a booking only when it is "
+                                   "refundable, and report what happened. (a tool; calls cancel_booking, get_booking; "
+                                   "replays t000001..t000003)")
+        self.assertTrue(lines[1].startswith("- word `check_booking(booking_id: str)`"))
+        self.assertIn("Learned action words: call one as a tool", index)
+        # Only words this session registered are listed; none at all without the list.
+        self.assertEqual(len([l for l in memory.inject(4096, words=["check_booking", "nope"]).splitlines()
+                              if l.startswith("- word ")]), 1)
+        self.assertNotIn("- word ", memory.inject(4096))
+        self.assertNotIn("- word ", memory.inject(512, words=both))  # a quarter of a small index cannot fit one
+
 
 if __name__ == "__main__":
     unittest.main()
