@@ -192,7 +192,7 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.pi.read(lambda r: r.get("type") == "agent_settled")
         dream_prompt = next(text_of(m.get("content")) for m in self.upstream.requests[-2]["messages"]
                             if text_of(m.get("content")).startswith("Dream pass."))
-        self.assertIn("- lookup_fee: Return the cancellation fee", dream_prompt)
+        self.assertIn("- rpc.lookup_fee(cabin: str, price: float): Return the cancellation fee for a fare.\n", dream_prompt)
         self.assertNotIn("- somni_note", dream_prompt)
         self.assertEqual(sorted(memory.load().action_words()), ["quote_fees"])
         self.assertIn("rpc.pi.lookup_fee", (store / "somni-v1" / "actions" / "quote_fees.py").read_text())
@@ -248,7 +248,9 @@ class SomniPiEndToEnd(unittest.TestCase):
         refs = [r["id"] for r in memory.transcript if r["source"] == "tool_result"][:2]
         source = ('def quote_fees(price: float):\n    """Quote economy and business cancellation fees for one fare."""\n'
                   '    return [rpc.lookup_fee(cabin=c, price=price)["fee"] for c in ["economy", "business"]]')
-        plans["Dream pass."] = [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
+        plans["Dream pass."] = [[("somni_action_try", {"source": source, "tests": [{"params": {"price": 300}, "refs": refs}]})],
+                                [("somni_action_try", {"inspect": "rpc"})],
+                                [("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
             {"op": "define_action", "source": source, "tests": [{"params": {"price": 300}, "refs": refs}]},
             {"op": "define_action", "tests": [],
              "source": 'def lookup_fee(cabin: str):\n    """Shadow a task tool."""\n    return rpc.screenshot()'}]})})]]
@@ -257,9 +259,12 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.pi.read(lambda r: r.get("type") == "agent_settled")
         dream_prompt = next(text_of(m.get("content")) for m in self.upstream.requests[-2]["messages"]
                             if text_of(m.get("content")).startswith("Dream pass."))
-        self.assertIn("- lookup_fee (task sessions): Return the cancellation fee", dream_prompt)
-        self.assertIn('- 2x: lookup_fee({"cabin":"economy","price":100}) -> lookup_fee({"cabin":"business","price":100}); '
+        self.assertIn("- rpc.lookup_fee(cabin: str, price: float): Return the cancellation fee for a fare. (task sessions)", dream_prompt)
+        self.assertIn('- 2x: rpc.lookup_fee({"cabin":"economy","price":100}) -> rpc.lookup_fee({"cabin":"business","price":100}); '
                       "arguments that vary: 1.price, 2.price. Refs of occurrences: ", dream_prompt)
+        tries = [e for e in self.pi.tool_ends() if e["toolName"] == "somni_action_try"]
+        self.assertEqual(tries[0]["result"]["details"]["results"][0]["returned"], [50, 24])
+        self.assertIn("rpc.lookup_fee(cabin: str, price: float)", text_of(tries[1]["result"]["content"]))
         memory.load()
         self.assertEqual(sorted(memory.action_words()), ["quote_fees"])
         self.assertIn("lookup_fee is already a session tool", json.dumps(memory.dreams[-1]["rejected"]))
@@ -275,6 +280,17 @@ class SomniPiEndToEnd(unittest.TestCase):
         index = "\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"])
         self.assertIn(f"- word `quote_fees(price: float)`: Quote economy and business cancellation fees for one fare. "
                       f"(a tool; calls lookup_fee; replays {refs[0]}..{refs[1]})", index)
+
+    def test_tools_that_register_late_are_still_declared_for_dreams(self):
+        self.pi.close()
+        self.upstream.script = plan_script({"Use the late tool": [[("late_tool", {"n": 3})]]})
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port,
+                            env={"SOMNI_ACTIONS": "1", "FIXTURE_LATE_TOOL": "1"})
+        self.pi.prompt("Use the late tool")
+        end = next(e for e in self.pi.tool_ends() if e["toolName"] == "late_tool")
+        self.assertFalse(end["isError"], text_of(end["result"]["content"]))
+        catalog = json.loads((self.work / ".pi" / "somni" / "somni-v1" / "action-tools.json").read_text())
+        self.assertEqual(catalog["late_tool"]["parameters"]["required"], ["n"])
 
     def test_word_passes_on_images_from_its_final_call_only(self):
         self.pi.close()

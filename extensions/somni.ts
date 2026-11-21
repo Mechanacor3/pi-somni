@@ -54,7 +54,7 @@ const MAX_ACTION_DEPTH = 4;
 const MAX_WORD_IMAGES = 2; // images a word passes on from its final call
 const configuredActionCalls = Number(process.env.SOMNI_ACTION_MAX_CALLS ?? 16);
 const ACTION_MAX_CALLS = Number.isInteger(configuredActionCalls) ? Math.min(64, Math.max(1, configuredActionCalls)) : 16;
-const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream"]);
+const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try"]);
 const MAX_INDEX_QUERY_BYTES = 65_536;
 const MAX_RECORD_BYTES = 8000;
 const configuredToolBytes = Number(process.env.SOMNI_TOOL_RESULT_BYTES ?? 4096);
@@ -363,6 +363,7 @@ export default function (pi: ExtensionAPI) {
 	 * without them (no MCP server, or before MCP tools register), but words are for task sessions.
 	 */
 	let sentCatalog = "";
+	let sentNames = new Set<string>();
 	async function recordToolCatalog(ctx: ExtensionContext) {
 		if (!ACTIONS || !canRecord()) return;
 		const tools = actionTargets().filter((tool) => !state.words.has(tool.name)).slice(0, 128).map((tool) => {
@@ -375,6 +376,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			await getBackend().request("action_tools", { tools });
 			sentCatalog = key;
+			sentNames = new Set(tools.map((tool) => tool.name));
 		} catch (error) {
 			notify(ctx, `Somni could not record this session's tools for action words. ${(error as Error).message}`);
 		}
@@ -382,10 +384,16 @@ export default function (pi: ExtensionAPI) {
 
 	type CatalogEntry = { description: string; parameters: unknown; declared: boolean };
 	type Candidate = { tools: string[]; count: number; same_args: number; args: unknown[]; varying: string[]; refs: string[][] };
+	/** How a word calls a tool (matches actions.call_path). */
+	function callPath(tool: string) {
+		const parts = tool.split("__");
+		return tool.startsWith("mcp__") && parts.length === 3 ? `rpc.mcp.${parts[1]}.${parts[2]}` : `rpc.${tool}`;
+	}
+
 	function candidateGuide(candidates: Candidate[]) {
 		if (!candidates.length) return "";
 		const lines = candidates.map((c) => {
-			const calls = c.tools.map((tool, i) => `${tool}(${clip(JSON.stringify(c.args[i] ?? {}), 100)})`).join(" -> ");
+			const calls = c.tools.map((tool, i) => `${callPath(tool)}(${clip(JSON.stringify(c.args[i] ?? {}), 100)})`).join(" -> ");
 			const repeat = c.same_args >= 2 ? `${c.count}x, ${c.same_args}x with these exact arguments` : `${c.count}x`;
 			const varying = c.varying.length ? `; arguments that vary: ${c.varying.join(", ")}` : "";
 			return `- ${repeat}: ${calls}${varying}. Refs of occurrences: ${c.refs.map((r) => r.join(" ")).join(" | ")}`;
@@ -395,37 +403,78 @@ export default function (pi: ExtensionAPI) {
 			"that occurs 3 or more times, either define a word for it in this pass or say in one line why not.\n";
 	}
 
-	function actionGuide(words: ActionWord[], catalog: Record<string, CatalogEntry>, candidates: Candidate[] = []) {
-		const line = (name: string, description: string, parameters: unknown, note = "") =>
-			`- ${name}${note}: ${clip(description.replace(/\s+/g, " "), 160)} params ${clip(JSON.stringify(parameters ?? {}), 300)}`;
-		const live = actionTargets().filter((tool) => !state.words.has(tool.name));
-		const liveNames = new Set(live.map((tool) => tool.name));
-		const tools = [
-			...live.map((tool) => line(tool.name, tool.description ?? "", tool.parameters)),
-			...Object.entries(catalog).filter(([name]) => !liveNames.has(name) && !state.words.has(name)
-				&& (!ACTION_ALLOW || ACTION_ALLOW.includes(name))).map(([name, entry]) => entry.declared
-				? line(name, entry.description, entry.parameters, " (task sessions)")
-				: `- ${name} (seen in the transcript; see its recorded calls for arguments)`),
-		];
-		const lexicon = words.map((word) => `### ${word.name}\n${word.source}`).join("\n\n") || "(none yet)";
-		return "\n\nAction words. When the transcript shows the same sequence of tool calls recurring, you may capture it as an " +
-			"action word: one Python function the agent can then call as a single tool. Submit " +
-			'{"op":"define_action","source":"<python>","tests":[{"params":{...},"refs":["tXXXXXX",...],"result":<optional>}]}. ' +
-			"The source is one `def name(param: str|int|float|bool|list|dict, ...)` whose body starts with a one-line " +
-			"docstring. Call tools as rpc.TOOL(key=value) or rpc.TOOL({...}) (rpc.pi.TOOL and rpc.mcp.SERVER.TOOL also work); " +
-			"a call returns the tool's parsed JSON result. Allowed: assignments, if, for over lists or range, comprehensions, " +
-			"arithmetic, dict/list indexing, .get/.items/.keys/.values/.lower/.split and similar, and abs min max round int " +
-			"float str len bool sorted sum any all range divmod. No imports, while, try, lambda, classes or I/O. " +
-			"Each test replays recorded calls: given params, the word must make exactly the calls in refs (same tools, same " +
-			"arguments, in order; each ref a successful tool_result) and then return. Together the tests must exercise every " +
-			"tool the word calls; add a test with fewer refs for each branch that stops early. Generalize with parameters, not " +
-			"constants copied from one episode. Return an observation that shows whether the word worked, such as state read " +
-			"back by a tool after the change, not a count of the word's own steps: an agent will take the return value as " +
-			"the outcome. Images from the word's final call (e.g. a screenshot) reach the agent; earlier images do not, so end with the looking call. Check cheap preconditions (a status or lookup tool) before acting, and branch on them. Use " +
-			"revise_action {source, tests?} to repair a word and retire_action {name, reason} to remove one; do so when " +
-			"the transcript shows a word ran but its effect did not happen. Words run in task sessions, so they may call " +
-			"tools marked as task-session tools even though this dream cannot; the gate checks them against the recorded " +
-			`calls.\n\nCallable tools:\n${tools.join("\n") || "(none)"}\n\nCurrent action words:\n${lexicon}\n${candidateGuide(candidates)}`;
+	type Workbench = Record<string, { tests: { params: unknown; refs: string[]; result?: unknown }[]; selftests: string[];
+		uses_words: string[]; used_by: string[]; runs: { ref: string; ok: boolean; args: unknown; result: string }[] }>;
+
+	/** Live tool declarations for the backend, which merges them with the task-session catalog and adds signatures. */
+	function liveTools() {
+		return actionTargets().filter((tool) => !state.words.has(tool.name)).slice(0, 128).map((tool) => ({
+			name: tool.name, description: clip((tool.description ?? "").replace(/\s+/g, " "), 300),
+			parameters: Buffer.byteLength(JSON.stringify(tool.parameters ?? {})) <= 4096 ? tool.parameters ?? {} : {},
+		}));
+	}
+
+	function actionGuide(words: ActionWord[], catalog: Record<string, CatalogEntry & { live?: boolean; signature: string }>,
+			candidates: Candidate[] = [], bench: Workbench = {}) {
+		const tools = Object.entries(catalog).filter(([name]) => !state.words.has(name)
+			&& (!ACTION_ALLOW || ACTION_ALLOW.includes(name)))
+			.map(([, entry]) => `- ${clip(entry.signature, 400)}${entry.live ? "" : " (task sessions)"}`);
+		const lexicon = words.map((word) => {
+			const info = bench[word.name];
+			const lines = [`### ${word.name}`];
+			if (info?.uses_words.length || info?.used_by.length) {
+				lines.push(`Uses words: ${info.uses_words.join(", ") || "none"}. Used by: ${info.used_by.join(", ") || "none"}.`);
+			}
+			lines.push("```python", word.source, "```");
+			for (const test of info?.tests ?? []) {
+				lines.push(`Test: ${clip(JSON.stringify(test.params), 200)} replays ${test.refs.join(" ") || "no calls"}` +
+					(test.result !== undefined ? ` -> ${clip(JSON.stringify(test.result), 200)}` : ""));
+			}
+			if (info?.selftests.length) lines.push(`Self-tests in the source: ${info.selftests.join(", ")}.`);
+			for (const run of info?.runs ?? []) {
+				lines.push(`Run ${run.ref} ${run.ok ? "ok" : "FAILED"}: ${clip(JSON.stringify(run.args), 160)} -> ${clip(run.result, 240)}`);
+			}
+			if (info && !info.runs.length) lines.push("No recorded runs yet.");
+			return lines.join("\n");
+		}).join("\n\n") || "(none yet)";
+		return `
+
+## Action words
+
+An action word is one Python function, built from a sequence of tool calls that recurs in the transcript, that the agent can then call as a single tool. Write one as a developer would: read the words and their recent runs below, try your source with somni_action_try, then submit it.
+
+Submit {"op":"define_action","source":"<python>","tests":[...]}. Repair with {"op":"revise_action","source":...,"tests"?:[...]}; remove with {"op":"retire_action","name":...,"reason":...}. Revise or retire a word when its runs show it did not have its effect. A word that other words use cannot be retired; revise or retire them first, in the same pass.
+
+Writing a word:
+- One \`def name(param: str|int|float|bool|list|dict, ...)\` whose body starts with a one-line docstring (the tool description). Allowed: assignments, if, for over lists or range, comprehensions, arithmetic, indexing, .get/.items/.keys/.values/.lower/.split and similar, and abs min max round int float str len bool sorted sum any all range divmod. No while, try, lambda, classes or I/O.
+- Call tools by the signatures listed below: rpc.mcp.SERVER.TOOL(key=value) for MCP tools, rpc.TOOL(key=value) for others (another word is called the same way). A call returns the tool's parsed JSON result. dir(rpc.mcp.SERVER) and help(rpc.mcp.SERVER.TOOL) list tools and their signatures.
+- Generalize with parameters, not constants copied from one episode. Check cheap preconditions (a status or lookup tool) first and branch on them. Return state read back after acting, not a count of your own steps: the agent takes the return value as the outcome. Only the final call's images (e.g. a screenshot) reach the agent, so end with the looking call.
+
+Testing (the gate runs both kinds, and together they must exercise every tool the word calls):
+- tests: [{"params":{...},"refs":["t000012","t000013"],"result":<optional>}]. Given params, the word must make exactly the recorded calls in refs (same tools and arguments, in order; successful, untruncated tool_results), then return.
+- Self-tests in the source, after the word, for assertions on results:
+\`\`\`python
+from rpc import replay
+
+def name(...):
+    ...
+
+def test_places_one_block():
+    with replay("t000012", "t000013"):
+        result = name(count=1)
+        assert result["placed"] == 1
+\`\`\`
+  Inside replay(...), the word's calls must match those records, in order, and get their recorded results.
+- somni_action_try {"source":..., "tests"?:[...]} dry-runs the gate and returns what each test's call returned, or the first error; {"inspect":"rpc.mcp.SERVER"} lists tools with signatures. Nothing is saved.
+
+Words run in task sessions, so they may call tools marked "(task sessions)" even though this dream cannot.
+
+### Callable tools
+${tools.join("\n") || "(none)"}
+
+### Current action words
+${lexicon}
+${candidateGuide(candidates)}`;
 	}
 
 	pi.registerTool({
@@ -519,6 +568,29 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	if (ACTIONS) pi.registerTool({
+		name: "somni_action_try",
+		label: "Somni action try",
+		description: "Only during /somni-dream: dry-run an action word against the gate without saving it. Pass source " +
+			"(and optional tests) to see each test's returned value or the first error, or inspect (e.g. \"rpc.mcp.body\" " +
+			"or \"rpc.mcp.body.key\") to list tools and their signatures.",
+		parameters: Type.Object({
+			source: Type.Optional(Type.String()),
+			tests: Type.Optional(Type.Array(Type.Any())),
+			inspect: Type.Optional(Type.String()),
+		}),
+		async execute(_id: string, params: { source?: string; tests?: unknown[]; inspect?: string }) {
+			if (!state.dream) throw new Error("somni_action_try is only available during /somni-dream");
+			if (!params.source && !params.inspect) throw new Error("pass source (a word) or inspect (an rpc path)");
+			const out = await getBackend().request<any>("action_try", {
+				...params,
+				tools: pi.getAllTools().map((tool) => tool.name).filter((name) => !state.words.has(name)),
+				action_allow: ACTION_ALLOW ?? null,
+			});
+			return { content: asText(out.inspect ?? out), details: out };
+		},
+	});
+
 	pi.registerCommand("somni-dream", {
 		description: "Consolidate recent transcript into cited memory claims (offline dreaming)",
 		handler: (args, ctx) => submitCommand(ctx, async () => {
@@ -539,8 +611,9 @@ export default function (pi: ExtensionAPI) {
 					"Current ledger: " + clip(JSON.stringify(ledger), 4096) + ". ";
 			}
 			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list"),
-				await getBackend().request<Record<string, CatalogEntry>>("action_catalog"),
-				await getBackend().request<Candidate[]>("action_candidates")) : "";
+				await getBackend().request<any>("action_catalog", { live: liveTools() }),
+				await getBackend().request<Candidate[]>("action_candidates"),
+				await getBackend().request<Workbench>("action_workbench")) : "";
 			const focus = args?.trim() || "lessons that will help in future sessions";
 			const prompt = `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
@@ -586,6 +659,7 @@ export default function (pi: ExtensionAPI) {
 		state.writable = state.recordWarning = state.indexWarning = false;
 		state.wordCalls.clear();
 		sentCatalog = "";
+		sentNames = new Set();
 		mkdirSync(workspace, { recursive: true });
 		// Isolate imports and avoid bytecode writes beside the extension.
 		const args = ["-I", "-B", STORE_PY, "--workspace", workspace, "--subject-id", SUBJECT, "serve",
@@ -673,6 +747,8 @@ export default function (pi: ExtensionAPI) {
 		// Calls an action word makes are recorded too: they are the evidence for revising or composing words.
 		if (event.parentToolCallId && !state.wordCalls.has(event.parentToolCallId)) return;
 		if (!canRecord() || event.toolName.startsWith("somni_")) return;
+		// In one-shot runs MCP tools register after the turn starts; record their declarations once they are in use.
+		if (ACTIONS && !sentNames.has(event.toolName) && !state.words.has(event.toolName)) await recordToolCatalog(ctx);
 		const { text, options } = toolRecord(event.toolName, event.input, event.content);
 		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false });
 	});

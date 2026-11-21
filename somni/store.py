@@ -1207,7 +1207,8 @@ class SomniMemory:
                 tests = operation.get("tests", words[replacing]["tests"])
             word, dropped = A.build(source, tests, self._records_by_id, words, allow=actions.get("allow"),
                                     reserved=set(actions.get("reserved", ())), replacing=replacing,
-                                    lenient=actions.get("author") == "human")
+                                    lenient=actions.get("author") == "human",
+                                    catalog=A.namespace(self.action_tool_catalog(), words))
         except (ValueError, TypeError, KeyError, RecursionError) as exc:
             raise MemoryError(str(exc)[:600]) from exc
         words[word["name"]] = word
@@ -1496,11 +1497,36 @@ class SomniMemory:
                 catalog[match[1]] = {"description": "", "parameters": {}, "declared": False}
         return catalog
 
+    def action_workbench(self, *, runs=3, scan=4000):
+        """What a dream needs to write or repair words: each word's tests, links, and recent runs."""
+        A = _action_module()
+        words = self.action_words()
+        recent = {name: [] for name in words}
+        for record in reversed(self.transcript[-scan:]):
+            match = record.get("source") == "tool_result" and A.RECORD.match(record.get("text", ""))
+            if not match or match[1] not in recent or len(recent[match[1]]) >= runs:
+                continue
+            text = record["text"]
+            try:
+                args, end = json.JSONDecoder().raw_decode(text, match.end())
+                body = text[end + 5:] if text.startswith(") -> ", end) else text[end:]
+            except ValueError:
+                args, body = None, text[match.end():]
+            recent[match[1]].append({"ref": record["id"], "ok": record.get("tool_ok") is not False,
+                                     "args": args, "result": body[:300]})
+        out = {}
+        for name, word in words.items():
+            uses, used_by = A.dependencies(name, words)
+            out[name] = {"tests": word["tests"], "selftests": word.get("selftests", []), "uses_words": uses,
+                         "used_by": used_by, "runs": recent[name]}
+        return out
+
     def write_action_files(self, events=None):
         """Render words as editable files in somni-v1/actions/.
 
-        Only words a pass changed are rewritten (all words when the folder is new), so
-        a human edit that has not been synced yet is never overwritten by another pass.
+        Words a pass changed are rewritten (all words when the folder is new).  Other files
+        get fresh generated headers (e.g. a new "used by") only when their source still
+        matches the stored word, so a human edit that has not been synced is never overwritten.
         """
         A = _action_module()
         folder = self.store / ACTIONS_DIR
@@ -1511,13 +1537,23 @@ class SomniMemory:
                 return
             os.mkdir(folder, 0o700)
             events = [{"op": "define", "name": name} for name in words]
+        changed = set()
         for event in events or ():
             path = folder / f"{event['name']}.py"
             if event["op"] == "retire":
                 if os.path.isfile(path):
                     os.unlink(path)
             elif event["name"] in words:
-                _write_text_atomic(path, A.render(words[event["name"]]))
+                _write_text_atomic(path, A.render(words[event["name"]], words))
+                changed.add(event["name"])
+        for name, word in words.items():
+            path = folder / f"{name}.py"
+            if name in changed or path.is_symlink() or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            fresh = A.render(word, words)
+            if text != fresh and A.source_of(text) == word["source"]:
+                _write_text_atomic(path, fresh)
 
     def sync_action_files(self, *, reserved=(), allow=None):
         """Record human edits to somni-v1/actions/ as a pass authored by "human".
@@ -1591,7 +1627,9 @@ class SomniMemory:
             evidence = word.get("evidence") or []
             proof = f"; replays {evidence[0]}..{evidence[-1]}" if len(evidence) > 1 else \
                 f"; replays {evidence[0]}" if evidence else "; edited by a human, no tests"
-            line = f"- word `{word['name']}({params})`: {word['description'][:200]} (a tool; calls {', '.join(word['uses'])}{proof})\n"
+            used_by = A.dependencies(word["name"], lexicon)[1]
+            also = f"; used by {', '.join(used_by)}" if used_by else ""
+            line = f"- word `{word['name']}({params})`: {word['description'][:200]} (a tool; calls {', '.join(word['uses'])}{proof}{also})\n"
             size = len(line.encode("utf-8"))
             if size > budget:
                 break
@@ -1841,6 +1879,8 @@ def _dream_summary(dream):
     return {"id": f"d{dream['seq']:06d}", "added_count": dream.get("added_count", default),
             **({"learning_count": len(dream["learning"])} if dream.get("learning") else {}),
             **({"action_count": len(dream["actions"])} if dream.get("actions") else {}),
+            **({"broken_dependents": broken} if (broken := {k: v for e in dream.get("actions", ())
+                                                           for k, v in e.get("broken_dependents", {}).items()}) else {}),
             **({"rejected": dream["rejected"]} if dream.get("rejected") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
             "operation_count": dream["operation_count"], "transcript_head": dream["transcript_head"]}
@@ -1939,7 +1979,25 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             raise MemoryError("Somni memory changes require the session that owns recording")
         return memory.load().record_action_tools(args.get("tools"))
     elif method == "action_catalog" and actions:
-        return memory.load().action_tool_catalog()
+        A = _action_module()
+        catalog = memory.load().action_tool_catalog()
+        live = args.get("live") or []
+        if not (isinstance(live, list) and len(live) <= MAX_ACTION_TOOLS and all(isinstance(t, dict) for t in live)):
+            raise MemoryError("live must be a list of tool declarations")
+        for tool in live:
+            if isinstance(tool.get("name"), str):
+                catalog[tool["name"]] = {"description": str(tool.get("description") or "")[:A.MAX_DESCRIPTION],
+                                         "parameters": tool.get("parameters") if isinstance(tool.get("parameters"), dict)
+                                         else {}, "declared": True, "live": True}
+        for tool, entry in catalog.items():
+            entry["signature"] = A.signature(tool, entry["parameters"] if entry["declared"] else None,
+                                             entry["description"] or ("" if entry["declared"] else
+                                                                      "seen in the transcript; see its recorded calls"))
+        return catalog
+    elif method == "action_workbench" and actions:
+        return memory.load().action_workbench()
+    elif method == "action_try" and actions:
+        return _action_try(memory.load(), args)
     elif method == "action_candidates" and actions:
         memory.load()
         return _action_module().candidates(memory.transcript, memory.action_words())
@@ -1948,8 +2006,10 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         if args.get("name") not in words:
             raise MemoryError(f"unknown action word {args.get('name')}")
         A = _action_module()
+        # Declared tools only: transcript-derived names change while a word runs, and dir() must replay identically.
         return A.step(A.shared_runtime(words), words[args["name"]], args["params"], args["history"],
-                      max_calls=args.get("max_calls", A.MAX_CALLS))
+                      max_calls=args.get("max_calls", A.MAX_CALLS),
+                      catalog=A.namespace(memory._read_action_tools(), words))
     elif method == "ledger" and learning:
         return memory.load().learning_ledger().description()
     elif method == "recent":
@@ -1980,6 +2040,32 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         }
     else:
         raise MemoryError(f"unknown Somni backend method: {method}")
+
+
+def _action_try(memory, args):
+    """Dry-run the action gate (or inspect rpc) for a dream; nothing is committed."""
+    A = _action_module()
+    words = memory.action_words()
+    space = A.namespace(memory.action_tool_catalog(), words)
+    if args.get("inspect"):
+        return {"inspect": A.inspect(args["inspect"], space)}
+    options = _dream_actions(args)
+    try:
+        source = A.normalize(args.get("source"))
+        name = A.parse(source)["name"]
+        replacing = name if name in words else None
+        tests = args.get("tests")
+        if tests is None:
+            tests = words[name]["tests"] if replacing else []
+        report = []
+        word, _ = A.build(source, tests, memory._records_by_id, words, allow=options["allow"],
+                          reserved=set(options["reserved"]) | set(memory.action_tool_catalog()),
+                          replacing=replacing, catalog=space, report=report)
+    except (ValueError, TypeError, KeyError, RecursionError) as exc:
+        return {"ok": False, "error": str(exc)[:800]}
+    return {"ok": True, "would": "revise" if replacing else "define", "name": word["name"],
+            "params": word["params"], "uses": word["uses"], "evidence": word["evidence"], "results": report,
+            **({"broken_dependents": word["broken_dependents"]} if word.get("broken_dependents") else {})}
 
 
 def _index_word_names(args):

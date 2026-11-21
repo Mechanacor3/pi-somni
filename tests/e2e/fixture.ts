@@ -3,6 +3,20 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
+	// FIXTURE_LATE_TOOL=1 registers late_tool only once the first turn starts, as MCP tools do in one-shot runs.
+	let late = false;
+	pi.on("before_agent_start", () => {
+		if (process.env.FIXTURE_LATE_TOOL !== "1" || late) return;
+		late = true;
+		pi.registerTool({
+			name: "late_tool", label: "Late tool", description: "A tool that registers after the session starts.",
+			parameters: Type.Object({ n: Type.Integer() }),
+			async execute(_id: string, params: { n: number }) {
+				return { content: [{ type: "text" as const, text: JSON.stringify({ n: params.n }) }], details: {} };
+			},
+		} as any);
+		pi.setActiveTools([...pi.getActiveTools(), "late_tool"]);
+	});
 	// FIXTURE_NO_FEE_TOOL=1 leaves lookup_fee out, like a dream session without the task's MCP server.
 	if (process.env.FIXTURE_NO_FEE_TOOL !== "1") pi.registerTool({
 		name: "lookup_fee",

@@ -98,7 +98,11 @@ class ActionWordTest(unittest.TestCase):
     def test_syntax_policy(self):
         body = '    """Doc."""\n    x = rpc.get_booking(booking_id=b)\n'
         bad = {
-            "exactly one top-level def": "import os\n" + CANCEL,
+            "a word file holds one def": "import os\n" + CANCEL,
+            "only import a word file may have": "from os import path\n" + CANCEL,
+            "defines exactly one word": CANCEL + "\ndef helper(x: int):\n    \"\"\"x\"\"\"\n    return rpc.get_booking(booking_id=x)\n",
+            "need `from rpc import replay`": CANCEL + '\ndef test_a():\n    with replay("t000001"):\n        cancel_if_refundable(booking_id="BK-1")\n',
+            "with dir\\(\\)/help\\(\\)": 'def w(b: str):\n' + body + '    return len(rpc.mcp)\n',
             "Import is not allowed": 'def w(b: str):\n' + body + '    import os\n',
             "docstring": "def w(b: str):\n    return rpc.get_booking(booking_id=b)\n",
             "annotate": 'def w(b):\n' + body,
@@ -271,6 +275,114 @@ class ActionWordTest(unittest.TestCase):
         # The rendered file and the index keep the declared order.
         self.assertIn("def zeta_first(zeta: str, alpha: int):", (self.m.store / "actions" / "zeta_first.py").read_text())
         self.assertIn("- word `zeta_first(zeta: str, alpha: int)`", self.m.load().inject(4096, words=["zeta_first"]))
+
+    def test_self_tests_in_the_file_replay_records_and_assert_on_results(self):
+        source = ("from rpc import replay\n\n" + CANCEL.strip() + """
+
+def test_refundable_is_cancelled():
+    with replay("t000001", "t000002"):
+        result = cancel_if_refundable(booking_id="BK-1")
+        assert result["cancelled"]
+
+def test_other_booking_is_kept():
+    with replay("t000003"):
+        assert cancel_if_refundable(booking_id="BK-2") == {"cancelled": False, "reason": "not refundable"}
+""")
+        dream = self.dream({"op": "define_action", "source": source, "tests": []})
+        word = self.m.load().action_words()["cancel_if_refundable"]
+        self.assertEqual(word["selftests"], ["test_refundable_is_cancelled", "test_other_booking_is_kept"])
+        self.assertEqual(word["evidence"], ["t000001", "t000002", "t000003"])
+        self.assertIn("self-tests test_refundable_is_cancelled, test_other_booking_is_kept ran and passed",
+                      (self.m.store / "actions" / "cancel_if_refundable.py").read_text())
+        # The word still runs normally; the tests are not part of its runtime.
+        self.assertEqual(self.run_word("cancel_if_refundable", {"booking_id": "BK-1"},
+                                       {"get_booking": {"refundable": True}, "cancel_booking": {"status": "cancelled"}})[0],
+                         {"cancelled": True})
+        failing = {
+            "assert result\\[.cancelled.\\] == False": ('assert result["cancelled"]', 'assert result["cancelled"] == False'),
+            "at t000002 the word called cancel_booking": ('"t000001", "t000002"', '"t000001", "t000002"'),
+            "more calls than replay\\(t000001\\)": ('with replay("t000001", "t000002"):', 'with replay("t000001"):'),
+            "stopped after 1 call": ('with replay("t000003"):', 'with replay("t000003", "t000004"):'),
+        }
+        self.m.set_phase("open")
+        self.tool("cancel_booking", {"booking_id": "BK-2", "reason": "other"}, {"status": "cancelled"})  # t000004
+        self.m.set_phase("closed")
+        for reason, (old, new) in failing.items():
+            bad = source.replace(old, new).replace('"customer request"', '"customer request"')
+            if "cancel_booking" in reason:
+                bad = source.replace('"reason": "customer request"', '"reason": "changed"')
+            with self.subTest(reason), self.assertRaisesRegex(SomniError, reason):
+                self.dream({"op": "revise_action", "source": bad, "tests": []})
+
+    def test_dir_and_help_list_tools_with_signatures(self):
+        schema = {"type": "object", "properties": {"code": {"type": "string"},
+                                                   "action": {"enum": ["press", "down", "up"]}, "hold_ms": {"type": "integer"}},
+                  "required": ["code"]}
+        self.assertEqual(A.signature("mcp__body__key", schema, "Press a key."),
+                         'rpc.mcp.body.key(code: str, action?: "press"|"down"|"up", hold_ms?: int): Press a key.')
+        space = A.namespace({"mcp__body__key": {"description": "Press a key.", "parameters": schema},
+                             "mcp__body__look": {"description": "Turn.", "parameters": {}},
+                             "get_booking": {"description": "Fetch.", "parameters": {}}})
+        self.assertEqual(space["names"][""], ["get_booking", "mcp", "pi"])
+        self.assertEqual(space["names"]["mcp.body"], ["key", "look"])
+        self.assertIn("- rpc.mcp.body.key(code: str", A.inspect("rpc.mcp.body", space))
+        source = ('def peek(b: str):\n    """List body tools, then fetch."""\n    names = dir(rpc.mcp.body)\n'
+                  '    rpc.get_booking(booking_id=b)\n    return {"names": names, "help": help(rpc.mcp.body.key)}')
+        word = A.parse(source)
+        self.assertEqual(word["uses"], ["get_booking"])  # dir/help are not calls
+        with A.ActionRuntime({"peek": word}) as runtime:
+            out = A.step(runtime, {**word, "name": "peek"}, {"b": "BK-1"}, [], catalog=space)
+            self.assertEqual(out["call"]["tool"], "get_booking")
+            out = A.step(runtime, {**word, "name": "peek"}, {"b": "BK-1"},
+                         [{**out["call"], "result": {}}], catalog=space)
+        self.assertEqual(out["result"]["names"], ["key", "look"])
+        self.assertTrue(out["result"]["help"].startswith("rpc.mcp.body.key(code: str"))
+
+    def test_dependencies_are_shown_and_checked(self):
+        self.define()
+        caller = ('def cancel_twice(first: str, second: str):\n    """Cancel two bookings."""\n'
+                  '    a = rpc.cancel_if_refundable(booking_id=first)\n    b = rpc.cancel_if_refundable(booking_id=second)\n'
+                  '    return [a, b]')
+        self.m.set_phase("open")
+        self.tool("cancel_if_refundable", {"booking_id": "BK-1"}, {"cancelled": True})   # t000004
+        self.tool("cancel_if_refundable", {"booking_id": "BK-2"}, {"cancelled": False})  # t000005
+        self.m.set_phase("closed")
+        self.dream({"op": "define_action", "source": caller,
+                    "tests": [{"params": {"first": "BK-1", "second": "BK-2"}, "refs": ["t000004", "t000005"]}]})
+        folder = self.m.store / "actions"
+        self.assertIn("# somni: used by cancel_twice", (folder / "cancel_if_refundable.py").read_text().replace("uses words none; ", ""))
+        self.assertIn("uses words cancel_if_refundable; used by none", (folder / "cancel_twice.py").read_text())
+        self.assertIn("used by cancel_twice", self.m.load().inject(4096, words=["cancel_if_refundable"]))
+        # A new caller with the wrong keyword arguments is rejected.
+        with self.assertRaisesRegex(SomniError, r"calls cancel_if_refundable with \['id'\]"):
+            self.dream({"op": "define_action", "tests": [{"params": {"x": "BK-1"}, "refs": ["t000004"]}],
+                        "source": 'def bad(x: str):\n    """x"""\n    return rpc.cancel_if_refundable(id=x)'})
+        # Changing the signature of a used word is allowed but reports the dependents it breaks.
+        renamed = CANCEL.replace("booking_id: str", "ref: str").replace("booking_id=booking_id", "booking_id=ref") \
+            .replace('{"booking_id": booking_id,', '{"booking_id": ref,')
+        tests = [{"params": {"ref": "BK-1"}, "refs": ["t000001", "t000002"]}, {"params": {"ref": "BK-2"}, "refs": ["t000003"]}]
+        dream = self.dream({"op": "revise_action", "source": renamed, "tests": tests})
+        from somni.store import _dream_summary
+        self.assertIn("cancel_twice", _dream_summary(dream)["broken_dependents"])
+        self.assertNotIn("broken_dependents", self.m.load().action_words()["cancel_if_refundable"])
+
+    def test_try_dry_runs_the_gate_and_workbench_shows_runs(self):
+        from somni.store import _action_try
+        out = _action_try(self.m.load(), {"source": CANCEL, "tests": TESTS})
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["results"][0]["returned"], {"cancelled": True})
+        self.assertFalse(self.m.load().action_words())  # nothing saved
+        bad = _action_try(self.m, {"source": CANCEL, "tests": [{"params": {"booking_id": "BK-1"}, "refs": ["t000003"]}]})
+        self.assertFalse(bad["ok"])
+        self.assertIn("at t000003", bad["error"])
+        self.assertIn("holds:", _action_try(self.m, {"inspect": "rpc"})["inspect"])
+        self.define()
+        self.m.set_phase("open")
+        self.m.record("tool_result", 'TOOL cancel_if_refundable({"booking_id":"BK-9"}) -> cancel_if_refundable stopped at call 1', tool_ok=False)
+        self.m.set_phase("closed")
+        runs = self.m.load().action_workbench()["cancel_if_refundable"]["runs"]
+        self.assertEqual((runs[0]["ok"], runs[0]["args"]), (False, {"booking_id": "BK-9"}))
+        self.assertIn("stopped at call 1", runs[0]["result"])
 
 
 if __name__ == "__main__":

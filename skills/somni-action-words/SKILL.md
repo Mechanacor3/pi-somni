@@ -24,7 +24,10 @@ Words live as files in `<somni workspace>/somni-v1/actions/<name>.py`:
 # somni: action word. Edit freely; the next Pi session re-checks this file and records the change.
 # somni: delete the file to retire the word. Lines starting with `# somni:` are regenerated.
 # somni: calls cancel_booking, get_booking; evidence t000001, t000002, t000003
-# somni: test cancel_if_refundable(booking_id='BK-1') replays t000001 t000002 -> {'cancelled': True}
+# somni: uses words none; used by cancel_all
+# somni: self-tests test_refundable_is_cancelled, test_other_is_kept ran and passed when this version was recorded
+
+from rpc import replay
 
 def cancel_if_refundable(booking_id: str):
     """Cancel a booking only when it is refundable, and report what happened."""
@@ -33,29 +36,44 @@ def cancel_if_refundable(booking_id: str):
         return {"cancelled": False, "reason": "not refundable"}
     result = rpc.cancel_booking({"booking_id": booking_id, "reason": "customer request"})
     return {"cancelled": result["status"] == "cancelled"}
+
+def test_refundable_is_cancelled():
+    with replay("t000001", "t000002"):
+        assert cancel_if_refundable(booking_id="BK-1")["cancelled"]
+
+def test_other_is_kept():
+    with replay("t000003"):
+        assert cancel_if_refundable(booking_id="BK-2")["reason"] == "not refundable"
 ```
 
+One file is one skill: the word, then its self-tests.
+
 - The docstring becomes the tool description. The parameter annotations, which must be `str`, `int`, `float`, `bool`, `list`, or `dict`, become its schema.
-- `rpc.TOOL(...)` and `rpc.pi.TOOL(...)` call a Pi tool, which may be another word. `rpc.mcp.SERVER.TOOL(...)` calls the MCP tool `mcp__SERVER__TOOL`. Pass keyword arguments or one dict. The call returns the tool's result as parsed JSON, or as text if it is not JSON.
+- `rpc.TOOL(...)` and `rpc.pi.TOOL(...)` call a Pi tool, which may be another word. `rpc.mcp.SERVER.TOOL(...)` calls the MCP tool `mcp__SERVER__TOOL`; prefer this form for MCP tools (`rpc.mcp__SERVER__TOOL(...)` also works). Pass keyword arguments or one dict. The call returns the tool's result as parsed JSON, or as text if it is not JSON.
+- `dir(rpc.mcp.SERVER)` lists a server's tools, `dir(rpc)` lists the namespaces and tools, and `help(rpc.mcp.SERVER.TOOL)` returns a signature such as `rpc.mcp.body.key(code: str, hold_ms?: int): ...`. They read the tools Somni recorded from task sessions.
+- **Self-tests.** After `from rpc import replay` at the top, up to eight `def test_*():` functions call the word inside `with replay("t000012", "t000013"):` and `assert` on its results. Inside the block, the word's tool calls must match those transcript records exactly and in order, and they receive the recorded results. Self-tests run whenever the word is defined or edited. They never call live tools.
+- The `# somni: uses words ...; used by ...` line shows which words call which.
 - Allowed: assignments, `if`, `for` over lists or `range`, comprehensions, arithmetic, indexing, and string and dict methods such as `.get`, `.items`, `.lower`, and `.split`. The allowed builtins are `abs min max round int float str len bool sorted sum any all range divmod`. `date`, `datetime`, `timedelta`, `floor`, and `ceil` are also available.
-- Rejected: imports, `while`, `try`, `lambda`, classes, names starting with `_`, and any I/O except `rpc`.
+- Rejected: imports other than `from rpc import replay`, `while`, `try`, `lambda`, classes, names starting with `_`, and any I/O except `rpc`.
 
 ## Editing a word (humans)
 
 Edit the file and save it. The next Pi session that records to this store checks the edit and records it in the store's hash-chained history as a pass authored by `human`.
 
-- To add a word, create a new `.py` file containing one `def`. To retire one, delete its file.
+- To add a word, create a new `.py` file containing one word `def`, plus any self-tests. To retire one, delete its file.
+- If a self-test you wrote fails, the edit is rejected, Pi warns with the failing assertion, and the previous version stays active.
 - The edit must pass the syntax rules above. If it does not, Pi warns at session start, and the previous version stays active until you fix the file.
 - A stored test that your edit breaks is dropped and listed in the pass. It does not block the edit.
 - Keep the file name and the function name the same.
 
 ## Writing a word in a dream
 
-Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the callable tools and the current words. Tools marked "(task sessions)" or "seen in the transcript" are absent from the dream itself, but words run in task sessions, so a word may call them.
+Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the callable tools as signatures, plus each current word with its source, tests, dependencies and recent runs (ok or failed, with the result or error). That is the "fails here, works there" evidence to read before writing or repairing a word. Tools marked "(task sessions)" or "seen in the transcript" are absent from the dream itself, but words run in task sessions, so a word may call them.
 
 1. Find the same sequence of tool calls in two or more places in the transcript. The dream prompt's "Recurring sequences" list does this for you: each candidate has refs you can use directly as tests.
 2. Write one function that makes that sequence. Turn the values that vary between occurrences into parameters, and branch with `if` where the occurrences differ.
-3. Add tests. Each test gives `params` and `refs`: the transcript IDs of the successful tool calls the word must reproduce, in order, with exactly the recorded arguments. After the last ref, the word must return. An optional `result` checks what it returns. Together the tests must exercise every tool the word calls. A branch that stops early needs its own test with fewer refs.
+3. Try it. `somni_action_try {"source": ..., "tests": [...]}` runs the gate without saving and returns what each test's call returned, or the first error. `somni_action_try {"inspect": "rpc.mcp.body"}` lists tools with signatures.
+4. Add tests. Each test gives `params` and `refs`: the transcript IDs of the successful tool calls the word must reproduce, in order, with exactly the recorded arguments. After the last ref, the word must return. An optional `result` checks what it returns. Together the tests must exercise every tool the word calls. A branch that stops early needs its own test with fewer refs.
 
 ```json
 {"op": "define_action",
@@ -80,6 +98,8 @@ def restock(item: str, amount: int):
 ```
 
 To repair a word, use `{"op":"revise_action","source":...,"tests":...}`. Omit `tests` to keep the stored ones. To remove a word, use `{"op":"retire_action","name":...,"reason":...}`. A rejected operation comes back with a reason. Fix it and resubmit while attempts remain.
+
+Dependencies: a word that other words use cannot be retired until they are revised or retired. Revising a word's parameters is allowed, but the pass reports the words whose calls no longer match (`broken_dependents`); revise them in the same pass. A word whose call to another word uses the wrong keyword arguments is rejected.
 
 Common rejections:
 
