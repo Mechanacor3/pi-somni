@@ -233,6 +233,10 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.upstream.script = plan_script(plans)
         for cabin in ("economy", "business"):
             self.pi.prompt(cabin)
+        for price in (100, 400):  # the same two-call sequence twice: a mined candidate
+            plans[f"Both {price}"] = [[("lookup_fee", {"cabin": "economy", "price": price})],
+                                      [("lookup_fee", {"cabin": "business", "price": price})]]
+            self.pi.prompt(f"Both {price}")
         self.pi.close()
         store = self.work / ".pi" / "somni"
         catalog = json.loads((store / "somni-v1" / "action-tools.json").read_text())
@@ -241,7 +245,7 @@ class SomniPiEndToEnd(unittest.TestCase):
 
         # The dream session lacks lookup_fee (as a dream lacks a task's MCP server) but still sees and may call it.
         memory = SomniMemory(store, "pi").load()
-        refs = [r["id"] for r in memory.transcript if r["source"] == "tool_result"]
+        refs = [r["id"] for r in memory.transcript if r["source"] == "tool_result"][:2]
         source = ('def quote_fees(price: float):\n    """Quote economy and business cancellation fees for one fare."""\n'
                   '    return [rpc.lookup_fee(cabin=c, price=price)["fee"] for c in ["economy", "business"]]')
         plans["Dream pass."] = [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
@@ -254,6 +258,8 @@ class SomniPiEndToEnd(unittest.TestCase):
         dream_prompt = next(text_of(m.get("content")) for m in self.upstream.requests[-2]["messages"]
                             if text_of(m.get("content")).startswith("Dream pass."))
         self.assertIn("- lookup_fee (task sessions): Return the cancellation fee", dream_prompt)
+        self.assertIn('- 2x: lookup_fee({"cabin":"economy","price":100}) -> lookup_fee({"cabin":"business","price":100}); '
+                      "arguments that vary: 1.price, 2.price. Refs of occurrences: ", dream_prompt)
         memory.load()
         self.assertEqual(sorted(memory.action_words()), ["quote_fees"])
         self.assertIn("lookup_fee is already a session tool", json.dumps(memory.dreams[-1]["rejected"]))

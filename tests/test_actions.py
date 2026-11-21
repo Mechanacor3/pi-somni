@@ -208,6 +208,32 @@ class ActionWordTest(unittest.TestCase):
                 self.define(tests=[TESTS[0], {"params": {"booking_id": "BK-4" if ref == "t000004" else "BK-5"},
                                               "refs": [ref]}])
 
+    def test_recurring_sequences_are_mined_with_refs_that_pass_the_gate(self):
+        self.m.set_phase("open")
+        for booking in ("BK-3", "BK-4", "BK-5"):
+            self.m.record("ordinary_observation", f"USER: cancel {booking}")
+            self.tool("get_booking", {"booking_id": booking}, {"booking_id": booking, "refundable": True})
+            self.m.record("agent_output", "It is refundable; cancelling.")
+            self.tool("cancel_booking", {"booking_id": booking, "reason": "customer request"}, {"status": "cancelled"})
+        self.m.record("ordinary_observation", "USER: cancel BK-6")
+        self.tool("get_booking", {"booking_id": "BK-6"}, {"booking_id": "BK-6", "refundable": True})
+        self.tool("cancel_booking", {"booking_id": "BK-6", "reason": "customer request"}, {"error": "down"}, ok=False)
+        self.m.record("ordinary_observation", "USER: and BK-7")
+        self.tool("get_booking", {"booking_id": "BK-7"}, {"booking_id": "BK-7", "refundable": True})
+        self.tool("somni_recall", {"query": "x"}, [])
+        self.tool("cancel_booking", {"booking_id": "BK-7", "reason": "customer request"}, {"status": "cancelled"})
+        self.m.set_phase("closed")
+        found = A.candidates(self.m.load().transcript)
+        top = found[0]
+        # t000001-2 (setup) plus three prompts; the failed and somni-interrupted runs do not count.
+        self.assertEqual((top["tools"], top["count"]), (["get_booking", "cancel_booking"], 4))
+        self.assertEqual(top["varying"], ["1.booking_id", "2.booking_id"])
+        word = 'def cancel(booking_id: str):\n    """Cancel a refundable booking."""\n    rpc.get_booking(booking_id=booking_id)\n' \
+               '    return rpc.cancel_booking(booking_id=booking_id, reason="customer request")'
+        tests = [{"params": {"booking_id": self.m._records_by_id[refs[0]]["text"].split('"')[3]}, "refs": refs}
+                 for refs in top["refs"]]
+        self.assertEqual(self.define(word, tests)["actions"][0]["name"], "cancel")
+
 
 if __name__ == "__main__":
     unittest.main()

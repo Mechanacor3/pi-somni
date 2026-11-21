@@ -371,7 +371,21 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	type CatalogEntry = { description: string; parameters: unknown; declared: boolean };
-	function actionGuide(words: ActionWord[], catalog: Record<string, CatalogEntry>) {
+	type Candidate = { tools: string[]; count: number; same_args: number; args: unknown[]; varying: string[]; refs: string[][] };
+	function candidateGuide(candidates: Candidate[]) {
+		if (!candidates.length) return "";
+		const lines = candidates.map((c) => {
+			const calls = c.tools.map((tool, i) => `${tool}(${clip(JSON.stringify(c.args[i] ?? {}), 100)})`).join(" -> ");
+			const repeat = c.same_args >= 2 ? `${c.count}x, ${c.same_args}x with these exact arguments` : `${c.count}x`;
+			const varying = c.varying.length ? `; arguments that vary: ${c.varying.join(", ")}` : "";
+			return `- ${repeat}: ${calls}${varying}. Refs of occurrences: ${c.refs.map((r) => r.join(" ")).join(" | ")}`;
+		});
+		return "\n\nRecurring sequences Somni found in the transcript (candidates for action words; each ref group is " +
+			"a ready-made test, and a varying argument is a likely parameter):\n" + lines.join("\n") + "\nFor each candidate " +
+			"that occurs 3 or more times, either define a word for it in this pass or say in one line why not.\n";
+	}
+
+	function actionGuide(words: ActionWord[], catalog: Record<string, CatalogEntry>, candidates: Candidate[] = []) {
 		const line = (name: string, description: string, parameters: unknown, note = "") =>
 			`- ${name}${note}: ${clip(description.replace(/\s+/g, " "), 160)} params ${clip(JSON.stringify(parameters ?? {}), 300)}`;
 		const live = actionTargets().filter((tool) => !state.words.has(tool.name));
@@ -401,7 +415,7 @@ export default function (pi: ExtensionAPI) {
 			"revise_action {source, tests?} to repair a word and retire_action {name, reason} to remove one; do so when " +
 			"the transcript shows a word ran but its effect did not happen. Words run in task sessions, so they may call " +
 			"tools marked as task-session tools even though this dream cannot; the gate checks them against the recorded " +
-			`calls.\n\nCallable tools:\n${tools.join("\n") || "(none)"}\n\nCurrent action words:\n${lexicon}\n`;
+			`calls.\n\nCallable tools:\n${tools.join("\n") || "(none)"}\n\nCurrent action words:\n${lexicon}\n${candidateGuide(candidates)}`;
 	}
 
 	pi.registerTool({
@@ -515,7 +529,8 @@ export default function (pi: ExtensionAPI) {
 					"Current ledger: " + clip(JSON.stringify(ledger), 4096) + ". ";
 			}
 			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list"),
-				await getBackend().request<Record<string, CatalogEntry>>("action_catalog")) : "";
+				await getBackend().request<Record<string, CatalogEntry>>("action_catalog"),
+				await getBackend().request<Candidate[]>("action_candidates")) : "";
 			const focus = args?.trim() || "lessons that will help in future sessions";
 			const prompt = `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +

@@ -1849,6 +1849,9 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         return memory.load().record_action_tools(args.get("tools"))
     elif method == "action_catalog" and actions:
         return memory.load().action_tool_catalog()
+    elif method == "action_candidates" and actions:
+        memory.load()
+        return _action_module().candidates(memory.transcript, memory.action_words())
     elif method == "action_step" and actions:
         words = memory.load().action_words()
         if args.get("name") not in words:

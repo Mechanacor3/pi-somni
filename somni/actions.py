@@ -452,6 +452,82 @@ def _describe(out):
     return f"returns {json.dumps(out['result'])[:200]}"
 
 
+MINE_SCAN = 4000      # most recent tool results scanned for recurring sequences
+MINE_LENGTHS = range(2, 7)
+MINE_LIMIT = 5
+MINE_REFS = 3
+
+
+def candidates(records, words=(), *, limit=MINE_LIMIT):
+    """Recurring runs of successful tool calls: the raw material for action words.
+
+    A run is the tool calls between two user prompts in one run label, cut at any call
+    that failed, was truncated, or was a Somni tool or an existing word.  Returns the
+    strongest shapes (tool sequences) of length 2-6 that occur at least twice without
+    overlapping, each with the refs of a few occurrences (ready-made gate tests) and the
+    argument fields that vary between occurrences (the word's parameters).
+    """
+    runs, run, label = [], [], object()
+    for record in [r for r in records if r.get("source") in {"tool_result", "ordinary_observation"}][-MINE_SCAN:]:
+        if record.get("source") != "tool_result" or record.get("run_label") != label:
+            runs.append(run)
+            run, label = [], record.get("run_label")
+            if record.get("source") != "tool_result":
+                continue
+        try:
+            tool, args, _ = parse_record(record, record.get("id"))
+        except ActionError:
+            runs.append(run)
+            run = []
+            continue
+        if tool.startswith(RESERVED_PREFIX) or tool in words:
+            runs.append(run)
+            run = []
+            continue
+        run.append((record["id"], tool, args))
+    runs.append(run)
+
+    groups = {}
+    for run in runs:
+        for n in MINE_LENGTHS:
+            free = {}
+            for i in range(len(run) - n + 1):
+                window = run[i:i + n]
+                shape = tuple(tool for _, tool, _ in window)
+                if i >= free.get(shape, 0):
+                    groups.setdefault(shape, []).append(window)
+                    free[shape] = i + n
+    found = []
+    for shape, windows in groups.items():
+        if len(windows) < 2 or len(set(shape)) == 1 and len(shape) > 2:
+            continue
+        keyed = {}
+        for window in windows:
+            keyed.setdefault(json.dumps([args for _, _, args in window], sort_keys=True), []).append(window)
+        same = max(keyed.values(), key=len)
+        varying = sorted({f"{position + 1}.{key}" for position in range(len(shape))
+                          for key in set().union(*(w[position][2] for w in windows))
+                          if len({json.dumps(w[position][2].get(key), sort_keys=True) for w in windows}) > 1})
+        shown = same if len(same) >= 2 else windows
+        found.append({"tools": list(shape), "count": len(windows), "same_args": len(same),
+                      "args": [args for _, _, args in shown[0]], "varying": varying[:12],
+                      "refs": [[ref for ref, _, _ in w] for w in shown[:MINE_REFS]]})
+    # Longer and more exactly repeated sequences save more turns and make easier first words.
+    found.sort(key=lambda c: ((c["count"] + c["same_args"]) * (len(c["tools"]) - 1), len(c["tools"])), reverse=True)
+    kept = []
+    for cand in found:
+        tools = cand["tools"]
+        # Skip a shape already covered by a kept, longer shape that occurs about as often.
+        if any(len(k["tools"]) > len(tools) and 4 * k["count"] >= 3 * cand["count"]
+               and any(k["tools"][i:i + len(tools)] == tools for i in range(len(k["tools"]) - len(tools) + 1))
+               for k in kept):
+            continue
+        kept.append(cand)
+        if len(kept) == limit:
+            break
+    return kept
+
+
 def check_retire(operation, words):
     require(isinstance(operation, dict) and set(operation) == {"op", "name", "reason"},
             "retire_action needs exactly name and reason")

@@ -53,7 +53,7 @@ Edit the file and save it. The next Pi session that records to this store checks
 
 Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the callable tools and the current words. Tools marked "(task sessions)" or "seen in the transcript" are absent from the dream itself, but words run in task sessions, so a word may call them.
 
-1. Find the same sequence of tool calls in two or more places in the transcript.
+1. Find the same sequence of tool calls in two or more places in the transcript. The dream prompt's "Recurring sequences" list does this for you: each candidate has refs you can use directly as tests.
 2. Write one function that makes that sequence. Turn the values that vary between occurrences into parameters, and branch with `if` where the occurrences differ.
 3. Add tests. Each test gives `params` and `refs`: the transcript IDs of the successful tool calls the word must reproduce, in order, with exactly the recorded arguments. After the last ref, the word must return. An optional `result` checks what it returns. Together the tests must exercise every tool the word calls. A branch that stops early needs its own test with fewer refs.
 
