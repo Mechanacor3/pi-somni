@@ -279,7 +279,7 @@ class SomniPiEndToEnd(unittest.TestCase):
         # The actor's injected index names the word, not only its tool declaration.
         index = "\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"])
         self.assertIn(f"- word `quote_fees(price: float)`: Quote economy and business cancellation fees for one fare. "
-                      f"(a tool; calls lookup_fee; replays {refs[0]}..{refs[1]})", index)
+                      f"(not run yet; a tool; calls lookup_fee; replays {refs[0]}..{refs[1]})", index)
 
     def test_tools_that_register_late_are_still_declared_for_dreams(self):
         self.pi.close()

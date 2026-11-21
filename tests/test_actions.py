@@ -248,8 +248,8 @@ class ActionWordTest(unittest.TestCase):
         index = memory.inject(4096, query="please cancel my booking", words=both)
         lines = [line for line in index.splitlines() if line.startswith("- word ")]
         self.assertEqual(lines[0], "- word `cancel_if_refundable(booking_id: str)`: Cancel a booking only when it is "
-                                   "refundable, and report what happened. (a tool; calls cancel_booking, get_booking; "
-                                   "replays t000001..t000003)")
+                                   "refundable, and report what happened. (not run yet; a tool; calls cancel_booking, "
+                                   "get_booking; replays t000001..t000003)")
         self.assertTrue(lines[1].startswith("- word `check_booking(booking_id: str)`"))
         self.assertIn("Learned action words: call one as a tool", index)
         # Only words this session registered are listed; none at all without the list.
@@ -257,6 +257,13 @@ class ActionWordTest(unittest.TestCase):
                               if l.startswith("- word ")]), 1)
         self.assertNotIn("- word ", memory.inject(4096))
         self.assertNotIn("- word ", memory.inject(512, words=both))  # a quarter of a small index cannot fit one
+        # Each line carries the word's recent run record, so the agent sees which words have worked.
+        self.m.set_phase("open")
+        self.tool("cancel_if_refundable", {"booking_id": "BK-1"}, {"cancelled": True})
+        self.tool("cancel_if_refundable", {"booking_id": "BK-9"}, "stopped at call 1", ok=False)
+        self.m.set_phase("closed")
+        self.assertIn("(last 2 runs: 1 ok, 1 failed (latest failed); a tool;",
+                      self.m.load().inject(4096, words=["cancel_if_refundable"]))
 
     def test_parameters_bind_by_name_after_the_word_is_stored(self):
         source = ('def zeta_first(zeta: str, alpha: int):\n    """Look up a booking and echo a number."""\n'

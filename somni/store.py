@@ -1497,14 +1497,13 @@ class SomniMemory:
                 catalog[match[1]] = {"description": "", "parameters": {}, "declared": False}
         return catalog
 
-    def action_workbench(self, *, runs=3, scan=4000):
-        """What a dream needs to write or repair words: each word's tests, links, and recent runs."""
+    def word_runs(self, names, *, per_word=3, scan=4000):
+        """The most recent runs of each named word in the transcript, newest first."""
         A = _action_module()
-        words = self.action_words()
-        recent = {name: [] for name in words}
+        recent = {name: [] for name in names}
         for record in reversed(self.transcript[-scan:]):
             match = record.get("source") == "tool_result" and A.RECORD.match(record.get("text", ""))
-            if not match or match[1] not in recent or len(recent[match[1]]) >= runs:
+            if not match or match[1] not in recent or len(recent[match[1]]) >= per_word:
                 continue
             text = record["text"]
             try:
@@ -1514,6 +1513,13 @@ class SomniMemory:
                 args, body = None, text[match.end():]
             recent[match[1]].append({"ref": record["id"], "ok": record.get("tool_ok") is not False,
                                      "args": args, "result": body[:300]})
+        return recent
+
+    def action_workbench(self, *, runs=3, scan=4000):
+        """What a dream needs to write or repair words: each word's tests, links, and recent runs."""
+        A = _action_module()
+        words = self.action_words()
+        recent = self.word_runs(words, per_word=runs, scan=scan)
         out = {}
         for name, word in words.items():
             uses, used_by = A.dependencies(name, words)
@@ -1621,6 +1627,7 @@ class SomniMemory:
                       _bm25([_terms(f"{w['name']} {w['name']} {w['description']}") for w in words], words, query)}
             words.sort(key=lambda w: scores.get(id(w), 0), reverse=True)
         lines = []
+        runs = self.word_runs([w["name"] for w in words[:5]], per_word=10)
         for word in words[:5]:
             declared = A.parse(word["source"])["params"]  # stored params are key-sorted; show the declared order
             params = ", ".join(f"{key}: {python.get(kind, kind)}" for key, kind in declared.items())
@@ -1629,7 +1636,13 @@ class SomniMemory:
                 f"; replays {evidence[0]}" if evidence else "; edited by a human, no tests"
             used_by = A.dependencies(word["name"], lexicon)[1]
             also = f"; used by {', '.join(used_by)}" if used_by else ""
-            line = f"- word `{word['name']}({params})`: {word['description'][:200]} (a tool; calls {', '.join(word['uses'])}{proof}{also})\n"
+            # The run record keeps a word that works in use after an unrelated failure.
+            done = runs[word["name"]]
+            failed = sum(not run["ok"] for run in done)
+            record = (f"last {len(done)} run{'s' if len(done) != 1 else ''}: {len(done) - failed} ok, {failed} failed"
+                      + ("" if not failed else f" (latest {'ok' if done[0]['ok'] else 'failed'})")) if done else "not run yet"
+            line = (f"- word `{word['name']}({params})`: {word['description'][:200]} "
+                    f"({record}; a tool; calls {', '.join(word['uses'])}{proof}{also})\n")
             size = len(line.encode("utf-8"))
             if size > budget:
                 break
