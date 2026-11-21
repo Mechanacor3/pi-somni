@@ -3,7 +3,8 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	pi.registerTool({
+	// FIXTURE_NO_FEE_TOOL=1 leaves lookup_fee out, like a dream session without the task's MCP server.
+	if (process.env.FIXTURE_NO_FEE_TOOL !== "1") pi.registerTool({
 		name: "lookup_fee",
 		label: "Lookup fee",
 		description: "Return the cancellation fee for a fare.",

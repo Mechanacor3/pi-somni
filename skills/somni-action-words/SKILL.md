@@ -51,7 +51,7 @@ Edit the file and save it. The next Pi session that records to this store checks
 
 ## Writing a word in a dream
 
-Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the callable tools and the current words.
+Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the callable tools and the current words. Tools marked "(task sessions)" or "seen in the transcript" are absent from the dream itself, but words run in task sessions, so a word may call them.
 
 1. Find the same sequence of tool calls in two or more places in the transcript.
 2. Write one function that makes that sequence. Turn the values that vary between occurrences into parameters, and branch with `if` where the occurrences differ.

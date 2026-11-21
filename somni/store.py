@@ -86,6 +86,9 @@ VAULT_DIR = "vault"
 ACTIONS_DIR = "actions"
 ACTION_OPS = frozenset({"define_action", "revise_action", "retire_action"})
 MAX_ACTION_FILE_BYTES = 16384
+ACTION_TOOLS_FILE = "action-tools.json"  # tool declarations seen in recording sessions; a cache, not evidence
+MAX_ACTION_TOOLS = 256
+MAX_ACTION_TOOL_SCHEMA_BYTES = 4096
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output"}
 STATUSES = {"verified", "uncertain"}
@@ -1393,6 +1396,55 @@ class SomniMemory:
         """The current lexicon: define/revise/retire events from every committed pass, in order."""
         return _action_module().fold(event for dream in self.dreams for event in dream.get("actions", ()))
 
+    def record_action_tools(self, tools):
+        """Remember the tools a recording session can call, so later dreams (which may run
+        without those tools, e.g. without an MCP server) can write words for them."""
+        A = _action_module()
+        A.require(isinstance(tools, list) and len(tools) <= MAX_ACTION_TOOLS, f"at most {MAX_ACTION_TOOLS} tools")
+        catalog = self._read_action_tools()
+        seen = {}
+        for tool in tools:
+            A.require(isinstance(tool, dict) and isinstance(tool.get("name"), str)
+                      and re.fullmatch(r"[A-Za-z_][\w.-]{0,127}", tool["name"]), "each tool needs a valid name")
+            if tool["name"].startswith(A.RESERVED_PREFIX):
+                continue
+            schema = tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {}
+            if A.size(schema) > MAX_ACTION_TOOL_SCHEMA_BYTES:
+                schema = {"omitted": f"schema over {MAX_ACTION_TOOL_SCHEMA_BYTES} bytes"}
+            description = tool.get("description") if isinstance(tool.get("description"), str) else ""
+            seen[tool["name"]] = {"description": " ".join(description.split())[:A.MAX_DESCRIPTION],
+                                  "parameters": schema}
+        if all(catalog.get(name) == entry for name, entry in seen.items()):
+            return len(catalog)
+        # The latest declaration wins; the least recently declared tools fall off first.
+        merged = {name: entry for name, entry in catalog.items() if name not in seen} | seen
+        merged = dict(list(merged.items())[-MAX_ACTION_TOOLS:])
+        _write_text_atomic(self.store / ACTION_TOOLS_FILE, json.dumps(merged, ensure_ascii=False, indent=1) + "\n")
+        return len(merged)
+
+    def _read_action_tools(self):
+        path = self.store / ACTION_TOOLS_FILE
+        try:
+            _no_symlink(path)
+            data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def action_tool_catalog(self):
+        """Tools that task sessions could call: recorded declarations, plus any other tool
+        named in the transcript's tool results (without a schema).  Words are excluded."""
+        A = _action_module()
+        words = self.action_words()
+        catalog = {name: {**entry, "declared": True} for name, entry in self._read_action_tools().items()
+                   if isinstance(entry, dict) and name not in words}
+        for record in self.transcript:
+            match = record.get("source") == "tool_result" and A.RECORD.match(record.get("text", ""))
+            if match and match[1] not in catalog and match[1] not in words \
+                    and not match[1].startswith(A.RESERVED_PREFIX):
+                catalog[match[1]] = {"description": "", "parameters": {}, "declared": False}
+        return catalog
+
     def write_action_files(self, events=None):
         """Render words as editable files in somni-v1/actions/.
 
@@ -1769,8 +1821,12 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         proposal = args["proposal_json"]
         if not isinstance(proposal, str) or len(proposal.encode()) > MAX_INPUT_BYTES:
             raise MemoryError("dream proposal exceeds byte limit")
+        options = None
+        if actions:
+            options = _dream_actions(args)
+            options["reserved"] = sorted(set(options["reserved"]) | set(memory.load().action_tool_catalog()))
         dream = memory.dream(json.loads(proposal), partial=True, allow_empty=True, viewed_images=viewed,
-                             learning=learning, actions=_dream_actions(args) if actions else None)
+                             learning=learning, actions=options)
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
         return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning)
@@ -1787,6 +1843,12 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
     elif method == "action_list" and actions:
         return [{key: word[key] for key in ("name", "description", "params", "uses", "source")}
                 for word in memory.load().action_words().values()]
+    elif method == "action_tools" and actions:
+        if not writable:
+            raise MemoryError("Somni memory changes require the session that owns recording")
+        return memory.load().record_action_tools(args.get("tools"))
+    elif method == "action_catalog" and actions:
+        return memory.load().action_tool_catalog()
     elif method == "action_step" and actions:
         words = memory.load().action_words()
         if args.get("name") not in words:

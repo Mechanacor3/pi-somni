@@ -225,6 +225,47 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual((last["author"], last["actions"][0]["op"]), ("human", "revise"))
         self.assertEqual(len(last["actions"][0]["dropped_tests"]), 1)
 
+    def test_dream_without_the_task_tools_can_still_define_a_word_for_them(self):
+        self.pi.close()
+        env = {"SOMNI_ACTIONS": "1"}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        plans = {cabin: [[("lookup_fee", {"cabin": cabin, "price": 300})]] for cabin in ("economy", "business")}
+        self.upstream.script = plan_script(plans)
+        for cabin in ("economy", "business"):
+            self.pi.prompt(cabin)
+        self.pi.close()
+        store = self.work / ".pi" / "somni"
+        catalog = json.loads((store / "somni-v1" / "action-tools.json").read_text())
+        self.assertEqual(catalog["lookup_fee"]["description"], "Return the cancellation fee for a fare.")
+        self.assertNotIn("somni_recall", catalog)
+
+        # The dream session lacks lookup_fee (as a dream lacks a task's MCP server) but still sees and may call it.
+        memory = SomniMemory(store, "pi").load()
+        refs = [r["id"] for r in memory.transcript if r["source"] == "tool_result"]
+        source = ('def quote_fees(price: float):\n    """Quote economy and business cancellation fees for one fare."""\n'
+                  '    return [rpc.lookup_fee(cabin=c, price=price)["fee"] for c in ["economy", "business"]]')
+        plans["Dream pass."] = [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
+            {"op": "define_action", "source": source, "tests": [{"params": {"price": 300}, "refs": refs}]},
+            {"op": "define_action", "tests": [],
+             "source": 'def lookup_fee(cabin: str):\n    """Shadow a task tool."""\n    return rpc.screenshot()'}]})})]]
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={**env, "FIXTURE_NO_FEE_TOOL": "1"})
+        self.pi.prompt("/somni-dream recurring tool sequences")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        dream_prompt = next(text_of(m.get("content")) for m in self.upstream.requests[-2]["messages"]
+                            if text_of(m.get("content")).startswith("Dream pass."))
+        self.assertIn("- lookup_fee (task sessions): Return the cancellation fee", dream_prompt)
+        memory.load()
+        self.assertEqual(sorted(memory.action_words()), ["quote_fees"])
+        self.assertIn("lookup_fee is already a session tool", json.dumps(memory.dreams[-1]["rejected"]))
+        self.pi.close()
+
+        # Back in a task session with the tool, the word registers and runs.
+        plans["Quote both"] = [[("quote_fees", {"price": 200})]]
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        self.pi.prompt("Quote both fees for 200")
+        word = next(e for e in self.pi.tool_ends() if e["toolName"] == "quote_fees")
+        self.assertEqual(json.loads(text_of(word["result"]["content"])), [50, 16])
+
     def test_dream_record_settings_bound_the_prompt(self):
         self.pi.close()
         store = self.work / "dream-memory"

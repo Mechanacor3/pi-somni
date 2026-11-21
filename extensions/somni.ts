@@ -332,7 +332,8 @@ export default function (pi: ExtensionAPI) {
 				changed = true;
 				if (state.words.get(name) === word.source) continue;
 				const description = `${word.description} (Learned action word: calls ${word.uses.join(", ")}. ` +
-					"Returns JSON. Its source is in Somni's actions folder.)";
+					"Returns JSON. If a call fails it stops, and earlier calls stay done. Its return value is what the " +
+					"word reports, so check the effect before relying on it. Its source is in Somni's actions folder.)";
 				pi.registerTool({
 					name, label: name, description,
 					parameters: Type.Object(Object.fromEntries(Object.entries(word.params).map(([key, kind]) => [key, PARAM_TYPES[kind]()]))),
@@ -347,9 +348,41 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function actionGuide(words: ActionWord[]) {
-		const tools = actionTargets().filter((tool) => !state.words.has(tool.name)).map((tool) =>
-			`- ${tool.name}: ${clip((tool.description ?? "").replace(/\s+/g, " "), 160)} params ${clip(JSON.stringify(tool.parameters ?? {}), 300)}`);
+	/**
+	 * Store the declarations of the tools this recording session can call. Dreams often run
+	 * without them (no MCP server, or before MCP tools register), but words are for task sessions.
+	 */
+	let sentCatalog = "";
+	async function recordToolCatalog(ctx: ExtensionContext) {
+		if (!ACTIONS || !canRecord()) return;
+		const tools = actionTargets().filter((tool) => !state.words.has(tool.name)).slice(0, 128).map((tool) => {
+			const parameters = (tool.parameters ?? {}) as Record<string, unknown>;
+			return { name: tool.name, description: clip((tool.description ?? "").replace(/\s+/g, " "), 300),
+				parameters: Buffer.byteLength(JSON.stringify(parameters)) <= 2048 ? parameters : { omitted: "schema over 2048 bytes" } };
+		});
+		const key = JSON.stringify(tools);
+		if (key === sentCatalog) return;
+		try {
+			await getBackend().request("action_tools", { tools });
+			sentCatalog = key;
+		} catch (error) {
+			notify(ctx, `Somni could not record this session's tools for action words. ${(error as Error).message}`);
+		}
+	}
+
+	type CatalogEntry = { description: string; parameters: unknown; declared: boolean };
+	function actionGuide(words: ActionWord[], catalog: Record<string, CatalogEntry>) {
+		const line = (name: string, description: string, parameters: unknown, note = "") =>
+			`- ${name}${note}: ${clip(description.replace(/\s+/g, " "), 160)} params ${clip(JSON.stringify(parameters ?? {}), 300)}`;
+		const live = actionTargets().filter((tool) => !state.words.has(tool.name));
+		const liveNames = new Set(live.map((tool) => tool.name));
+		const tools = [
+			...live.map((tool) => line(tool.name, tool.description ?? "", tool.parameters)),
+			...Object.entries(catalog).filter(([name]) => !liveNames.has(name) && !state.words.has(name)
+				&& (!ACTION_ALLOW || ACTION_ALLOW.includes(name))).map(([name, entry]) => entry.declared
+				? line(name, entry.description, entry.parameters, " (task sessions)")
+				: `- ${name} (seen in the transcript; see its recorded calls for arguments)`),
+		];
 		const lexicon = words.map((word) => `### ${word.name}\n${word.source}`).join("\n\n") || "(none yet)";
 		return "\n\nAction words. When the transcript shows the same sequence of tool calls recurring, you may capture it as an " +
 			"action word: one Python function the agent can then call as a single tool. Submit " +
@@ -366,7 +399,9 @@ export default function (pi: ExtensionAPI) {
 			"back by a tool after the change, not a count of the word's own steps: an agent will take the return value as " +
 			"the outcome. Check cheap preconditions (a status or lookup tool) before acting, and branch on them. Use " +
 			"revise_action {source, tests?} to repair a word and retire_action {name, reason} to remove one; do so when " +
-			`the transcript shows a word ran but its effect did not happen.\n\nCallable tools:\n${tools.join("\n")}\n\nCurrent action words:\n${lexicon}\n`;
+			"the transcript shows a word ran but its effect did not happen. Words run in task sessions, so they may call " +
+			"tools marked as task-session tools even though this dream cannot; the gate checks them against the recorded " +
+			`calls.\n\nCallable tools:\n${tools.join("\n") || "(none)"}\n\nCurrent action words:\n${lexicon}\n`;
 	}
 
 	pi.registerTool({
@@ -479,7 +514,8 @@ export default function (pi: ExtensionAPI) {
 					"(verb:{name,params,doc,source,examples:[{args,result}]}). Verbs are pure Python with 2–32 worked examples on distinct inputs. Boolean verbs need true and false results. " +
 					"Current ledger: " + clip(JSON.stringify(ledger), 4096) + ". ";
 			}
-			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list")) : "";
+			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list"),
+				await getBackend().request<Record<string, CatalogEntry>>("action_catalog")) : "";
 			const focus = args?.trim() || "lessons that will help in future sessions";
 			const prompt = `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
@@ -524,6 +560,7 @@ export default function (pi: ExtensionAPI) {
 		state.dream = undefined;
 		state.writable = state.recordWarning = state.indexWarning = false;
 		state.wordCalls.clear();
+		sentCatalog = "";
 		mkdirSync(workspace, { recursive: true });
 		// Isolate imports and avoid bytecode writes beside the extension.
 		const args = ["-I", "-B", STORE_PY, "--workspace", workspace, "--subject-id", SUBJECT, "serve",
@@ -552,6 +589,7 @@ export default function (pi: ExtensionAPI) {
 					(rejected ? ` Rejected: ${rejected}` : ""));
 			}
 			await registerWords(ctx);
+			await recordToolCatalog(ctx);
 			if (RECORD && !writable) {
 				notify(ctx, "Somni opened without recording because another Pi session is recording in this Somni workspace.");
 			}
@@ -571,7 +609,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.backend || state.dream) return undefined;
-		if (ACTIONS) await registerWords(ctx);
+		if (ACTIONS) {
+			await registerWords(ctx);
+			await recordToolCatalog(ctx); // MCP tools often register after session_start
+		}
 		const prompt = event.messageType === "custom" ? undefined : event.prompt;
 		const options = { index_bytes: INJECT_BYTES, query: prompt ? utf8Prefix(prompt, MAX_INDEX_QUERY_BYTES) : undefined };
 		let index = prompt ? await record("ordinary_observation", `USER: ${prompt}`, ctx, options) : undefined;

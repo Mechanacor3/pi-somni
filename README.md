@@ -146,7 +146,7 @@ def cancel_if_refundable(booking_id: str):
 
 An agent tends to take a word's return value as its outcome, so a word should return state it read back after acting (a status, a count the tool reports, the changed record), not a count of its own steps. The dream prompt and the `somni-action-words` skill both say so. The gate checks that a word reproduces its calls; it cannot check that those calls had the intended effect. Timing-sensitive sequences, where the gap between calls matters, belong in a single tool, because each call in a word is a separate round trip.
 
-`SOMNI_ACTION_TOOLS=a,b` restricts which tools words may call. Words can never call Somni's own tools. The dream prompt lists the callable tools and current words. Dream sessions cannot call words, because offline dreams block every tool except Somni's evidence tools.
+`SOMNI_ACTION_TOOLS=a,b` restricts which tools words may call. Words can never call Somni's own tools. Each recording session stores the declarations of the tools it can call in `somni-v1/action-tools.json`, a cache rather than evidence. The dream prompt lists those tools, any other tool named in the transcript, and the current words. Dreams often run without the task's tools, for example with no MCP server attached, or in a one-shot `-p` dream before MCP tools register, so this listing is what lets them write words for those tools. The gate checks words against recorded calls, not live tools. Task-session tool names are reserved, so a word cannot shadow them. Dream sessions cannot call words, because offline dreams block every tool except Somni's evidence tools.
 
 ### Headless runs
 
