@@ -1511,8 +1511,14 @@ class SomniMemory:
                 body = text[end + 5:] if text.startswith(") -> ", end) else text[end:]
             except ValueError:
                 args, body = None, text[match.end():]
-            recent[match[1]].append({"ref": record["id"], "ok": record.get("tool_ok") is not False,
-                                     "args": args, "result": body[:300]})
+            try:
+                value = json.loads(body)
+            except ValueError:
+                value = None
+            # Convention: a word returns a top-level boolean `confirmed` when a read-back proved its effect (or not).
+            confirmed = value.get("confirmed") if isinstance(value, dict) else None
+            recent[match[1]].append({"ref": record["id"], "ok": record.get("tool_ok") is not False, "args": args,
+                                     "result": body[:300], "confirmed": confirmed if isinstance(confirmed, bool) else None})
         return recent
 
     def action_workbench(self, *, runs=3, scan=4000):
@@ -1639,7 +1645,10 @@ class SomniMemory:
             # The run record keeps a word that works in use after an unrelated failure.
             done = runs[word["name"]]
             failed = sum(not run["ok"] for run in done)
-            record = (f"last {len(done)} run{'s' if len(done) != 1 else ''}: {len(done) - failed} ok, {failed} failed"
+            yes = sum(run["ok"] and run["confirmed"] is True for run in done)
+            no = sum(run["ok"] and run["confirmed"] is False for run in done)
+            checked = f" ({yes} confirmed, {no} unconfirmed)" if yes or no else ""
+            record = (f"last {len(done)} run{'s' if len(done) != 1 else ''}: {len(done) - failed} ok{checked}, {failed} failed"
                       + ("" if not failed else f" (latest {'ok' if done[0]['ok'] else 'failed'})")) if done else "not run yet"
             line = (f"- word `{word['name']}({params})`: {word['description'][:200]} "
                     f"({record}; a tool; calls {', '.join(word['uses'])}{proof}{also})\n")

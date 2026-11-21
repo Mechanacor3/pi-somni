@@ -264,6 +264,14 @@ class ActionWordTest(unittest.TestCase):
         self.m.set_phase("closed")
         self.assertIn("(last 2 runs: 1 ok, 1 failed (latest failed); a tool;",
                       self.m.load().inject(4096, words=["cancel_if_refundable"]))
+        self.m.set_phase("open")
+        self.tool("cancel_if_refundable", {"booking_id": "BK-1"}, {"cancelled": True, "confirmed": True})
+        self.tool("cancel_if_refundable", {"booking_id": "BK-1"}, {"cancelled": False, "confirmed": False})
+        self.m.set_phase("closed")
+        self.assertIn("(last 4 runs: 3 ok (1 confirmed, 1 unconfirmed), 1 failed (latest ok); a tool;",
+                      self.m.load().inject(4096, words=["cancel_if_refundable"]))
+        runs = self.m.action_workbench()["cancel_if_refundable"]["runs"]
+        self.assertEqual([run["confirmed"] for run in runs], [False, True, None])
 
     def test_parameters_bind_by_name_after_the_word_is_stored(self):
         source = ('def zeta_first(zeta: str, alpha: int):\n    """Look up a booking and echo a number."""\n'

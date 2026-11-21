@@ -14,6 +14,7 @@ Call it like any tool. It returns JSON: whatever the function returns. If the wo
 - Each call it makes goes through Pi like your own calls do: the same argument checks, the same permission hooks, and the same recording.
 - If one of its calls fails, the word stops and the error names the calls that already ran. Those calls' effects stay in place. Check the state before you retry.
 - A word encodes what worked before. When your situation differs from its description, make the calls yourself.
+- A word whose index line shows many unconfirmed runs often runs without effect. Check the result before you rely on it.
 - The return value is whatever the word's author chose to report. If it reports only the word's own steps, such as how many calls it made, it does not show that anything changed. Check the effect with a tool before you say the work is done.
 
 ## Reading a word
@@ -87,6 +88,7 @@ A good word does two things beyond replaying calls:
 - **It checks preconditions it can read cheaply.** If a status or lookup tool returns structured state, branch on it before acting. For example, `if not rpc.status()["ready"]: rpc.prepare()`.
 - **It ends with the observation, if one is visual.** Only the final call's images reach the agent, so make the looking call last.
 - **It returns evidence of its effect.** Return state read back after the change, such as the new status, a count the tool reports, or the changed record. Do not return a count of the word's own steps. An agent will take the return value as the outcome.
+- **It says whether the effect was confirmed.** A word that changes something returns a top-level `"confirmed": true` only when a read-back proves the effect, and `false` when it does not. The memory index counts them, as in `last 5 runs: 5 ok (3 confirmed, 2 unconfirmed), 0 failed`, and the dream sees each run marked confirmed or UNCONFIRMED.
 
 ```python
 def restock(item: str, amount: int):
@@ -94,7 +96,7 @@ def restock(item: str, amount: int):
     before = rpc.inventory(item=item)["level"]
     rpc.place_order(item=item, amount=amount)
     after = rpc.inventory(item=item)["level"]
-    return {"before": before, "after": after, "added": after - before}
+    return {"before": before, "after": after, "confirmed": after - before == amount}
 ```
 
 To repair a word, use `{"op":"revise_action","source":...,"tests":...}`. Omit `tests` to keep the stored ones. To remove a word, use `{"op":"retire_action","name":...,"reason":...}`. A rejected operation comes back with a reason. Fix it and resubmit while attempts remain.

@@ -404,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	type Workbench = Record<string, { tests: { params: unknown; refs: string[]; result?: unknown }[]; selftests: string[];
-		uses_words: string[]; used_by: string[]; runs: { ref: string; ok: boolean; args: unknown; result: string }[] }>;
+		uses_words: string[]; used_by: string[]; runs: { ref: string; ok: boolean; args: unknown; result: string; confirmed: boolean | null }[] }>;
 
 	/** Live tool declarations for the backend, which merges them with the task-session catalog and adds signatures. */
 	function liveTools() {
@@ -432,7 +432,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (info?.selftests.length) lines.push(`Self-tests in the source: ${info.selftests.join(", ")}.`);
 			for (const run of info?.runs ?? []) {
-				lines.push(`Run ${run.ref} ${run.ok ? "ok" : "FAILED"}: ${clip(JSON.stringify(run.args), 160)} -> ${clip(run.result, 240)}`);
+				const status = !run.ok ? "FAILED" : run.confirmed === true ? "ok, confirmed" : run.confirmed === false ? "ok, UNCONFIRMED" : "ok";
+				lines.push(`Run ${run.ref} ${status}: ${clip(JSON.stringify(run.args), 160)} -> ${clip(run.result, 240)}`);
 			}
 			if (info && !info.runs.length) lines.push("No recorded runs yet.");
 			return lines.join("\n");
@@ -448,7 +449,7 @@ Submit {"op":"define_action","source":"<python>","tests":[...]}. Repair with {"o
 Writing a word:
 - One \`def name(param: str|int|float|bool|list|dict, ...)\` whose body starts with a one-line docstring (the tool description). Allowed: assignments, if, for over lists or range, comprehensions, arithmetic, indexing, .get/.items/.keys/.values/.lower/.split and similar, and abs min max round int float str len bool sorted sum any all range divmod. No while, try, lambda, classes or I/O.
 - Call tools by the signatures listed below: rpc.mcp.SERVER.TOOL(key=value) for MCP tools, rpc.TOOL(key=value) for others (another word is called the same way). A call returns the tool's parsed JSON result. dir(rpc.mcp.SERVER) and help(rpc.mcp.SERVER.TOOL) list tools and their signatures.
-- Generalize with parameters, not constants copied from one episode. Check cheap preconditions (a status or lookup tool) first and branch on them. Return state read back after acting, not a count of your own steps: the agent takes the return value as the outcome. Only the final call's images (e.g. a screenshot) reach the agent, so end with the looking call.
+- Generalize with parameters, not constants copied from one episode. Check cheap preconditions (a status or lookup tool) first and branch on them. Return state read back after acting, not a count of your own steps: the agent takes the return value as the outcome. When the word changes something, return a top-level "confirmed": true only when a read-back proves the effect, and false when it does not; the agent's index counts confirmed and unconfirmed runs. Revise or retire a word whose runs are mostly unconfirmed. Only the final call's images (e.g. a screenshot) reach the agent, so end with the looking call.
 
 Testing (the gate runs both kinds, and together they must exercise every tool the word calls):
 - tests: [{"params":{...},"refs":["t000012","t000013"],"result":<optional>}]. Given params, the word must make exactly the recorded calls in refs (same tools and arguments, in order; successful, untruncated tool_results), then return.
