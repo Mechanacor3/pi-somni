@@ -146,7 +146,13 @@ def cancel_if_refundable(booking_id: str):
 
 An agent tends to take a word's return value as its outcome, so a word should return state it read back after acting (a status, a count the tool reports, the changed record), not a count of its own steps. The dream prompt and the `somni-action-words` skill both say so. The gate checks that a word reproduces its calls; it cannot check that those calls had the intended effect. Timing-sensitive sequences, where the gap between calls matters, belong in a single tool, because each call in a word is a separate round trip.
 
-`SOMNI_ACTION_TOOLS=a,b` restricts which tools words may call. Words can never call Somni's own tools. Each recording session stores the declarations of the tools it can call in `somni-v1/action-tools.json`, a cache rather than evidence. The dream prompt lists those tools, any other tool named in the transcript, and the current words. Dreams often run without the task's tools, for example with no MCP server attached, or in a one-shot `-p` dream before MCP tools register, so this listing is what lets them write words for those tools. The gate checks words against recorded calls, not live tools. Task-session tool names are reserved, so a word cannot shadow them. Dream sessions cannot call words, because offline dreams block every tool except Somni's evidence tools.
+Without `SOMNI_ACTION_TOOLS`, any tool Pi enables in a session can be a word target, including a shell tool such as `bash` or `powershell` if one is on. For a sandboxed deployment, list the exact tool names words may call. Names are matched exactly, with no wildcards:
+
+```bash
+export SOMNI_ACTION_TOOLS=mcp__body__look,mcp__body__status,mcp__body__mouse_click,mcp__body__key
+```
+
+`SOMNI_ACTION_TOOLS` restricts which tools words may call; the dream prompt shows only those tools and the gate rejects any others. Words can never call Somni's own tools. Each recording session stores the declarations of the tools it can call in `somni-v1/action-tools.json`, a cache rather than evidence. The dream prompt lists those tools, any other tool named in the transcript, and the current words. Dreams often run without the task's tools, for example with no MCP server attached, or in a one-shot `-p` dream before MCP tools register, so this listing is what lets them write words for those tools. The gate checks words against recorded calls, not live tools. Task-session tool names are reserved, so a word cannot shadow them. Dream sessions cannot call words, because offline dreams block every tool except Somni's evidence tools.
 
 ### Headless runs
 
@@ -238,6 +244,7 @@ imports, build recipes, and benchmark details, see [Evaluation](EVALUATION.md).
 - `verified` means Somni checked the cited excerpt or image against the transcript.
 - An action word can do nothing the agent could not do with the same tools. Each of its calls goes
   through Pi's guards, but an earlier call's effects stay in place when a later call fails or is blocked.
+  Set `SOMNI_ACTION_TOOLS` to keep words away from command tools the agent has.
 
 ## Background and credits
 
