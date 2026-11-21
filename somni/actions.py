@@ -229,7 +229,7 @@ for _line in sys.stdin:
             _done, _value = True, None
             signal.setitimer(signal.ITIMER_PROF, _cpu)
             try:
-                _value = _fn(*_req["args"])
+                _value = _fn(**_req["args"])  # by name: stored params are key-sorted, not in declared order
             except _Next:
                 _done = False
             finally:
@@ -333,7 +333,7 @@ def step(runtime, word, params, history, *, max_calls=MAX_CALLS):
     for item in history:
         require(isinstance(item, dict) and {"tool", "args", "result"} <= set(item), "malformed action history")
         require(size(item["result"]) <= RESULT_BYTES, "a tool result in the action history exceeds 64 KiB")
-    reply = runtime.run(word["name"], [params[key] for key in word["params"]], [item["result"] for item in history])
+    reply = runtime.run(word["name"], {key: params[key] for key in word["params"]}, [item["result"] for item in history])
     calls = reply["calls"]
     for index, item in enumerate(history):
         require(index < len(calls) and calls[index] == [item["tool"], item["args"]],

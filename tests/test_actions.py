@@ -254,6 +254,24 @@ class ActionWordTest(unittest.TestCase):
         self.assertNotIn("- word ", memory.inject(4096))
         self.assertNotIn("- word ", memory.inject(512, words=both))  # a quarter of a small index cannot fit one
 
+    def test_parameters_bind_by_name_after_the_word_is_stored(self):
+        source = ('def zeta_first(zeta: str, alpha: int):\n    """Look up a booking and echo a number."""\n'
+                  '    rpc.get_booking(booking_id=zeta)\n    return alpha')
+        self.dream({"op": "define_action", "source": source,
+                    "tests": [{"params": {"zeta": "BK-1", "alpha": 3}, "refs": ["t000001"], "result": 3}]})
+        words = SomniMemory(self.m.workspace, "s").load().action_words()  # from disk: params come back key-sorted
+        self.assertEqual(list(words["zeta_first"]["params"]), ["alpha", "zeta"])
+        result = {"booking_id": "BK-1", "refundable": True}
+        with A.ActionRuntime(words) as runtime:
+            for params in ({"zeta": "BK-9", "alpha": 7}, {"alpha": 7, "zeta": "BK-9"}):
+                call = A.step(runtime, words["zeta_first"], params, [])["call"]
+                self.assertEqual(call, {"tool": "get_booking", "args": {"booking_id": "BK-9"}})
+                done = A.step(runtime, words["zeta_first"], params, [{**call, "result": result}])
+                self.assertEqual(done, {"result": 7})
+        # The rendered file and the index keep the declared order.
+        self.assertIn("def zeta_first(zeta: str, alpha: int):", (self.m.store / "actions" / "zeta_first.py").read_text())
+        self.assertIn("- word `zeta_first(zeta: str, alpha: int)`", self.m.load().inject(4096, words=["zeta_first"]))
+
 
 if __name__ == "__main__":
     unittest.main()

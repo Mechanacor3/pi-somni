@@ -1535,7 +1535,8 @@ class SomniMemory:
             words.sort(key=lambda w: scores.get(id(w), 0), reverse=True)
         lines = []
         for word in words[:5]:
-            params = ", ".join(f"{key}: {python.get(kind, kind)}" for key, kind in word["params"].items())
+            declared = A.parse(word["source"])["params"]  # stored params are key-sorted; show the declared order
+            params = ", ".join(f"{key}: {python.get(kind, kind)}" for key, kind in declared.items())
             evidence = word.get("evidence") or []
             proof = f"; replays {evidence[0]}..{evidence[-1]}" if len(evidence) > 1 else \
                 f"; replays {evidence[0]}" if evidence else "; edited by a human, no tests"
