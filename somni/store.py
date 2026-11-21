@@ -43,6 +43,7 @@ import json
 import math
 import os
 import pathlib
+import posixpath
 import re
 import stat
 import sys
@@ -77,10 +78,15 @@ LIMIT_KEYS = {"max_transcript_records": 65_536, "max_claims": 4_096, "max_record
 DEFAULT_INJECTION_BYTES = 4_096
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CLAIM_ID = re.compile(r"^n[0-9]{6}$")
-PAGE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+SLUG_SEGMENT = r"[a-z0-9][a-z0-9-]{0,63}"
+MAX_PAGE_DEPTH = 3  # a slug may be a path: folder/subfolder/page
+SLUG_PATH = rf"{SLUG_SEGMENT}(?:/{SLUG_SEGMENT}){{0,{MAX_PAGE_DEPTH - 1}}}"
+PAGE_SLUG = re.compile(rf"^{SLUG_PATH}$")
+RESERVED_PAGES = frozenset({"index", "claims"})  # vault files Somni renders itself
+LINK_STYLES = ("markdown", "wikilink")
 MAX_PAGES = 512
 MAX_PAGE_BYTES = 6_144
-WIKILINK = re.compile(r"\[\[([a-z0-9][a-z0-9-]{0,63})(?:\|[^\]\n]{1,160})?\]\]")
+WIKILINK = re.compile(rf"\[\[({SLUG_PATH})(?:\|([^\]\n]{{1,160}}))?\]\]")
 CLAIM_CITE = re.compile(r"\[(n[0-9]{6})\]")
 VAULT_DIR = "vault"
 ACTIONS_DIR = "actions"
@@ -664,7 +670,10 @@ class SomniMemory:
             raise MemoryError("page operation needs slug, title, body, claims (and optional links)")
         slug, title, body = op["slug"], op["title"], op["body"]
         if not isinstance(slug, str) or not PAGE_SLUG.fullmatch(slug):
-            raise MemoryError("page slug must match [a-z0-9][a-z0-9-]{0,63}")
+            raise MemoryError(f"page slug must be lowercase-hyphenated segments ([a-z0-9][a-z0-9-]{{0,63}}), "
+                              f"optionally a folder path such as topic/page, at most {MAX_PAGE_DEPTH} deep")
+        if slug in RESERVED_PAGES:
+            raise MemoryError(f"page slug {slug!r} is reserved for the vault's own {slug}.md")
         if not isinstance(title, str) or not title.strip() or len(title) > 160:
             raise MemoryError("page title must be 1-160 characters")
         if not isinstance(body, str) or not body.strip() or len(body.encode("utf-8")) > MAX_PAGE_BYTES:
@@ -681,7 +690,7 @@ class SomniMemory:
         links = op.get("links", [])
         if not isinstance(links, list) or not all(isinstance(x, str) and PAGE_SLUG.fullmatch(x) for x in links):
             raise MemoryError("page links must be a list of slugs")
-        links = sorted(set(links) | set(WIKILINK.findall(body)))
+        links = sorted(set(links) | {match[1] for match in WIKILINK.finditer(body)})
         if len(links) > 32:
             raise MemoryError("a page may link to at most 32 other pages")
         if not refs and not links:
@@ -692,39 +701,74 @@ class SomniMemory:
         return {"slug": slug, "title": title.strip(), "body": body.strip(), "claims": refs, "links": links, "version": version}
 
     def write_vault(self):
-        """Render the wiki as an Obsidian-style vault (deterministic; a view, never read back)."""
+        """Render the wiki as a vault of markdown notes (deterministic; a view, never read back).
+
+        A slug like ``topic/page`` becomes ``topic/page.md``.  Links render as relative markdown
+        links (``[Title](../topic/page.md)``), which GitLab wikis and Obsidian both follow, or as
+        Obsidian ``[[wikilinks]]`` with SOMNI_LINK_STYLE=wikilink.
+        """
         vault = self.store / VAULT_DIR
         _no_symlink(vault)
         vault.mkdir(mode=0o700, exist_ok=True)
+        markdown = os.environ.get("SOMNI_LINK_STYLE", "markdown") != "wikilink"
         claims = self.claims
         backlinks = {}
         for page in self.pages.values():
             for link in page["links"]:
                 backlinks.setdefault(link, []).append(page["slug"])
 
-        def body_md(text, refs):
-            text = CLAIM_CITE.sub(lambda m: f"[[claims#{m.group(1)}|{m.group(1)}]]" if m.group(1) in refs else m.group(0), text)
+        def link(source, target, label, anchor=None):
+            """A link written in note `source` (a slug, or index/claims) to note `target`."""
+            if not markdown:
+                return f"[[{target}{'#' + anchor if anchor else ''}|{label}]]"
+            path = posixpath.relpath(f"{target}.md", posixpath.dirname(f"{source}.md") or ".")
+            text = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            return f"[{text}]({path}{'#' + anchor if anchor else ''})"
+
+        def title(slug):
+            return self.pages[slug]["title"] if slug in self.pages else slug
+
+        def body_md(source, text, refs):
+            text = CLAIM_CITE.sub(lambda m: link(source, "claims", m.group(1), m.group(1))
+                                  if m.group(1) in refs else m.group(0), text)
+            if markdown:
+                text = WIKILINK.sub(lambda m: link(source, m.group(1), m.group(2) or title(m.group(1))), text)
             return text
 
         files = {}
         for slug, page in sorted(self.pages.items()):
             fm = ["---", f"title: {json.dumps(page['title'], ensure_ascii=False)}", f"version: {page['version']}",
                   "claims: [" + ", ".join(page["claims"]) + "]", "tags: [somni]", "---", ""]
-            lines = fm + [f"# {page['title']}", "", body_md(page["body"], set(page["claims"])), ""]
+            lines = fm + [f"# {page['title']}", "", body_md(slug, page["body"], set(page["claims"])), ""]
             if page["links"]:
-                lines += ["## See also", ""] + [f"- [[{l}|{self.pages[l]['title']}]]" for l in page["links"] if l in self.pages] + [""]
+                lines += ["## See also", ""] + [f"- {link(slug, l, title(l))}" for l in page["links"] if l in self.pages] + [""]
             if backlinks.get(slug):
-                lines += ["## Backlinks", ""] + [f"- [[{b}|{self.pages[b]['title']}]]" for b in sorted(backlinks[slug])] + [""]
+                lines += ["## Backlinks", ""] + [f"- {link(slug, b, title(b))}" for b in sorted(backlinks[slug])] + [""]
             lines += ["## Evidence", ""]
             for ref in page["claims"]:
                 c = claims.get(ref)
                 state = "" if c and c["state"] == "active" else f" (**{c['state'] if c else 'missing'}**)"
-                lines.append(f"- [[claims#{ref}|{ref}]]{state}: {c['text'] if c else ''}")
+                lines.append(f"- {link(slug, 'claims', ref, ref)}{state}: {c['text'] if c else ''}")
             files[f"{slug}.md"] = "\n".join(lines) + "\n"
+
+        tree = {"pages": [], "folders": {}}
+        for slug, page in self.pages.items():
+            node = tree
+            for part in slug.split("/")[:-1]:
+                node = node["folders"].setdefault(part, {"pages": [], "folders": {}})
+            node["pages"].append(slug)
+
+        def tree_lines(node, depth=0):
+            out = [f"{'  ' * depth}- {link('index', slug, title(slug))}"
+                   for slug in sorted(node["pages"], key=lambda slug: (title(slug).casefold(), slug))]
+            for name, sub in sorted(node["folders"].items()):
+                out += [f"{'  ' * depth}- {name}/", *tree_lines(sub, depth + 1)]
+            return out
+
         index = ["---", "title: Index", "tags: [somni, index]", "---", "", "# Index", "",
                  f"{len(self.pages)} pages, {sum(c['state'] == 'active' for c in claims.values())} active claims. "
-                 "Pages trace to [[claims]] and their transcript quotes and images.", ""]
-        index += [f"- [[{slug}|{page['title']}]]" for slug, page in sorted(self.pages.items(), key=lambda kv: kv[1]["title"].casefold())]
+                 f"Pages trace to {link('index', 'claims', 'claims')} and their transcript quotes and images.", ""]
+        index += tree_lines(tree)
         files["index.md"] = "\n".join(index) + "\n"
         transcript = {r["id"]: r for r in self.transcript}
         cl = ["---", "title: Claims", "tags: [somni, claims]", "---", "", "# Claims", "",
@@ -741,12 +785,12 @@ class SomniMemory:
             if c.get("tags"):
                 cl.append("- tags: " + ", ".join(c["tags"]))
             if c.get("replaces"):
-                cl.append(f"- supersedes [[claims#{c['replaces']}|{c['replaces']}]]")
+                cl.append(f"- supersedes {link('claims', 'claims', c['replaces'], c['replaces'])}")
             if c.get("merged_from"):
-                parents = ", ".join(f"[[claims#{ref}|{ref}]]" for ref in c["merged_from"])
+                parents = ", ".join(link("claims", "claims", ref, ref) for ref in c["merged_from"])
                 cl.extend([f"- merged from {parents}", f"- provenance SHA-256: `{c['provenance_sha256']}`"])
             if cited_by.get(cid):
-                cl.append("- used by: " + ", ".join(f"[[{s}]]" for s in sorted(cited_by[cid])))
+                cl.append("- used by: " + ", ".join(link("claims", s, title(s)) for s in sorted(cited_by[cid])))
             for ev in c["evidence"]:
                 rec = transcript.get(ev["ref"], {})
                 quote = ev.get("quote")
@@ -757,17 +801,24 @@ class SomniMemory:
                 cl.append(f"- {ev['ref']} ({rec.get('source', '?')}): {content}")
             cl.append("")
         files["claims.md"] = "\n".join(cl) + "\n"
-        for existing in vault.glob("*.md"):
-            if existing.name not in files:
-                existing.unlink()
+
+        for folder, dirs, names in os.walk(vault, topdown=False):
+            for name in names:
+                path = pathlib.Path(folder) / name
+                if name.endswith(".md") and path.relative_to(vault).as_posix() not in files:
+                    path.unlink()
+            if pathlib.Path(folder) != vault and not os.listdir(folder):
+                os.rmdir(folder)
         for name, text in files.items():
             target = vault / name
+            folder = vault
+            for part in pathlib.PurePosixPath(name).parts[:-1]:
+                folder = folder / part
+                _no_symlink(folder)
+                folder.mkdir(mode=0o700, exist_ok=True)
             if target.exists() and target.read_text(encoding="utf-8") == text:
                 continue
-            fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=vault)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
-            os.replace(tmp, target)
+            _write_text_atomic(target, text)
         return sorted(files)
 
     def stale_pages(self):

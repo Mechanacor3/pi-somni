@@ -15,11 +15,14 @@ and consolidates them offline ("dreaming"):
    pages, each bound to the transcript head it reviewed. History is never deleted: corrections
    and retractions keep their lineage.
 
-After every dream Somni renders the wiki as an **Obsidian-style vault** in
+After every dream Somni renders the wiki as a **vault of markdown notes** in
 `somni-v1/vault/`. Each page is one note with YAML frontmatter, *See also* and *Backlinks*
-sections, and an *Evidence* list. `index.md` is the map of content, and `claims.md` shows
-every claim with its transcript quotes and image links. Open the folder in Obsidian, or read it on GitHub.
-The vault is a view; edits there are not read back.
+sections, and an *Evidence* list. `index.md` is the map of content, showing folders as a tree, and `claims.md` shows
+every claim with its transcript quotes and image links. A page slug may be a folder path such as `fares/refunds`
+(at most three levels), rendered as `fares/refunds.md`. Dreams are asked to group pages into a folder once a topic has several.
+Links render as relative markdown links (`[Refunds](fares/refunds.md)`, `[n000004](../claims.md#n000004)`), so the
+folder works as a GitLab or GitHub wiki and in Obsidian. `SOMNI_LINK_STYLE=wikilink` renders Obsidian `[[wikilinks]]`
+instead. Dreams write `[[slug]]` links either way. The vault is a view; edits there are not read back.
 
 Before each Pi turn, Somni injects a small memory index ranked against the current user prompt.
 It prioritizes exact run labels and tags, then uses lexical similarity (BM25), salience, and
@@ -189,6 +192,7 @@ can be `null`. Claims inherit the union of run labels and tags from the records 
 | `SOMNI_ACTIONS` | off | `1` enables [action words](#action-words-experimental): dreamed Python functions that call session tools, registered as Pi tools |
 | `SOMNI_ACTION_TOOLS` | all non-Somni tools | Comma-separated tools that action words may call |
 | `SOMNI_ACTION_MAX_CALLS` | `16` | Tool calls per action word run, clamped to 1–64 |
+| `SOMNI_LINK_STYLE` | `markdown` | Vault link style: `markdown` (relative `[Title](path.md)` links) or `wikilink` (Obsidian `[[slug\|Title]]`) |
 | `SOMNI_DREAM_RECORDS` | `120` | Number of recent transcript records sent to `/somni-dream`, clamped to 1–120 |
 | `SOMNI_DREAM_RECORD_BYTES` | `1500` | UTF-8 text excerpt per dream record, including the truncation marker, clamped to 64–8192. IDs, metadata, and attachments have separate bounds |
 | `SOMNI_TOOL_RESULT_BYTES` | `4096` | Tool result text budget in UTF-8 bytes, clamped to 512–8000 |
@@ -256,7 +260,7 @@ Somni implements the memory hierarchy described by Lance Martin in
 |---|---|
 | Transcripts as a searchable event log at the base | `transcript.jsonl` and `somni_search` |
 | Memory notes written by the agent, which judges salience | Claims with salience 1–5 (`somni_note`) |
-| Representations: pages that gather one subject and link to notes and each other (wikis) | `wiki.jsonl` pages with `[[slug]]` links and `[nXXXXXX]` citations, rendered as an Obsidian vault |
+| Representations: pages that gather one subject and link to notes and each other (wikis) | `wiki.jsonl` pages with `[[slug]]` links and `[nXXXXXX]` citations, rendered as a markdown vault (folders, relative links; GitLab wiki and Obsidian) |
 | Small injected context loaded every session (an index) | The bounded index from `inject`, with prompt-ranked pages and claims |
 | Dreaming corrects memory against the transcript | `correct` / `retract` operations (`/somni-dream`, `somni/dream.py dream_pass`) |
 | Dreaming builds new representations | `build_wiki` / `/somni-wiki`: claims gathered into pages, iterated until nearly all are covered |

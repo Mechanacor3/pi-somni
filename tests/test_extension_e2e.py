@@ -93,8 +93,8 @@ class SomniPiEndToEnd(unittest.TestCase):
         memory = SomniMemory(store, "pi").load()
         self.assertEqual(sorted(memory.pages), ["fees"])
         vault = store / "somni-v1" / "vault"
-        self.assertIn("[[claims#n000001|n000001]]", (vault / "fees.md").read_text())
-        self.assertIn("[[fees|Fees]]", (vault / "index.md").read_text())
+        self.assertIn("[n000001](claims.md#n000001)", (vault / "fees.md").read_text())
+        self.assertIn("- [Fees](fees.md)", (vault / "index.md").read_text())
         self.assertIn(merged["provenance_sha256"], (vault / "claims.md").read_text())
         self.pi.prompt("Anything else I should know?")
         self.assertIn("page `fees`", json.dumps(self.upstream.requests[-1]["messages"][-1]))

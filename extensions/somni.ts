@@ -571,7 +571,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const goal = args?.trim() || "what will help in future sessions";
 			return `Wiki pass. Goal: ${goal}. ${info.guide} Gather the claims below into pages and call somni_dream once with ` +
-					`page operations: {"op":"page","slug":"lowercase-hyphenated","title":...,"body":markdown citing [nXXXXXX] and ` +
+					`page operations: {"op":"page","slug":"lowercase-hyphenated or folder/page","title":...,"body":markdown citing [nXXXXXX] and ` +
 					`linking [[slug]],"claims":[...]}. Extend an existing page by reusing its slug.\n\n## Existing pages\n${info.pages}\n\n## Claims not yet on a page\n${info.claims}`;
 		}),
 	});

@@ -21,7 +21,7 @@ DEFAULT_FOCUS = ("durable lessons that would help in future, similar situations:
                  "thresholds and calculations, and common traps or failure modes")
 
 WIKI_LINK_GUIDE = ("Wiki links can point to pages created later in the same pass and can form cycles. "
-                   "Every link must resolve at the end of the pass.")
+                   "Every link must resolve at the end of the pass. " + 'Group pages in folders when a topic has several pages: a slug may be a path such as topic/page or topic/subtopic/page (at most 3 levels). Link with the full path, [[topic/page]].')
 
 SYSTEM = """You consolidate an agent's memory offline ("dreaming").
 
@@ -36,7 +36,7 @@ OP is one of:
   {"op": "correct", "claim_id": "n000004", "text": ..., "status": ..., "salience": ..., "evidence": [...], "links": []}
   {"op": "merge", "claim_ids": ["n000004", "n000007"], "text": "Combined guidance", "status": "uncertain", "salience": 3}
   {"op": "retract", "claim_id": "n000004", "reason": "why it is wrong or redundant", "evidence": [{"ref": "t000123"}]}
-  {"op": "page", "slug": "lowercase-hyphenated", "title": "...", "body": "markdown", "claims": ["n000004", ...]}
+  {"op": "page", "slug": "lowercase-hyphenated or folder/page", "title": "...", "body": "markdown", "claims": ["n000004", ...]}
   {"op": "drop_page", "slug": "...", "reason": "merged into other-slug"}
   {"op": "promote", "claim_id": "n000004", "salience": 5}   (raise a broadly useful claim up the index)
 

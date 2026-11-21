@@ -29,7 +29,7 @@ class WikiTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def page(self, slug, body, claims, **extra):
-        return {"op": "page", "slug": slug, "title": slug.replace("-", " ").title(), "body": body, "claims": claims, **extra}
+        return {"op": "page", "slug": slug, "title": slug.split("/")[-1].replace("-", " ").title(), "body": body, "claims": claims, **extra}
 
     def test_pages_cite_active_claims_and_links_must_resolve(self):
         dangling = self.page("cancellations", "See [[refunds]]. Preview first [n000001].", ["n000001"])
@@ -65,8 +65,8 @@ class WikiTest(unittest.TestCase):
         self.assertEqual(pages["consent"]["links"], ["cancellations", "overview"])
         self.assertEqual(pages["cancellations"]["links"], ["consent"])
         vault = self.ws / "somni-v1" / "vault"
-        self.assertIn("## Backlinks\n\n- [[consent|Consent]]", (vault / "overview.md").read_text())
-        self.assertIn("## See also\n\n- [[consent|Consent]]", (vault / "overview.md").read_text())
+        self.assertIn("## Backlinks\n\n- [Consent](consent.md)", (vault / "overview.md").read_text())
+        self.assertIn("## See also\n\n- [Consent](consent.md)", (vault / "overview.md").read_text())
 
     def test_drops_and_rewrites_use_final_links(self):
         self.m.dream({"schema": 1, "operations": [
@@ -108,11 +108,11 @@ class WikiTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in vault.glob("*.md")), ["cancellations.md", "claims.md", "consent.md", "index.md"])
         page = (vault / "cancellations.md").read_text()
         self.assertTrue(page.startswith("---\ntitle: \"Cancellations\""))
-        self.assertIn("[[claims#n000001|n000001]]", page)
+        self.assertIn("[n000001](claims.md#n000001)", page)
         self.assertIn("## See also", page)
         self.assertIn("## Backlinks", (vault / "consent.md").read_text())
         self.assertIn("> status preview", (vault / "claims.md").read_text())
-        self.assertIn("[[consent|Consent]]", (vault / "index.md").read_text())
+        self.assertIn("- [Consent](consent.md)", (vault / "index.md").read_text())
         m = SomniMemory(self.ws, "s").load()
         m.dream({"schema": 1, "operations": [{"op": "retract", "claim_id": "n000002", "reason": "test", "evidence": [{"ref": "t000002"}]}]})
         m = SomniMemory(self.ws, "s").load()
@@ -123,6 +123,50 @@ class WikiTest(unittest.TestCase):
         before = {p.name: p.read_text() for p in vault.glob("*.md")}
         m.write_vault()
         self.assertEqual(before, {p.name: p.read_text() for p in vault.glob("*.md")})
+
+    def test_nested_pages_render_as_folders_with_relative_markdown_links(self):
+        self.m.dream({"schema": 1, "operations": [
+            self.page("overview", "Start with [[fares/economy|economy fares]] and [[fares/rules/refunds]].", []),
+            self.page("fares/economy", "Preview the fee [n000001]; see [[fares/rules/refunds]].", ["n000001"]),
+            self.page("fares/rules/refunds", "Ask first [n000002]. Back to [[overview]].", ["n000002"])]})
+        vault = self.ws / "somni-v1" / "vault"
+        files = sorted(p.relative_to(vault).as_posix() for p in vault.rglob("*.md"))
+        self.assertEqual(files, ["claims.md", "fares/economy.md", "fares/rules/refunds.md", "index.md", "overview.md"])
+        economy = (vault / "fares" / "economy.md").read_text()
+        self.assertIn("Preview the fee [n000001](../claims.md#n000001); see [Refunds](rules/refunds.md).", economy)
+        refunds = (vault / "fares" / "rules" / "refunds.md").read_text()
+        self.assertIn("Back to [Overview](../../overview.md).", refunds)
+        self.assertIn("## Backlinks\n\n- [Economy](../economy.md)\n- [Overview](../../overview.md)", refunds)
+        self.assertIn("Start with [economy fares](fares/economy.md)", (vault / "overview.md").read_text())
+        index = (vault / "index.md").read_text()
+        self.assertIn("- [Overview](overview.md)\n- fares/\n  - [Economy](fares/economy.md)\n  - rules/\n"
+                      "    - [Refunds](fares/rules/refunds.md)\n", index)
+        self.assertIn("used by: [Economy](fares/economy.md)", (vault / "claims.md").read_text())
+        # Links are validated over full paths; depth and reserved names are bounded.
+        with self.assertRaisesRegex(SomniError, "at most 3 deep.*reserved for the vault.*'fares/missing', which does not exist"):
+            self.m.dream({"schema": 1, "operations": [
+                self.page("a/b/c/d", "Too deep [n000001].", ["n000001"]),
+                self.page("claims", "Clashes with claims.md [n000001].", ["n000001"]),
+                self.page("fares/oops", "Links [[fares/missing]] [n000001].", ["n000001"])]}, partial=True)
+        # Moving a page to a folder removes the old note and any emptied folder.
+        m = SomniMemory(self.ws, "s").load()
+        m.dream({"schema": 1, "operations": [
+            {"op": "drop_page", "slug": "fares/rules/refunds", "reason": "moved"},
+            self.page("refunds", "Ask first [n000002].", ["n000002"]),
+            self.page("fares/economy", "Preview the fee [n000001]; see [[refunds]].", ["n000001"]),
+            self.page("overview", "Start with [[fares/economy]].", [])]})
+        self.assertFalse((vault / "fares" / "rules").exists())
+        self.assertTrue((vault / "refunds.md").exists())
+
+    def test_wikilink_style_keeps_obsidian_links(self):
+        with patch.dict(os.environ, {"SOMNI_LINK_STYLE": "wikilink"}):
+            self.m.dream({"schema": 1, "operations": [
+                self.page("fares/economy", "Preview the fee [n000001], see [[overview]].", ["n000001"]),
+                self.page("overview", "Start at [[fares/economy]].", [])]})
+        vault = self.ws / "somni-v1" / "vault"
+        self.assertIn("Preview the fee [[claims#n000001|n000001]], see [[overview]].",
+                      (vault / "fares" / "economy.md").read_text())
+        self.assertIn("- [[fares/economy|Economy]]", (vault / "index.md").read_text())
 
     def test_corrected_page_can_be_recalled_after_repair(self):
         self.m.dream({"schema": 1, "operations": [
