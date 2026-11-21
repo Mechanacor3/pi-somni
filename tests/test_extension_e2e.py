@@ -272,6 +272,34 @@ class SomniPiEndToEnd(unittest.TestCase):
         word = next(e for e in self.pi.tool_ends() if e["toolName"] == "quote_fees")
         self.assertEqual(json.loads(text_of(word["result"]["content"])), [50, 16])
 
+    def test_word_passes_on_images_from_its_final_call_only(self):
+        self.pi.close()
+        folder = self.work / ".pi" / "somni" / "somni-v1" / "actions"
+        folder.mkdir(parents=True)
+        words = {
+            "fee_then_look": 'rpc.lookup_fee(cabin="economy", price=price)\n    return rpc.screenshot()',
+            "look_then_fee": 'rpc.screenshot()\n    return rpc.lookup_fee(cabin="economy", price=price)',
+            "outer_look": 'shot = rpc.fee_then_look(price=price)\n    return {"age": shot["frame_age_ms"]}',
+        }
+        for name, body in words.items():
+            (folder / f"{name}.py").write_text(f'def {name}(price: float):\n    """Test word."""\n    {body}\n')
+        self.upstream.script = plan_script({f"Run {name}": [[(name, {"price": 300})]] for name in words})
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={"SOMNI_ACTIONS": "1"})
+        results = {}
+        for name in words:
+            self.pi.prompt(f"Run {name}")
+            end = [e for e in self.pi.tool_ends() if e["toolName"] == name][-1]
+            self.assertFalse(end["isError"], text_of(end["result"]["content"]))
+            results[name] = end["result"]
+        kinds = {name: [part["type"] for part in r["content"]] for name, r in results.items()}
+        self.assertEqual(kinds, {"fee_then_look": ["text", "image"], "look_then_fee": ["text"],
+                                 "outer_look": ["text", "image"]})  # its final call, a word, ended with the image
+        self.assertEqual(results["fee_then_look"]["details"]["images_from"], "screenshot")
+        self.assertEqual(results["outer_look"]["details"]["images_from"], "fee_then_look")
+        self.assertEqual(json.loads(text_of(results["fee_then_look"]["content"])), {"frame_time": 100, "frame_age_ms": 25})
+        # The image does not disturb a calling word, which still parses the text as JSON.
+        self.assertEqual(json.loads(text_of(results["outer_look"]["content"])), {"age": 25})
+
     def test_dream_record_settings_bound_the_prompt(self):
         self.pi.close()
         store = self.work / "dream-memory"

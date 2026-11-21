@@ -9,7 +9,7 @@ An action word is a short Python function that Somni learned from your own trans
 
 ## Using a word
 
-Call it like any tool. It returns JSON: whatever the function returns.
+Call it like any tool. It returns JSON: whatever the function returns. If the word's final call returned images, such as a screenshot, up to two of them come back with the result. Images from earlier calls do not, because they may show the state before the word's later calls.
 
 - Each call it makes goes through Pi like your own calls do: the same argument checks, the same permission hooks, and the same recording.
 - If one of its calls fails, the word stops and the error names the calls that already ran. Those calls' effects stay in place. Check the state before you retry.
@@ -67,6 +67,7 @@ Only during `/somni-dream`, when `SOMNI_ACTIONS=1`. The dream prompt lists the c
 A good word does two things beyond replaying calls:
 
 - **It checks preconditions it can read cheaply.** If a status or lookup tool returns structured state, branch on it before acting. For example, `if not rpc.status()["ready"]: rpc.prepare()`.
+- **It ends with the observation, if one is visual.** Only the final call's images reach the agent, so make the looking call last.
 - **It returns evidence of its effect.** Return state read back after the change, such as the new status, a count the tool reports, or the changed record. Do not return a count of the word's own steps. An agent will take the return value as the outcome.
 
 ```python

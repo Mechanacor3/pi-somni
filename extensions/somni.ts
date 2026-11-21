@@ -51,6 +51,7 @@ const LEARNING = process.env.SOMNI_CHEL_LEARNING === "1";
 const ACTIONS = process.env.SOMNI_ACTIONS === "1";
 const ACTION_ALLOW = process.env.SOMNI_ACTION_TOOLS?.split(",").map((name) => name.trim()).filter(Boolean);
 const MAX_ACTION_DEPTH = 4;
+const MAX_WORD_IMAGES = 2; // images a word passes on from its final call
 const configuredActionCalls = Number(process.env.SOMNI_ACTION_MAX_CALLS ?? 16);
 const ACTION_MAX_CALLS = Number.isInteger(configuredActionCalls) ? Math.min(64, Math.max(1, configuredActionCalls)) : 16;
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream"]);
@@ -279,12 +280,18 @@ export default function (pi: ExtensionAPI) {
 		if (toolCallId.split("/").length > MAX_ACTION_DEPTH) throw new Error(`Action words nest at most ${MAX_ACTION_DEPTH} deep.`);
 		const history: { tool: string; args: Record<string, unknown>; result: unknown }[] = [];
 		const calls: { tool: string; args: Record<string, unknown>; ok: boolean }[] = [];
+		let last: { tool: string; images: ImageContent[] } | undefined;
 		state.wordCalls.add(toolCallId);
 		try {
 			for (;;) {
 				const step = await getBackend().request<ActionStep>("action_step", { name: word.name, params, history, max_calls: ACTION_MAX_CALLS });
 				if (!step.call) {
-					return { content: asText(JSON.stringify(step.result ?? null)), details: { word: word.name, calls } };
+					// Images from the word's final call show the state the word ended in, so they go to the caller;
+					// images from earlier calls may predate later actions, so they are not passed on.
+					// No extra text: a calling word parses this result's text as JSON.
+					const images = last?.images.slice(0, MAX_WORD_IMAGES) ?? [];
+					return { content: [...asText(JSON.stringify(step.result ?? null)), ...images],
+						details: { word: word.name, calls, ...(images.length ? { images_from: last!.tool } : {}) } };
 				}
 				const { tool, args } = step.call;
 				if (ACTION_ALLOW && !ACTION_ALLOW.includes(tool) && !state.words.has(tool)) {
@@ -292,7 +299,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				// Resolves to { toolCall, result: { content, details }, isError, durationMs }; never rejects.
 				const outcome = await ctx.executeTool(tool, args, { signal });
-				const value = resultValue(outcome.result?.content ?? []);
+				const content: (TextContent | ImageContent)[] = outcome.result?.content ?? [];
+				const value = resultValue(content);
+				last = { tool, images: content.filter((part): part is ImageContent => part.type === "image") };
 				calls.push({ tool, args, ok: !outcome.isError });
 				if (outcome.isError) {
 					const done = calls.slice(0, -1).map((call) => call.tool).join(", ") || "none";
@@ -411,7 +420,7 @@ export default function (pi: ExtensionAPI) {
 			"tool the word calls; add a test with fewer refs for each branch that stops early. Generalize with parameters, not " +
 			"constants copied from one episode. Return an observation that shows whether the word worked, such as state read " +
 			"back by a tool after the change, not a count of the word's own steps: an agent will take the return value as " +
-			"the outcome. Check cheap preconditions (a status or lookup tool) before acting, and branch on them. Use " +
+			"the outcome. Images from the word's final call (e.g. a screenshot) reach the agent; earlier images do not, so end with the looking call. Check cheap preconditions (a status or lookup tool) before acting, and branch on them. Use " +
 			"revise_action {source, tests?} to repair a word and retire_action {name, reason} to remove one; do so when " +
 			"the transcript shows a word ran but its effect did not happen. Words run in task sessions, so they may call " +
 			"tools marked as task-session tools even though this dream cannot; the gate checks them against the recorded " +
