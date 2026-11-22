@@ -100,7 +100,7 @@ def restock(item: str, amount: int):
     return {"before": before, "after": after, "confirmed": after - before == amount}
 ```
 
-To repair a word, use `{"op":"revise_action","source":...,"tests":...}`. Omit `tests` to keep the stored ones. To remove a word, use `{"op":"retire_action","name":...,"reason":...}`. A rejected operation comes back with a reason. Fix it and resubmit while attempts remain.
+To repair a word, use `{"op":"revise_action","source":...,"tests":...}`. Omit `tests` to keep the stored ones. To remove a word, use `{"op":"retire_action","name":...,"reason":...,"runs":["t000123"]}`, citing the failing runs it is retired for. Runs the workbench marks as older source, older Somni or unstamped failed on code that has changed since. They are not grounds to retire: a retirement citing only them is refused, and so is one that cites nothing while every failure is stale. A word with no failures can be retired as redundant without citing runs. A rejected operation comes back with a reason. Fix it and resubmit while attempts remain.
 
 Dependencies: a word that other words use cannot be retired until they are revised or retired. Revising a word's parameters is allowed, but the pass reports the words whose calls no longer match (`broken_dependents`); revise them in the same pass. A word whose call to another word uses the wrong keyword arguments is rejected.
 
