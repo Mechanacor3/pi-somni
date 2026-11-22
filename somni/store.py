@@ -375,6 +375,23 @@ def _read_log(path, committed_size=None):
     return records
 
 
+USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost", "calls", "duration_ms")
+
+
+def _usage(value):
+    """Model usage reported with a dream pass: known non-negative numbers only."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - set(USAGE_KEYS):
+        raise MemoryError(f"usage may only report {', '.join(USAGE_KEYS)}")
+    out = {}
+    for key, number in value.items():
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or number != number or not 0 <= number < 1e12:
+            raise MemoryError(f"usage {key} must be a non-negative number")
+        out[key] = round(number, 6) if key == "cost" else int(number)
+    return out
+
+
 class _Horizon(dict):
     """Records visible to a daydream, with the last ID it may cite."""
     horizon = None
@@ -1202,7 +1219,7 @@ class SomniMemory:
         return claim_id
 
     def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False, actions=None,
-              snapshot=None):
+              snapshot=None, usage=None):
         """Apply one offline consolidation pass.
 
         By default the pass is all-or-nothing.  With ``partial=True`` an operation
@@ -1224,6 +1241,7 @@ class SomniMemory:
         minimum = 0 if allow_empty else 1
         if not isinstance(operations, list) or not minimum <= len(operations) <= 32:
             raise MemoryError(f"dream proposal needs {minimum}-32 operations")
+        usage = _usage(usage)
         proposal_bytes = canonical(proposal).encode("utf-8")
         if len(proposal_bytes) > MAX_INPUT_BYTES:
             raise MemoryError("dream proposal exceeds byte limit")
@@ -1250,7 +1268,7 @@ class SomniMemory:
             if not prepared and operations:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected,
-                               author=(actions or {}).get("author", "dream"), snapshot=snapshot)
+                               author=(actions or {}).get("author", "dream"), snapshot=snapshot, usage=usage)
             self._load_locked(force=True)
             if self.dreams[-1].get("actions"):
                 self.write_action_files(self.dreams[-1]["actions"])
@@ -1438,7 +1456,7 @@ class SomniMemory:
             raise MemoryError("unknown dream operation")
         return next_claim
 
-    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None):
+    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None, usage=None):
         learning = [body for op, body in prepared if op == "ledger_propose"]
         words = [body for op, body in prepared if op == "action"]
         prepared = [(op, body) for op, body in prepared if op not in {"ledger_propose", "action"}]
@@ -1479,6 +1497,8 @@ class SomniMemory:
             dream["author"] = author
         if snapshot is not None:
             dream["live"] = True  # a daydream: committed while recording continued past its snapshot
+        if usage:
+            dream["usage"] = usage  # what the dreaming model reported spending, up to this submission
         if learning:
             dream["learning"] = learning
             dream["operation_count"] += len(learning)
@@ -2038,8 +2058,10 @@ def _dream_summary(dream):
                                                            for k, v in e.get("broken_dependents", {}).items()}) else {}),
             **({"rejected": dream["rejected"]} if dream.get("rejected") else {}),
             **({"live": True} if dream.get("live") else {}),
+            **({"usage": dream["usage"]} if dream.get("usage") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
-            "operation_count": dream["operation_count"], "transcript_head": dream["transcript_head"]}
+            "operation_count": dream["operation_count"], "transcript_count": dream["transcript_count"],
+            "transcript_head": dream["transcript_head"]}
 
 
 def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORDS,
@@ -2114,7 +2136,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             options = _dream_actions(args)
             options["reserved"] = sorted(set(options["reserved"]) | set(memory.load().action_tool_catalog()))
         dream = memory.dream(json.loads(proposal), partial=True, allow_empty=True, viewed_images=viewed,
-                             learning=learning, actions=options, snapshot=daydream)
+                             learning=learning, actions=options, snapshot=daydream, usage=args.get("usage"))
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
         return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning,

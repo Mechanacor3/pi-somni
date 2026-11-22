@@ -315,12 +315,14 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(len(memory.dreams), 1, "the daydream did not commit a pass")
         live = memory.dreams[0]
         self.assertTrue(live["live"])
+        self.assertGreaterEqual(live["usage"]["calls"], 1)  # the worker reports what it spent
         self.assertEqual(memory.state["phase"], "open")  # the owning session kept recording throughout
         self.assertIn("n000001", memory.claims)
         # The next turn carries the notice and the new claim.
         self.pi.prompt("Anything else?")
         injected = "\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"])
-        self.assertIn("Somni daydream d000001: +1 claim(s)", injected)
+        self.assertRegex(injected, r"Somni daydream d000001: \+1 claim\(s\), 0 merged, 0 rejected "
+                                   r"\(records up to \d+, \$\d+\.\d\d, \d+k tok, \d+s\)")
         self.assertIn("Economy cancellation fees have a $50 floor.", injected)
         self.assertGreater(len(SomniMemory(store, "pi").load().transcript), live["transcript_count"])
 
@@ -492,7 +494,7 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(status["active_claims_by_status"], {"uncertain": 0, "verified": 1})
         self.assertEqual(status["last_pass"], {
             "id": "d000001", "transcript_head": status["transcript_head"], "operation_count": 1,
-            "added_count": 1, "rejected_count": 0, "merged_count": 0,
+            "transcript_count": status["transcript_count"], "added_count": 1, "rejected_count": 0, "merged_count": 0,
         })
 
     def test_print_dream_reports_summary_and_fails_when_model_skips_the_pass(self):

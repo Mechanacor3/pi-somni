@@ -65,6 +65,19 @@ class DaydreamTest(unittest.TestCase):
         reloaded = SomniMemory(self.ws, "s").load()
         self.assertEqual((len(reloaded.transcript), len(reloaded.dreams), reloaded.state["phase"]), (5, 1, "open"))
 
+    def test_passes_record_reported_usage(self):
+        usage = {"input": 41000, "output": 2100, "cacheRead": 30000, "cacheWrite": 0, "totalTokens": 73100,
+                 "cost": 0.2134567, "calls": 3, "duration_ms": 48211}
+        dream = SomniMemory(self.ws, "s").load().dream({"schema": 1, "operations": [add("t000001", '"echo":1')]},
+                                                       snapshot=3, usage=usage)
+        self.assertEqual(dream["usage"], {**usage, "cost": 0.213457})
+        from somni.store import _dream_summary
+        self.assertEqual(_dream_summary(dream)["usage"]["totalTokens"], 73100)
+        for bad in ({"tokens": 1}, {"cost": -1}, {"input": True}, {"cost": float("nan")}):
+            with self.subTest(bad), self.assertRaisesRegex(SomniError, "usage"):
+                SomniMemory(self.ws, "s").load().dream({"schema": 1, "operations": [add("t000002", '"echo":2')]},
+                                                       snapshot=3, usage=bad)
+
     def test_daydream_backend_runs_beside_the_recording_owner(self):
         self.m.set_phase("closed")
         owner = Backend(self.ws, "--record")

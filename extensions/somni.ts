@@ -69,6 +69,7 @@ const DAYDREAMS = !DAYDREAM_CHILD && (DAYDREAM_TURNS > 0 || DAYDREAM_MINUTES > 0
 const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what just happened in the latest records. Add or " +
 	"correct claims, and define, revise or retire action words, from what the newest records show. Keep the pass small; " +
 	"leave wiki pages to the night dream";
+const AUTH_ERROR = /\b(401|403)\b|unauthori[sz]ed|authenticat|token expired|credential|not logged in|api key/i;
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try"]);
 const MAX_INDEX_QUERY_BYTES = 65_536;
 const MAX_RECORD_BYTES = 8000;
@@ -106,6 +107,7 @@ const state = {
 	words: new Map<string, string>(), // registered action word -> source
 	wordCalls: new Set<string>(), // tool call IDs of running action words
 	workspace: "",
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, calls: 0 },
 };
 const day = {
 	child: undefined as ChildProcess | undefined,
@@ -350,8 +352,14 @@ export default function (pi: ExtensionAPI) {
 				const pass = after.last_pass;
 				if (pass && pass.id !== before && pass.live) {
 					const words = pass.action_count ? `, ${pass.action_count} action word change(s)` : "";
+					const u = pass.usage;
+					const spent = u ? `, $${u.cost.toFixed(2)}, ${Math.round(u.totalTokens / 1000)}k tok, ` +
+						`${Math.round((u.duration_ms ?? 0) / 1000)}s` : "";
 					day.notice = `Somni daydream ${pass.id}: +${pass.added_count ?? 0} claim(s), ${pass.merged_count ?? 0} merged` +
-						`${words}, ${pass.rejected_count} rejected (records up to ${pass.transcript_count}).`;
+						`${words}, ${pass.rejected_count} rejected (records up to ${pass.transcript_count}${spent}).`;
+				} else if (AUTH_ERROR.test(stderr)) {
+					day.notice = "Somni daydream skipped: auth. The daydream's Pi could not authenticate with its provider. " +
+						clip(stderr.trim().split("\n").slice(-2).join(" "), 240);
 				} else {
 					day.notice = `Somni daydream made no pass (${signal ? `stopped by ${signal}` : `exit ${code}`}). ` +
 						clip(stderr.trim().split("\n").slice(-3).join(" "), 300);
@@ -647,6 +655,8 @@ ${candidateGuide(candidates)}`;
 			try {
 				const out = await backend.request<DreamResult>("dream", {
 					proposal_json: params.proposal_json,
+					// A daydream worker reports what it spent up to this submission; it lands on the live pass.
+					...(DAYDREAM_CHILD ? { usage: { ...state.usage, duration_ms: Math.round(process.uptime() * 1000) } } : {}),
 					...(ACTIONS ? {
 						tools: pi.getAllTools().map((tool) => tool.name).filter((name) => !state.words.has(name)),
 						action_allow: ACTION_ALLOW ?? null,
@@ -746,6 +756,17 @@ ${candidateGuide(candidates)}`;
 
 	pi.on("agent_settled", async () => {
 		if (state.dream) await finishDream(state.dream);
+	});
+
+	pi.on("message_end", (event: any) => {
+		const usage = event.message?.role === "assistant" ? event.message.usage : undefined;
+		if (!usage) return;
+		const total = state.usage;
+		for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
+			total[key] += Number.isFinite(usage[key]) ? usage[key] : 0;
+		}
+		total.cost += Number.isFinite(usage.cost?.total) ? usage.cost.total : 0;
+		total.calls += 1;
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
