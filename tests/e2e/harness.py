@@ -59,6 +59,14 @@ class FakeUpstream:
                     reply = outer.script(body, index)
                 except Exception as exc:  # surface script bugs in the transcript
                     reply = {"text": f"SCRIPT ERROR {exc!r}"}
+                if "http_error" in reply:  # a provider failure, e.g. quota or 5xx
+                    payload = json.dumps({"error": {"message": reply.get("text", "provider error"), "type": "test"}}).encode()
+                    self.send_response(reply["http_error"])
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 base = {"id": f"c{index}", "object": "chat.completion.chunk", "created": 0, "model": body.get("model")}
                 if "tool_calls" in reply:
                     calls = [{"index": i, "id": f"call_{index}_{i}", "type": "function",

@@ -102,6 +102,39 @@ class DreamRobustness(unittest.TestCase):
         with self.assertRaisesRegex(SomniError, r'exactly \{"schema": 1, "operations": \[\.\.\.\]\}; got keys ops, schema'):
             self.request("dream", {"proposal_json": '{"schema": 1, "ops": []}'}, set())
 
+    def test_failed_dreams_are_logged_and_counted_by_cause(self):
+        self.assertEqual(self.m.status()["dream_failures"], {"total": 0, "by_cause": {}, "by_kind": {}})
+        for cause, kind in (("provider_error", "dream"), ("no_submission", "dream"), ("all_rejected", "wiki"),
+                            ("budget_exhausted", "daydream"), ("provider_error", "daydream"), ("timeout", "daydream")):
+            self.request("dream_failure", {"cause": cause, "kind": kind, "detail": f"{cause}  happened\n", "reads": 5}, set())
+        status = SomniMemory(self.ws, "s").load().status()["dream_failures"]
+        self.assertEqual(status["total"], 6)
+        self.assertEqual(status["by_cause"], {"all_rejected": 1, "budget_exhausted": 1, "no_submission": 1,
+                                              "provider_error": 2, "timeout": 1})
+        self.assertEqual(status["by_kind"], {"daydream": 3, "dream": 2, "wiki": 1})
+        self.assertEqual({k: status["last"][k] for k in ("cause", "kind", "detail", "reads", "transcript_count")},
+                         {"cause": "timeout", "kind": "daydream", "detail": "timeout happened", "reads": 5,
+                          "transcript_count": 3})
+        logged = _handle_request(self.m, "dream_failure", {"cause": "other", "kind": "dream"}, writable=True,
+                                 viewed=set(), context={"run_label": "task 7"})
+        self.assertEqual(logged["run_label"], "task 7")
+        for bad in ({"cause": "bored", "kind": "dream"}, {"cause": "other", "kind": "nap"},
+                    {"cause": "other", "kind": "dream", "reads": -1}, {"cause": "other", "kind": "dream", "extra": 1}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(SomniError, "dream failure"):
+                self.request("dream_failure", bad, set())
+        # The chained logs are untouched: the failure log is diagnostics beside them.
+        self.assertEqual(SomniMemory(self.ws, "s").load().state["dream_count"], 0)
+
+    def test_the_failure_log_is_bounded_and_keeps_counting(self):
+        from unittest.mock import patch
+        with patch("somni.store.MAX_FAILURES_BYTES", 2000):
+            for _ in range(40):
+                self.request("dream_failure", {"cause": "provider_error", "kind": "dream", "detail": "x" * 40}, set())
+        status = self.m.status()["dream_failures"]
+        self.assertEqual(status["total"], 40)
+        self.assertGreater(status["dropped"], 0)
+        self.assertLessEqual((self.m.store / "dream-failures.jsonl").stat().st_size, 2000)
+
 
 if __name__ == "__main__":
     unittest.main()

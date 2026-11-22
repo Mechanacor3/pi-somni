@@ -543,6 +543,26 @@ class SomniPiEndToEnd(unittest.TestCase):
         memory = SomniMemory(self.work / ".pi" / "somni", "pi").load()
         self.assertEqual([c["text"] for c in memory.claims.values()], ["Look up the fee first."])
 
+    def test_failed_dreams_are_logged_by_cause(self):
+        self.pi.prompt("What is the fee")
+        bad = {"op": "add", "text": "Bad quote.", "status": "verified", "evidence": [{"ref": "t000002", "quote": "nope"}]}
+        plans = dict(PLANS)
+        self.upstream.script = plan_script(plans)
+        store = self.work / ".pi" / "somni"
+        for kind, plan in (("no_submission", [[("somni_search", {"query": "fee"})]]),
+                           ("all_rejected", [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [bad]})})]]),
+                           ("provider_error", [{"http_error": 400, "text": "quota exhausted for this test"}])):
+            plans["Dream pass."] = plan
+            self.pi.prompt(f"/somni-dream {kind}")
+            self.pi.read(lambda r: r.get("type") == "agent_settled")
+        status = SomniMemory(store, "pi").load().status()["dream_failures"]
+        self.assertEqual(status["by_cause"], {"all_rejected": 1, "no_submission": 1, "provider_error": 1})
+        self.assertEqual(status["by_kind"], {"dream": 3})
+        self.assertIn("quota exhausted for this test", status["last"]["detail"])
+        log = [json.loads(line) for line in (store / "somni-v1" / "dream-failures.jsonl").read_text().splitlines()]
+        self.assertEqual([(e["cause"], e["reads"], e["submissions"]) for e in log],
+                         [("no_submission", 1, 0), ("all_rejected", 0, 1), ("provider_error", 0, 0)])
+
     def test_print_dream_reports_summary_and_fails_when_model_skips_the_pass(self):
         self.pi.close()
         self.upstream.script = plan_script({})

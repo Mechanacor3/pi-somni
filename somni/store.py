@@ -34,6 +34,7 @@ append only text the agent itself already saw or produced.
 import argparse
 import base64
 import binascii
+import datetime as _dt
 from collections import Counter
 from contextlib import contextmanager
 from copy import deepcopy
@@ -101,6 +102,11 @@ ACTIONS_DIR = "actions"
 ACTION_OPS = frozenset({"define_action", "revise_action", "retire_action"})
 MAX_ACTION_FILE_BYTES = 16384
 ACTION_TOOLS_FILE = "action-tools.json"  # tool declarations seen in recording sessions; a cache, not evidence
+FAILURES_FILE = "dream-failures.jsonl"  # dream attempts that committed nothing; diagnostics, not evidence
+FAILURE_CAUSES = ("provider_error", "no_submission", "all_rejected", "invalid_submission", "budget_exhausted",
+                  "timeout", "other")
+FAILURE_KINDS = ("dream", "wiki", "daydream")
+MAX_FAILURES_BYTES = 1 << 20  # past this the oldest half is dropped; the counts say how many were dropped
 MAX_ACTION_TOOLS = 256
 MAX_ACTION_TOOL_SCHEMA_BYTES = 4096
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
@@ -1704,6 +1710,75 @@ class SomniMemory:
         """The current lexicon: define/revise/retire events from every committed pass, in order."""
         return _action_module().fold(event for dream in self.dreams for event in dream.get("actions", ()))
 
+    def record_dream_failure(self, failure, context=None):
+        """Log a dream attempt that committed nothing: its cause and what it had used.
+
+        The log sits beside the hash-chained logs, not in them: it describes the dreamer, not the subject.
+        """
+        if not isinstance(failure, dict) or set(failure) - {"cause", "kind", "detail", "reads", "submissions", "images"}:
+            raise MemoryError("a dream failure is {cause, kind, detail?, reads?, submissions?, images?}")
+        if failure.get("cause") not in FAILURE_CAUSES or failure.get("kind") not in FAILURE_KINDS:
+            raise MemoryError(f"dream failure cause must be one of {', '.join(FAILURE_CAUSES)} "
+                              f"and kind one of {', '.join(FAILURE_KINDS)}")
+        detail = failure.get("detail", "")
+        if not isinstance(detail, str):
+            raise MemoryError("dream failure detail must be text")
+        entry = {"at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"), "cause": failure["cause"],
+                 "kind": failure["kind"], "detail": " ".join(detail.split())[:500]}
+        for key in ("reads", "submissions", "images"):
+            value = failure.get(key, 0)
+            if type(value) is not int or not 0 <= value <= 10_000:
+                raise MemoryError(f"dream failure {key} must be a count")
+            entry[key] = value
+        with self._locked():
+            self._load_locked()
+            entry["transcript_count"] = self.state["transcript_count"]
+            if (context or {}).get("run_label") is not None:
+                entry["run_label"] = str(context["run_label"])[:200]
+            path = self.store / FAILURES_FILE
+            _no_symlink(path)
+            line = json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
+            if path.exists() and path.stat().st_size + len(line) > MAX_FAILURES_BYTES:
+                # Keep the newest half; a header line carries the count of every entry dropped so far.
+                old = self._failure_rows(path.read_text(encoding="utf-8").splitlines())
+                kept = old["entries"][len(old["entries"]) // 2:]
+                header = {"dropped": old["dropped"] + len(old["entries"]) - len(kept)}
+                _write_text_atomic(path, "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                                                 for row in [header, *kept]))
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return entry
+
+    @staticmethod
+    def _failure_rows(rows):
+        out = {"dropped": 0, "entries": []}
+        for row in rows:
+            try:
+                value = json.loads(row)
+            except ValueError:
+                continue
+            if isinstance(value, dict) and set(value) == {"dropped"} and type(value["dropped"]) is int:
+                out["dropped"] += value["dropped"]
+            elif isinstance(value, dict) and value.get("cause") in FAILURE_CAUSES:
+                out["entries"].append(value)
+        return out
+
+    def dream_failures(self):
+        """Counts of failed dream attempts by cause (and kind), with the latest one."""
+        path = self.store / FAILURES_FILE
+        if not path.is_file():
+            return {"total": 0, "by_cause": {}, "by_kind": {}}
+        rows = self._failure_rows(path.read_text(encoding="utf-8").splitlines())
+        by_cause, by_kind = {}, {}
+        for entry in rows["entries"]:
+            by_cause[entry["cause"]] = by_cause.get(entry["cause"], 0) + 1
+            by_kind[entry.get("kind", "dream")] = by_kind.get(entry.get("kind", "dream"), 0) + 1
+        return {"total": len(rows["entries"]) + rows["dropped"], "by_cause": dict(sorted(by_cause.items())),
+                "by_kind": dict(sorted(by_kind.items())), **({"dropped": rows["dropped"]} if rows["dropped"] else {}),
+                **({"last": rows["entries"][-1]} if rows["entries"] else {})}
+
     def record_action_tools(self, tools):
         """Remember the tools a recording session can call, so later dreams (which may run
         without those tools, e.g. without an MCP server) can write words for them."""
@@ -2032,6 +2107,7 @@ class SomniMemory:
             "transcript_live_records": self.state["transcript_count"]
             - sum(segment["count"] for segment in self._segments("transcript.jsonl")),
             "limits": {key: self._limit(key) for key in LIMIT_KEYS},
+            "dream_failures": self.dream_failures(),
         }
 
     def report(self):
@@ -2341,6 +2417,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         return {"sha256": digest, "image": image} if args.get("resolve") else image
     elif method == "dream_images":
         return len(viewed)
+    elif method == "dream_failure":
+        return memory.record_dream_failure(args, context)
     elif method == "wiki":
         # With python -I, explicitly add this package's root for the formatter.
         root = str(pathlib.Path(__file__).resolve().parent.parent)

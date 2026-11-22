@@ -120,7 +120,9 @@ function callTimeline(calls: CallTiming[]) {
 	return shown.join(", ") + (calls.length > shown.length ? `, ... ${calls.length - shown.length} more` : "");
 }
 type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; result?: unknown };
-type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string };
+type DreamKind = "dream" | "wiki" | "daydream";
+type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string;
+	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string };
 const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
 	backend: undefined as Backend | undefined,
@@ -294,13 +296,33 @@ export default function (pi: ExtensionAPI) {
 		if (run.result?.action_count && lastCtx) await registerWords(lastCtx);
 	}
 
-	async function startDream(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>) {
+	/** Why a dream committed nothing, for the store's dream_failures log. */
+	function failureOf(run: DreamRun, error: Error) {
+		if (run.providerError) return { cause: "provider_error", detail: run.providerError };
+		if (run.exhausted) return { cause: "budget_exhausted", detail: `${run.exhausted} limit reached. ${run.error ?? ""}` };
+		if (run.error) return { cause: run.error.startsWith("nothing committed: all") ? "all_rejected" : "invalid_submission", detail: run.error };
+		if (run.submissions === 0) return { cause: "no_submission", detail: error.message };
+		return { cause: "other", detail: error.message };
+	}
+
+	async function recordFailure(failure: { cause: string; detail: string }, kind: DreamKind, run?: DreamRun) {
+		try {
+			const images = run ? await getBackend().request<number>("dream_images", {}) : 0;
+			await getBackend().request("dream_failure", { ...failure, detail: clip(failure.detail, 500), kind,
+				reads: Math.min(run?.reads ?? 0, 10_000), submissions: Math.min(run?.submissions ?? 0, 10_000), images });
+		} catch {
+			// Diagnostics only: a failed log write must not hide the dream's own error.
+		}
+	}
+
+	async function startDream(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
+			kind: "dream" | "wiki") {
 		const headless = ctx.mode === "print" || ctx.mode === "json";
 		let run: DreamRun | undefined;
 		try {
 			const backend = requireWriteAccess();
 			if (state.dream || !ctx.isIdle()) throw new Error("Wait for the current Pi turn to settle first.");
-			run = { submitting: false, reads: 0, submissions: 0 };
+			run = { submitting: false, reads: 0, submissions: 0, kind: DAYDREAM_CHILD ? "daydream" : kind };
 			state.dream = run;
 			const content = await load();
 			if (content === undefined) {
@@ -310,19 +332,22 @@ export default function (pi: ExtensionAPI) {
 			// A daydream worker leaves the phase alone: the owning session is still recording.
 			if (!DAYDREAM_CHILD) await backend.request("phase", { phase: "closed" });
 			// A triggered custom message starts the turn before waitForIdle checks Pi's state.
+			run.started = true;
 			pi.sendMessage({ customType: "somni-dream-input", content, display: false }, { triggerTurn: true });
 			await ctx.waitForIdle();
 			if (!run.result) throw new Error(run.error ?? "The dream ended without a committed pass. The model must call somni_dream.");
 		} catch (error) {
 			if (headless) process.exitCode = 1;
+			if (run?.started && !run.result) await recordFailure(failureOf(run, error as Error), run.kind, run);
 			notify(ctx, `Somni dream failed. ${(error as Error).message}`);
 		} finally {
 			if (run) await finishDream(run);
 		}
 	}
 
-	function submitCommand(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>) {
-		const task = startDream(ctx, load);
+	function submitCommand(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
+			kind: "dream" | "wiki") {
+		const task = startDream(ctx, load, kind);
 		if (ctx.mode === "json" || ctx.mode === "print") return task;
 		// RPC clients get the handled reply first and can then wait for agent_settled.
 		void task.catch((error: Error) => notify(ctx, `Somni dream cleanup failed. ${error.message}`));
@@ -364,7 +389,8 @@ export default function (pi: ExtensionAPI) {
 		});
 		day.child = child;
 		child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
-		const timeout = setTimeout(() => child.kill("SIGTERM"), DAYDREAM_TIMEOUT_MS);
+		let timedOut = false;
+		const timeout = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, DAYDREAM_TIMEOUT_MS);
 		child.on("error", (error) => { stderr += ` ${error.message}`; });
 		child.on("close", async (code, signal) => {
 			clearTimeout(timeout);
@@ -383,6 +409,7 @@ export default function (pi: ExtensionAPI) {
 					day.notice = "Somni daydream skipped: auth. The daydream's Pi could not authenticate with its provider. " +
 						clip(stderr.trim().split("\n").slice(-2).join(" "), 240);
 				} else {
+					if (timedOut) await recordFailure({ cause: "timeout", detail: `stopped after ${DAYDREAM_TIMEOUT_MS / 1000}s` }, "daydream");
 					day.notice = `Somni daydream made no pass (${signal ? `stopped by ${signal}` : `exit ${code}`}). ` +
 						clip(stderr.trim().split("\n").slice(-3).join(" "), 300);
 				}
@@ -766,7 +793,7 @@ ${candidateGuide(candidates)}`;
 				content.push(...asText(`Screenshot for [${ref}] image_sha256=${sha256}`), image);
 			}
 			return content;
-		}),
+		}, "dream"),
 	});
 
 	pi.registerCommand("somni-wiki", {
@@ -783,7 +810,7 @@ ${candidateGuide(candidates)}`;
 			return `Wiki pass. Goal: ${goal}. ${info.guide} Gather the claims below into pages and call somni_dream once with ` +
 					`page operations: {"op":"page","slug":"lowercase-hyphenated or folder/page","title":...,"body":markdown citing [nXXXXXX] and ` +
 					`linking [[slug]],"claims":[...]}. Extend an existing page by reusing its slug.\n\n## Existing pages\n${info.pages}\n\n## Claims not yet on a page\n${info.claims}`;
-		}),
+		}, "wiki"),
 	});
 
 	pi.on("agent_settled", async () => {
@@ -791,6 +818,10 @@ ${candidateGuide(candidates)}`;
 	});
 
 	pi.on("message_end", (event: any) => {
+		const run = state.dream;
+		if (run && event.message?.role === "assistant" && event.message.stopReason === "error") {
+			run.providerError = String(event.message.errorMessage ?? "provider error").slice(0, 500);
+		}
 		const usage = event.message?.role === "assistant" ? event.message.usage : undefined;
 		if (!usage) return;
 		const total = state.usage;
@@ -906,9 +937,11 @@ ${candidateGuide(candidates)}`;
 		}
 		if (event.toolName === "somni_dream") {
 			if (++run.submissions > DREAM_MAX_SUBMISSIONS) {
+				run.exhausted = "submission";
 				return { block: true, reason: `Dream submission limit reached (${DREAM_MAX_SUBMISSIONS}); this dream ends without a pass.` };
 			}
 		} else if (++run.reads > DREAM_MAX_READS) {
+			run.exhausted = "read";
 			return { block: true, reason: `Dream evidence read limit reached (${DREAM_MAX_READS} reads). Submit the pass now with ` +
 				"somni_dream; you can still cite every record you have already read." };
 		}
