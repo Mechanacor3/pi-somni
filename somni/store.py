@@ -8,6 +8,8 @@ Layers (all under `<workspace>/somni-v1/`):
 
   transcript.jsonl  canonical, hash-chained, append-only record of what the agent
                     saw (observations, tool results) and said (its own output).
+  segments/         sealed, immutable older parts of the transcript, notes and dream
+                    logs; each chain runs on across its segments into the live file.
   notes.jsonl       agent-authored claims.  Every claim cites transcript records;
                     `verified` claims cite exact excerpts or stored images.
   images/           bounded, content-addressed attachments for tool results.
@@ -59,9 +61,12 @@ MAX_NOTE_BYTES = 4_096
 MAX_GIST_BYTES = 160
 MAX_INPUT_BYTES = 65_536
 MAX_CLAIMS = 512
-MAX_TRANSCRIPT_RECORDS = 4_096
-MAX_DREAM_PASSES = 512
-MAX_LOG_BYTES = 16 * 1024 * 1024
+MAX_TRANSCRIPT_RECORDS = 65_536
+MAX_DREAM_PASSES = 4_096
+MAX_LOG_BYTES = 16 * 1024 * 1024  # per file; long logs are sealed into segments well before this
+SEGMENT_DIR = "segments"
+SEGMENT_BYTES = 8 * 1024 * 1024  # seal a live log before an append takes it past this
+SEGMENTED_LOGS = ("transcript.jsonl", "notes.jsonl", "dreams.jsonl")
 MAX_INJECTION_BYTES = 8_192
 DEFAULT_DREAM_RECORD_BYTES = 1_500
 DEFAULT_DREAM_RECORDS = 120
@@ -74,7 +79,8 @@ MAX_BACKEND_REQUEST = 512 * 1024 + MAX_RECORD_IMAGES * ((MAX_IMAGE_INPUT + 2) //
 IMAGE_SUFFIX = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 # Per-store overrides (set once at create time, recorded in the manifest).
-LIMIT_KEYS = {"max_transcript_records": 65_536, "max_claims": 4_096, "max_record_bytes": 32_768}
+LIMIT_KEYS = {"max_transcript_records": 1_048_576, "max_claims": 4_096, "max_record_bytes": 32_768,
+              "max_dream_passes": 1_048_576}
 DEFAULT_INJECTION_BYTES = 4_096
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CLAIM_ID = re.compile(r"^n[0-9]{6}$")
@@ -369,6 +375,11 @@ def _read_log(path, committed_size=None):
     return records
 
 
+class _Horizon(dict):
+    """Records visible to a daydream, with the last ID it may cite."""
+    horizon = None
+
+
 class SomniMemory:
     def __init__(self, workspace, subject_id, *, scheduled_verification=False):
         raw = pathlib.Path(workspace)
@@ -439,7 +450,7 @@ class SomniMemory:
         if key in limits:
             return limits[key]
         return {"max_transcript_records": MAX_TRANSCRIPT_RECORDS, "max_claims": MAX_CLAIMS,
-                "max_record_bytes": MAX_RECORD_BYTES}[key]
+                "max_record_bytes": MAX_RECORD_BYTES, "max_dream_passes": MAX_DREAM_PASSES}[key]
 
     def load(self):
         if not self.store.is_dir():
@@ -495,9 +506,9 @@ class SomniMemory:
         journal = self.store / ".transaction.json"
         if os.path.lexists(journal):
             self._recover_transaction(journal, state)
-        transcript = _read_log(self.store / "transcript.jsonl")
-        notes = _read_log(self.store / "notes.jsonl")
-        dreams = _read_log(self.store / "dreams.jsonl")
+        transcript = self._read_chain("transcript.jsonl", state)
+        notes = self._read_chain("notes.jsonl", state)
+        dreams = self._read_chain("dreams.jsonl", state)
         self._check_chain(transcript, "transcript", state["transcript_count"], state["transcript_head"])
         self._check_chain(notes, "notes", state["note_events"], state["notes_head"])
         self._check_chain(dreams, "dreams", state["dream_count"], state["dreams_head"])
@@ -519,6 +530,95 @@ class SomniMemory:
             self._clear_transaction(journal)
         return self
 
+    # --- Segments: long logs are sealed into immutable, hash-checked files; the chain runs across them. ---
+
+    def _segments(self, name, state=None):
+        segments = ((state or self.state).get("segments") or {}).get(name, [])
+        if not isinstance(segments, list):
+            raise MemoryError("invalid segment list in state")
+        return segments
+
+    def _sealed_records(self, name, state):
+        cache = self.__dict__.setdefault("_segment_cache", {})
+        records = []
+        for segment in self._segments(name, state):
+            if not (isinstance(segment, dict) and isinstance(segment.get("file"), str)
+                    and re.fullmatch(r"[a-z]+-[0-9]{6}\.jsonl", segment["file"])):
+                raise MemoryError("invalid segment entry in state")
+            path = self.store / SEGMENT_DIR / segment["file"]
+            _no_symlink(path)
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                raise MemoryError(f"missing sealed segment {segment['file']}") from None
+            key = (segment["file"], info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, segment["sha256"])
+            if cache.get(segment["file"], (None,))[0] != key:
+                data = _read_regular(path, MAX_LOG_BYTES)
+                if sha(data) != segment["sha256"]:
+                    raise MemoryError(f"sealed segment {segment['file']} does not match its recorded hash")
+                part = _read_log(path)
+                if len(part) != segment["count"] or (part and sha(part[-1]) != segment["head"]):
+                    raise MemoryError(f"sealed segment {segment['file']} does not match state")
+                cache[segment["file"]] = (key, part)
+            records.extend(cache[segment["file"]][1])
+        return records
+
+    def _read_chain(self, name, state):
+        sealed = self._sealed_records(name, state)
+        live_path = self.store / name
+        live = _read_log(live_path)
+        segments = self._segments(name, state)
+        count_key, _ = LOG_STATE[name]
+        if segments and len(sealed) == state[count_key] and live and len(live) == segments[-1]["count"] \
+                and sha(_read_regular(live_path, MAX_LOG_BYTES)) == segments[-1]["sha256"]:
+            # A seal was interrupted after state recorded the segment: finish truncating the live log.
+            fd = os.open(live_path, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.ftruncate(fd, 0)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            live = []
+        return sealed + live
+
+    def _seal(self, name):
+        """Move the live log into segments/ and start an empty live log, without breaking the chain."""
+        live_path = self.store / name
+        data = _read_regular(live_path, MAX_LOG_BYTES)
+        if not data:
+            return
+        folder = self.store / SEGMENT_DIR
+        _no_symlink(folder)
+        folder.mkdir(mode=0o700, exist_ok=True)
+        segments = self._segments(name)
+        count_key, head_key = LOG_STATE[name]
+        file = f"{name.split('.')[0]}-{len(segments) + 1:06d}.jsonl"
+        fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=folder)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, folder / file)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        _sync_directory(folder)
+        snapshot, self._verified = self._verified, None
+        live_count = self.state[count_key] - sum(segment["count"] for segment in segments)
+        state = deepcopy(self.state)
+        state.setdefault("segments", {}).setdefault(name, []).append(
+            {"file": file, "count": live_count, "head": self.state[head_key], "sha256": sha(data)})
+        self.state = state
+        self._save_state()
+        fd = os.open(live_path, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.ftruncate(fd, 0)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._accept_local_write(snapshot, ("state.json", name))
+
     def _recover_transaction(self, journal, state):
         pending = _read_json(journal)
         if not isinstance(pending, dict) or set(pending) != {"before", "after", "offsets"}:
@@ -536,7 +636,7 @@ class SomniMemory:
         # Verify all committed prefixes before removing any interrupted append.
         for name, size in offsets.items():
             count, head = LOG_STATE[name]
-            prefix = _read_log(self.store / name, size)
+            prefix = self._sealed_records(name, state) + _read_log(self.store / name, size)
             self._check_chain(prefix, name, state.get(count, 0), state.get(head, ZERO_HASH))
         for name, size in offsets.items():
             fd = os.open(self.store / name, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -573,7 +673,10 @@ class SomniMemory:
                 raise MemoryError("evidence must contain ref and optional quote or image_sha256")
             ref, quote = item.get("ref"), item.get("quote")
             if not isinstance(ref, str) or not EVIDENCE_ID.fullmatch(ref) or ref not in records or ref in seen:
-                raise MemoryError("evidence reference is missing, duplicated, or unknown")
+                horizon = getattr(records, "horizon", None)
+                beyond = horizon and isinstance(ref, str) and EVIDENCE_ID.fullmatch(ref) and ref > horizon
+                raise MemoryError(f"evidence reference {ref!r} is after this daydream's snapshot ({horizon})" if beyond
+                                  else f"evidence reference {ref!r} is missing, duplicated, or unknown")
             if quote is not None and (not isinstance(quote, str) or not quote or quote not in records[ref]["text"]):
                 raise MemoryError("evidence quote must occur exactly in the referenced transcript")
             digest = item.get("image_sha256")
@@ -916,6 +1019,10 @@ class SomniMemory:
             self._verified = snapshot
 
     def _commit_logs(self, entries, next_state):
+        for name, values in entries.items():
+            if name in SEGMENTED_LOGS and (self.store / name).stat().st_size + sum(map(len, values)) > SEGMENT_BYTES:
+                self._seal(name)
+                next_state = {**next_state, "segments": self.state["segments"]}
         journal = self.store / ".transaction.json"
         offsets = {name: _preflight_append(self.store / name, values) for name, values in entries.items()}
         snapshot, self._verified = self._verified, None
@@ -1094,7 +1201,8 @@ class SomniMemory:
             self.claims[replaces]["superseded_by"] = claim_id
         return claim_id
 
-    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False, actions=None):
+    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False, actions=None,
+              snapshot=None):
         """Apply one offline consolidation pass.
 
         By default the pass is all-or-nothing.  With ``partial=True`` an operation
@@ -1105,6 +1213,10 @@ class SomniMemory:
 
         ``actions`` enables action-word operations: ``{"allow": names or None,
         "reserved": session tool names, "author": "dream" or "human"}``.
+
+        ``snapshot`` (a transcript count H) makes this a live pass, a daydream: it may run
+        while a session keeps recording, may cite only records 1..H, and is bound to the
+        transcript head at H rather than the current head.
         """
         if not isinstance(proposal, dict) or proposal.get("schema") != SCHEMA or set(proposal) != {"schema", "operations"}:
             raise MemoryError("dream proposal must contain schema and operations")
@@ -1117,15 +1229,28 @@ class SomniMemory:
             raise MemoryError("dream proposal exceeds byte limit")
         with self._locked():
             self._load_locked()
-            if self.state["phase"] != "closed":
+            if snapshot is None and self.state["phase"] != "closed":
                 raise MemoryError("dreaming is offline-only; close the subject session first")
-            if self.state["dream_count"] >= MAX_DREAM_PASSES:
+            if snapshot is not None:
+                if type(snapshot) is not int or not 0 < snapshot <= self.state["transcript_count"]:
+                    raise MemoryError(f"snapshot must be a transcript count in 1..{self.state['transcript_count']}")
+                if learning:
+                    raise MemoryError("learning-ledger passes need a closed session; daydreams cannot run them")
+            if self.state["dream_count"] >= self._limit("max_dream_passes"):
                 raise MemoryError("dream pass limit reached; seal the bounded attempt")
-            prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, learning, actions)
+            records = self._records_by_id
+            if snapshot is not None:
+                # Evidence is limited to the snapshot: records after H do not exist for this pass.
+                self._records_by_id = _Horizon({r["id"]: r for r in self.transcript[:snapshot]})
+                self._records_by_id.horizon = self.transcript[snapshot - 1]["id"]
+            try:
+                prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, learning, actions)
+            finally:
+                self._records_by_id = records
             if not prepared and operations:
                 raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected,
-                               author=(actions or {}).get("author", "dream"))
+                               author=(actions or {}).get("author", "dream"), snapshot=snapshot)
             self._load_locked(force=True)
             if self.dreams[-1].get("actions"):
                 self.write_action_files(self.dreams[-1]["actions"])
@@ -1313,7 +1438,7 @@ class SomniMemory:
             raise MemoryError("unknown dream operation")
         return next_claim
 
-    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream"):
+    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None):
         learning = [body for op, body in prepared if op == "ledger_propose"]
         words = [body for op, body in prepared if op == "action"]
         prepared = [(op, body) for op, body in prepared if op not in {"ledger_propose", "action"}]
@@ -1338,8 +1463,10 @@ class SomniMemory:
             note_events.append(event)
             notes_head = sha(event)
         pass_number = self.state["dream_count"] + 1
-        dream = {"schema": SCHEMA, "seq": pass_number, "transcript_count": self.state["transcript_count"],
-                 "transcript_head": self.state["transcript_head"], "operation_count": len(prepared),
+        count = self.state["transcript_count"] if snapshot is None else snapshot
+        head = self.state["transcript_head"] if snapshot is None else sha(self.transcript[snapshot - 1])
+        dream = {"schema": SCHEMA, "seq": pass_number, "transcript_count": count,
+                 "transcript_head": head, "operation_count": len(prepared),
                  "proposal_sha256": sha(proposal_bytes), "input_bytes": len(proposal_bytes),
                  "input_tokens_estimate": token_estimate(proposal_bytes), "prev_sha256": self.state["dreams_head"]}
         merged = sum(op == "add" and "merged_from" in body for op, body in prepared)
@@ -1350,6 +1477,8 @@ class SomniMemory:
             dream["operation_count"] += len(words)
         if author != "dream":
             dream["author"] = author
+        if snapshot is not None:
+            dream["live"] = True  # a daydream: committed while recording continued past its snapshot
         if learning:
             dream["learning"] = learning
             dream["operation_count"] += len(learning)
@@ -1759,6 +1888,10 @@ class SomniMemory:
             "claim_count": len(self.claims), "dream_count": self.state["dream_count"],
             "last_pass": _dream_summary(self.dreams[-1]) if self.dreams else None,
             "action_words": sorted(self.action_words()),
+            "segments": {name.split(".")[0]: len(self._segments(name)) for name in SEGMENTED_LOGS},
+            "transcript_live_records": self.state["transcript_count"]
+            - sum(segment["count"] for segment in self._segments("transcript.jsonl")),
+            "limits": {key: self._limit(key) for key in LIMIT_KEYS},
         }
 
     def report(self):
@@ -1904,17 +2037,18 @@ def _dream_summary(dream):
             **({"broken_dependents": broken} if (broken := {k: v for e in dream.get("actions", ())
                                                            for k, v in e.get("broken_dependents", {}).items()}) else {}),
             **({"rejected": dream["rejected"]} if dream.get("rejected") else {}),
+            **({"live": True} if dream.get("live") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
             "operation_count": dream["operation_count"], "transcript_head": dream["transcript_head"]}
 
 
 def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORDS,
-            record_bytes=DEFAULT_DREAM_RECORD_BYTES):
+            record_bytes=DEFAULT_DREAM_RECORD_BYTES, head=None):
     if type(record_limit) is not int or not 1 <= record_limit <= DEFAULT_DREAM_RECORDS:
         raise MemoryError(f"dream record limit must be 1-{DEFAULT_DREAM_RECORDS}")
     if type(record_bytes) is not int or not 64 <= record_bytes <= MAX_RECORD_BYTES:
         raise MemoryError(f"dream record excerpt must be 64-{MAX_RECORD_BYTES} bytes")
-    records = memory.transcript[-record_limit:]
+    records = (memory.transcript if head is None else memory.transcript[:head])[-record_limit:]
     attachments = []
     budget = 1024 * 1024
     viewed.clear()
@@ -1948,7 +2082,9 @@ def _action_module():
 
 
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
-                    resize=None, viewed=None, learning=False, actions=False):
+                    resize=None, viewed=None, learning=False, actions=False, daydream=None):
+    if daydream is not None and method in {"phase", "record", "note", "wiki", "action_tools"}:
+        raise MemoryError("a daydream may only read memory and submit its pass")
     if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable:
         raise MemoryError("Somni memory changes require the session that owns recording")
     if method == "phase":
@@ -1978,7 +2114,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             options = _dream_actions(args)
             options["reserved"] = sorted(set(options["reserved"]) | set(memory.load().action_tool_catalog()))
         dream = memory.dream(json.loads(proposal), partial=True, allow_empty=True, viewed_images=viewed,
-                             learning=learning, actions=options)
+                             learning=learning, actions=options, snapshot=daydream)
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
         return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning,
@@ -2037,7 +2173,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
     elif method == "recent":
         return _recent(memory.load(), args.get("include_images", False), viewed,
                        record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
-                       record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES))
+                       record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES), head=daydream)
     elif method == "image":
         ref, digest = args["ref"], args["sha256"]
         image = memory.load().image(ref, digest)
@@ -2107,7 +2243,7 @@ def _dream_actions(args):
     return {"author": "dream", "allow": allow, "reserved": reserved}
 
 
-def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False, actions=False):
+def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False, actions=False, daydream=False):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
 
@@ -2121,6 +2257,27 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
             raise MemoryError("SOMNI_IMAGE_MAX_EDGE requires Pillow in SOMNI_PYTHON") from exc
         resize = (Image, image_max_edge)
     viewed = set()
+    if daydream:
+        # A daydream backend takes no lease: the live session keeps recording. It reads up to the head
+        # it saw at start and may write only its dream pass, under the store lock, bound to that head.
+        memory = SomniMemory(memory.workspace, memory.subject_id, scheduled_verification=True)
+        head = memory.load().state["transcript_count"]
+        if not head:
+            raise MemoryError("nothing to daydream about: the transcript is empty")
+        reply(0, result={"writable": True, "daydream_head": head})
+        while line := sys.stdin.buffer.readline(MAX_BACKEND_REQUEST + 1):
+            if len(line) > MAX_BACKEND_REQUEST:
+                raise MemoryError("Somni backend request exceeds byte limit")
+            request_id = None
+            try:
+                request = json.loads(line)
+                request_id = request["id"]
+                reply(request_id, result=_handle_request(memory, request["method"], request["args"], writable=True,
+                                                         context=context, image_bytes=image_bytes, resize=resize,
+                                                         viewed=viewed, learning=False, actions=actions, daydream=head))
+            except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
+                reply(request_id, error=str(exc))
+        return
     with _recording_lease(memory) as owner:
         if owner is not False and (not os.path.lexists(memory.store) or _seeded_only(memory.store)):
             SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
@@ -2196,6 +2353,7 @@ def parser():
     commands.add_parser("session-open"); commands.add_parser("session-close")
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
     serve.add_argument("--actions", action="store_true")
+    serve.add_argument("--daydream", action="store_true", help="read-only except for one live dream pass; no lease")
     serve.add_argument("--learning", action="store_true")
     serve.add_argument("--record", action="store_true")
     serve.add_argument("--run-label")
@@ -2228,7 +2386,7 @@ def main():
         if args.command == "serve":
             _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
                    image_bytes=args.image_bytes, image_max_edge=args.image_max_edge, learning=args.learning,
-                   actions=args.actions)
+                   actions=args.actions, daydream=args.daydream)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":

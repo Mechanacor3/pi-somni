@@ -222,6 +222,10 @@ the kernel releases it directly. The next writer verifies the chain and recovers
 transaction on startup. PID namespaces do not affect ownership on the same mounted store.
 Leave the lock file in place so concurrent sessions lock the same file.
 The extension can be mounted read-only with `SOMNI_WORKSPACE` on a separate writable mount.
+
+**Long sessions.** The transcript, claim and dream logs are hash-chained across **segments**. Before an append would take a live log past 8 MiB, Somni seals it into `somni-v1/segments/<log>-NNNNNN.jsonl` and records the segment's count, head and SHA-256 in `state.json`. Sealed segments are immutable and are re-checked against their hash when they change on disk. Routine re-verification only re-parses the live tail. An interrupted seal is finished on the next load. Default limits are 65,536 transcript records and 4,096 dream passes. A store's `manifest.json` `limits` can raise `max_transcript_records` and `max_dream_passes` to 1,048,576. `status --json` reports `segments`, `transcript_live_records`, and the effective `limits`.
+
+**Daydreams (backend, experimental).** `store.py serve --daydream` opens a backend beside the session that owns recording, without taking its lease. It pins the transcript head H it sees at start. `recent` stops at H, and the only write it accepts is one dream pass. That pass is a *live* pass, marked `"live": true` and bound to H instead of the current head, and it can cite only records up to H. The store lock serializes it with the owner's appends, and the owner picks up the new claims and words at its next turn. Scheduling daydreams from Pi is the next step.
 The child reuses a verified snapshot for up to 128
 store accesses or 60 seconds. It runs the next full check on access once either limit is
 reached, when it detects an outside file change, during recovery, and after a dream. New
