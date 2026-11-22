@@ -212,6 +212,19 @@ class SomniPiEndToEnd(unittest.TestCase):
         texts = [r["text"] for r in memory.load().transcript if r["source"] == "tool_result"]
         self.assertTrue(texts[-3].startswith('TOOL lookup_fee({"cabin":"economy","price":200})'))
         self.assertTrue(texts[-1].startswith('TOOL quote_fees({"price":200}) -> {"economy":50,"business":16}'))
+        # The word's own record times its nested calls: when each began after the word started, and how long it took.
+        timed = [r for r in memory.transcript if r["source"] == "tool_result"][-1]["calls"]
+        self.assertEqual([(c["tool"], c["ok"]) for c in timed], [("lookup_fee", True), ("lookup_fee", True)])
+        self.assertTrue(all(type(c["start_ms"]) is int and type(c["ms"]) is int and c["ms"] >= 0 for c in timed))
+        self.assertGreaterEqual(timed[1]["start_ms"], timed[0]["start_ms"] + timed[0]["ms"])
+        self.assertNotIn("start_ms", texts[-1])  # not in the result text a calling word parses
+        # The next dream's workbench shows that timeline beside the run.
+        plans["Dream pass."] = [[("somni_action_try", {"inspect": "rpc"})]]
+        self.pi.prompt("/somni-dream word timing")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        dream_prompt = next(text_of(m.get("content")) for m in reversed(self.upstream.requests[-1]["messages"])
+                            if text_of(m.get("content")).startswith("Dream pass."))
+        self.assertRegex(dream_prompt, r"\n  timing: lookup_fee \+\d+ms \d+ms, lookup_fee \+\d+ms \d+ms\n")
 
         # A human edits the file; the next session records the edit and runs the new version.
         self.pi.close()

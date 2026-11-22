@@ -89,6 +89,7 @@ A good word does two things beyond replaying calls:
 - **It ends with the observation, if one is visual.** Only the final call's images reach the agent, so make the looking call last.
 - **It returns evidence of its effect.** Return state read back after the change, such as the new status, a count the tool reports, or the changed record. Do not return a count of the word's own steps. An agent will take the return value as the outcome.
 - **It says whether the effect was confirmed.** A word that changes something returns a top-level `"confirmed": true` only when a read-back proves the effect, and `false` when it does not. The memory index counts them, as in `last 5 runs: 5 ok (3 confirmed, 2 unconfirmed), 0 failed`, and the dream sees each run marked confirmed or UNCONFIRMED.
+- **It doesn't depend on fast timing.** A word is a script of round trips, not a real-time loop: each call is a full trip to the tool and back, and can take anywhere from milliseconds to seconds. Steps that must happen within a fraction of a second of each other, such as jumping and then clicking while still in the air, go into one tool call that does its own timing, if the environment has one. Each run is timed in the dream workbench, as in `timing: key +0ms 640ms, mouse_click +655ms 912ms`: when each call began after the word started, and how long it took. If a run failed or did nothing, check the gaps before changing the plan.
 
 ```python
 def restock(item: str, amount: int):

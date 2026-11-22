@@ -406,6 +406,25 @@ def test_other_booking_is_kept():
         runs = self.m.load().action_workbench()["cancel_if_refundable"]["runs"]
         self.assertEqual((runs[0]["ok"], runs[0]["args"]), (False, {"booking_id": "BK-9"}))
         self.assertIn("stopped at call 1", runs[0]["result"])
+        self.assertNotIn("calls", runs[0])
+
+    def test_word_runs_carry_nested_call_timings(self):
+        self.define()
+        self.m.set_phase("open")
+        timing = [{"tool": "get_booking", "ok": True, "start_ms": 0, "ms": 640},
+                  {"tool": "cancel_booking", "ok": False, "start_ms": 655, "ms": 912}]
+        self.m.record("tool_result", 'TOOL cancel_if_refundable({"booking_id":"BK-9"}) -> cancel_if_refundable stopped at call 2',
+                      tool_ok=False, calls=timing)
+        for bad in ([{"tool": "x", "ok": True, "start_ms": -1, "ms": 1}], [{"tool": "x", "ok": True, "ms": 1}],
+                    [{"tool": "x", "ok": 1, "start_ms": 0, "ms": 1}], [{"tool": "x", "ok": True, "start_ms": 0, "ms": 1.5}],
+                    [timing[0]] * 65, "fast"):
+            with self.subTest(bad=str(bad)[:40]), self.assertRaisesRegex(SomniError, "call timing"):
+                self.m.record("tool_result", "TOOL x({}) -> 1", calls=bad)
+        with self.assertRaisesRegex(SomniError, "one tool result"):
+            self.m.record("agent_output", "AGENT: hi", calls=timing)
+        self.m.set_phase("closed")
+        runs = SomniMemory(self.m.workspace, self.m.subject_id).load().action_workbench()["cancel_if_refundable"]["runs"]
+        self.assertEqual(runs[0]["calls"], timing)  # survives a reload through the hash-chained log
 
 
 if __name__ == "__main__":

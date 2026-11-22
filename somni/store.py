@@ -74,6 +74,8 @@ DEFAULT_IMAGE_BYTES = 256 * 1024
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_INPUT = 4 * 1024 * 1024  # raw before optional downscaling
 MAX_RECORD_IMAGES = 4
+MAX_RECORD_CALLS = 64  # an action word's nested-call timings on its result record
+MAX_CALL_MS = 86_400_000
 MAX_IMAGE_STORE_BYTES = 64 * 1024 * 1024
 MAX_BACKEND_REQUEST = 512 * 1024 + MAX_RECORD_IMAGES * ((MAX_IMAGE_INPUT + 2) // 3 * 4)
 IMAGE_SUFFIX = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
@@ -142,6 +144,20 @@ def sha(value):
 def token_estimate(value):
     size = len(value.encode("utf-8") if isinstance(value, str) else value)
     return (size + 3) // 4
+
+
+def _call_timings(calls):
+    """Validate an action word's nested-call timings: [{tool, ok, start_ms, ms}], in call order."""
+    if not isinstance(calls, list) or len(calls) > MAX_RECORD_CALLS:
+        raise MemoryError(f"call timings must be a list of at most {MAX_RECORD_CALLS}")
+    out = []
+    for call in calls:
+        if (not isinstance(call, dict) or set(call) != {"tool", "ok", "start_ms", "ms"}
+                or not isinstance(call["tool"], str) or not 0 < len(call["tool"]) <= 128 or type(call["ok"]) is not bool
+                or any(type(call[k]) is not int or not 0 <= call[k] <= MAX_CALL_MS for k in ("start_ms", "ms"))):
+            raise MemoryError("each call timing is {tool, ok, start_ms, ms} with non-negative integer milliseconds")
+        out.append({"tool": call["tool"], "ok": call["ok"], "start_ms": call["start_ms"], "ms": call["ms"]})
+    return out
 
 
 def _record_context(run_label=None, tags=None):
@@ -1126,11 +1142,18 @@ class SomniMemory:
         return self.record_many([(source, text)], **kwargs)[0]
 
     def record_many(self, items, *, context=None, images=(), omitted_images=0, clip=False,
-                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None):
-        """Append several (source, text) records under one lock."""
+                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None, calls=None):
+        """Append several (source, text) records under one lock.
+
+        `calls` ([{tool, ok, start_ms, ms}]) times an action word's nested calls on the word's own result.
+        """
         items = list(items)
         if not items:
             return []
+        if calls is not None:
+            calls = _call_timings(calls)
+            if len(items) != 1 or items[0][0] != "tool_result":
+                raise MemoryError("call timings require one tool result")
         context = _record_context(**(context or {}))
         if tool_ok is not None and (type(tool_ok) is not bool or len(items) != 1 or items[0][0] != "tool_result"):
             raise MemoryError("tool status requires one tool result")
@@ -1170,6 +1193,8 @@ class SomniMemory:
                     record["original_text_bytes"] = len(text.encode("utf-8"))
                 if tool_ok is not None:
                     record["tool_ok"] = tool_ok
+                if calls:
+                    record["calls"] = calls
                 if attachments:
                     record["images"] = attachments
                 if omitted_images:
@@ -1667,7 +1692,8 @@ class SomniMemory:
             # Convention: a word returns a top-level boolean `confirmed` when a read-back proved its effect (or not).
             confirmed = value.get("confirmed") if isinstance(value, dict) else None
             recent[match[1]].append({"ref": record["id"], "ok": record.get("tool_ok") is not False, "args": args,
-                                     "result": body[:300], "confirmed": confirmed if isinstance(confirmed, bool) else None})
+                                     "result": body[:300], "confirmed": confirmed if isinstance(confirmed, bool) else None,
+                                     **({"calls": record["calls"]} if record.get("calls") else {})})
         return recent
 
     def action_workbench(self, *, runs=3, scan=4000):
@@ -2132,7 +2158,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         if not isinstance(images, list):
             raise MemoryError("invalid tool result image list")
         ref = memory.record(args["source"], args["text"], context=context, images=images, omitted_images=omitted,
-                            clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"))
+                            clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"),
+                            calls=args.get("calls"))
         return ref if index_bytes is None else memory.inject(index_bytes, query=query, learning=learning,
                                                             words=_index_word_names(args) if actions else None)
     elif method == "note":

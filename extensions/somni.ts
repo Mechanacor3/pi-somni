@@ -53,6 +53,7 @@ const ACTIONS = process.env.SOMNI_ACTIONS === "1";
 const ACTION_ALLOW = process.env.SOMNI_ACTION_TOOLS?.split(",").map((name) => name.trim()).filter(Boolean);
 const MAX_ACTION_DEPTH = 4;
 const MAX_WORD_IMAGES = 2; // images a word passes on from its final call
+const MAX_TIMED_CALLS = 64; // nested-call timings kept on a word's result record
 const configuredActionCalls = Number(process.env.SOMNI_ACTION_MAX_CALLS ?? 16);
 const ACTION_MAX_CALLS = Number.isInteger(configuredActionCalls) ? Math.min(64, Math.max(1, configuredActionCalls)) : 16;
 // Daydreams: live dream passes run by a child Pi while this session keeps recording.
@@ -98,6 +99,13 @@ type DreamResult = {
 	rejected?: { index: number; reason: string }[];
 };
 type ActionWord = { name: string; description: string; params: Record<string, string>; uses: string[]; source: string };
+type CallTiming = { tool: string; ok: boolean; start_ms: number; ms: number };
+
+/** "key +0ms 640ms, mouse_click +655ms 912ms FAILED": when each nested call began (from the word's start) and how long it took. */
+function callTimeline(calls: CallTiming[]) {
+	const shown = calls.slice(0, 16).map((call) => `${call.tool} +${call.start_ms}ms ${call.ms}ms${call.ok ? "" : " FAILED"}`);
+	return shown.join(", ") + (calls.length > shown.length ? `, ... ${calls.length - shown.length} more` : "");
+}
 type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; result?: unknown };
 type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string };
 const state = {
@@ -106,6 +114,7 @@ const state = {
 	recordWarning: false, indexWarning: false,
 	words: new Map<string, string>(), // registered action word -> source
 	wordCalls: new Set<string>(), // tool call IDs of running action words
+	wordTimings: new Map<string, CallTiming[]>(), // a finished word's nested-call timings, until its result is recorded
 	workspace: "",
 	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, calls: 0 },
 };
@@ -165,7 +174,7 @@ function notify(ctx: ExtensionContext, message: string) {
 
 async function record(source: "ordinary_observation" | "tool_result" | "agent_output", text: string, ctx: ExtensionContext,
 		options: { tool_ok?: boolean; index_bytes?: number; query?: string; images?: ImageContent[]; omitted_images?: number;
-			action_words?: string[] } = {}) {
+			action_words?: string[]; calls?: CallTiming[] } = {}) {
 	if (!canRecord() || !text.trim()) return;
 	try {
 		const output = await getBackend().request<string>("record", {
@@ -382,8 +391,10 @@ export default function (pi: ExtensionAPI) {
 			signal: AbortSignal | undefined, ctx: any) {
 		if (toolCallId.split("/").length > MAX_ACTION_DEPTH) throw new Error(`Action words nest at most ${MAX_ACTION_DEPTH} deep.`);
 		const history: { tool: string; args: Record<string, unknown>; result: unknown }[] = [];
-		const calls: { tool: string; args: Record<string, unknown>; ok: boolean }[] = [];
+		const calls: ({ args: Record<string, unknown> } & CallTiming)[] = [];
 		let last: { tool: string; images: ImageContent[] } | undefined;
+		// Wall-clock timing of each nested call, so a dream can see when a word is too slow for what it does.
+		const started = Date.now();
 		state.wordCalls.add(toolCallId);
 		try {
 			for (;;) {
@@ -401,11 +412,12 @@ export default function (pi: ExtensionAPI) {
 					throw new Error(`${word.name} may not call ${tool} (SOMNI_ACTION_TOOLS).`);
 				}
 				// Resolves to { toolCall, result: { content, details }, isError, durationMs }; never rejects.
+				const begin = Date.now();
 				const outcome = await ctx.executeTool(tool, args, { signal });
 				const content: (TextContent | ImageContent)[] = outcome.result?.content ?? [];
 				const value = resultValue(content);
 				last = { tool, images: content.filter((part): part is ImageContent => part.type === "image") };
-				calls.push({ tool, args, ok: !outcome.isError });
+				calls.push({ tool, args, ok: !outcome.isError, start_ms: begin - started, ms: Date.now() - begin });
 				if (outcome.isError) {
 					const done = calls.slice(0, -1).map((call) => call.tool).join(", ") || "none";
 					throw new Error(`${word.name} stopped at call ${calls.length} (${tool}): ` +
@@ -415,6 +427,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		} finally {
 			state.wordCalls.delete(toolCallId);
+			state.wordTimings.set(toolCallId, calls.slice(0, MAX_TIMED_CALLS).map(({ tool, ok, start_ms, ms }) => ({ tool, ok, start_ms, ms })));
 		}
 	}
 
@@ -506,7 +519,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	type Workbench = Record<string, { tests: { params: unknown; refs: string[]; result?: unknown }[]; selftests: string[];
-		uses_words: string[]; used_by: string[]; runs: { ref: string; ok: boolean; args: unknown; result: string; confirmed: boolean | null }[] }>;
+		uses_words: string[]; used_by: string[]; runs: { ref: string; ok: boolean; args: unknown; result: string; confirmed: boolean | null; calls?: CallTiming[] }[] }>;
 
 	/** Live tool declarations for the backend, which merges them with the task-session catalog and adds signatures. */
 	function liveTools() {
@@ -536,6 +549,7 @@ export default function (pi: ExtensionAPI) {
 			for (const run of info?.runs ?? []) {
 				const status = !run.ok ? "FAILED" : run.confirmed === true ? "ok, confirmed" : run.confirmed === false ? "ok, UNCONFIRMED" : "ok";
 				lines.push(`Run ${run.ref} ${status}: ${clip(JSON.stringify(run.args), 160)} -> ${clip(run.result, 240)}`);
+				if (run.calls?.length) lines.push(`  timing: ${callTimeline(run.calls)}`);
 			}
 			if (info && !info.runs.length) lines.push("No recorded runs yet.");
 			return lines.join("\n");
@@ -779,6 +793,7 @@ ${candidateGuide(candidates)}`;
 		state.dream = undefined;
 		state.writable = state.recordWarning = state.indexWarning = false;
 		state.wordCalls.clear();
+		state.wordTimings.clear();
 		sentCatalog = "";
 		sentNames = new Set();
 		mkdirSync(workspace, { recursive: true });
@@ -879,13 +894,15 @@ ${candidateGuide(candidates)}`;
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
+		const calls = state.wordTimings.get(event.toolCallId);
+		state.wordTimings.delete(event.toolCallId);
 		// Calls an action word makes are recorded too: they are the evidence for revising or composing words.
 		if (event.parentToolCallId && !state.wordCalls.has(event.parentToolCallId)) return;
 		if (!canRecord() || event.toolName.startsWith("somni_")) return;
 		// In one-shot runs MCP tools register after the turn starts; record their declarations once they are in use.
 		if (ACTIONS && !sentNames.has(event.toolName) && !state.words.has(event.toolName)) await recordToolCatalog(ctx);
 		const { text, options } = toolRecord(event.toolName, event.input, event.content);
-		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false });
+		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false, ...(calls?.length ? { calls } : {}) });
 	});
 
 	pi.on("message_end", async (event, ctx) => {
