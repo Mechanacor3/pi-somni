@@ -135,6 +135,46 @@ class DreamRobustness(unittest.TestCase):
         self.assertGreater(status["dropped"], 0)
         self.assertLessEqual((self.m.store / "dream-failures.jsonl").stat().st_size, 2000)
 
+    def test_cached_reads_belong_to_one_attempt_on_one_set_of_records(self):
+        put = lambda **kw: self.request("dream_cache_put", {"kind": "dream", "tool": "somni_search",
+                                                             "args": {"query": "fee"}, "text": "t000001 ...", **kw}, set())
+        take = lambda kind="dream", age=3600: self.request("dream_cache_take", {"kind": kind, "max_age_seconds": age}, set())
+        self.assertEqual(put(), 1)
+        self.assertEqual(put(), 1)  # the same read again is not stored twice
+        put(tool="somni_image", text="[t000001] image", images=[{"ref": self.shot, "sha256": self.digest}])
+        self.assertEqual([r["tool"] for r in take()], ["somni_search", "somni_image"])
+        self.assertEqual(take("wiki"), [])  # another kind of turn
+        self.assertEqual(take(age=0), [])  # caching disabled
+        cache = json.loads((self.m.store / "dream-cache.json").read_text())
+        cache["started"] = cache["updated"] = "2000-01-01T00:00:00+00:00"
+        (self.m.store / "dream-cache.json").write_text(json.dumps(cache))
+        self.assertEqual(take(), [])  # too old
+        put(text="x" * 20_000)  # a new read refreshes it; long text is clipped
+        self.assertEqual(len(take()), 3)
+        self.assertLess(len(take()[-1]["text"]), 9_000)
+        # New records change the head, so an old attempt's reads no longer apply.
+        self.m.set_phase("open")
+        self.m.record("ordinary_observation", "something new")
+        self.m.set_phase("closed")
+        self.assertEqual(take(), [])
+        put()
+        self.request("dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
+            self.claim([{"ref": self.plain, "quote": "no image"}])]})}, set())
+        self.assertFalse((self.m.store / "dream-cache.json").exists())
+        for bad in ({"kind": "dream", "tool": "bash", "text": ""}, {"kind": "nap", "tool": "somni_search", "text": ""},
+                    {"kind": "dream", "tool": "somni_image", "text": "", "images": [{"ref": "x", "sha256": "y"}]}):
+            with self.subTest(bad=bad), self.assertRaises(SomniError):
+                self.request("dream_cache_put", bad, set())
+
+    def test_a_daydream_cache_is_keyed_to_its_snapshot(self):
+        self.m.set_phase("open")
+        put = {"kind": "daydream", "tool": "somni_search", "args": {}, "text": "hit"}
+        _handle_request(self.m, "dream_cache_put", put, writable=False, viewed=set(), daydream=2)
+        self.m.record("ordinary_observation", "recorded after the snapshot")
+        take = {"kind": "daydream", "max_age_seconds": 60}
+        self.assertEqual(len(_handle_request(self.m, "dream_cache_take", take, writable=False, viewed=set(), daydream=2)), 1)
+        self.assertEqual(_handle_request(self.m, "dream_cache_take", take, writable=False, viewed=set(), daydream=4), [])
+
 
 if __name__ == "__main__":
     unittest.main()

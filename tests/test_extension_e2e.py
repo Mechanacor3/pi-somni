@@ -41,6 +41,16 @@ PLANS = {
 }
 
 
+def failures(store, total, timeout=20):
+    """dream_failures once `total` attempts are logged: the log is written just after the agent settles."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = SomniMemory(store, "pi").load().status()["dream_failures"]
+        if status["total"] >= total or time.monotonic() > deadline:
+            return status
+        time.sleep(0.1)
+
+
 @unittest.skipUnless(pi_ready(), "set PI_PLUGIN_E2E_BINARY or build the Docker image in tests/e2e")
 class SomniPiEndToEnd(unittest.TestCase):
     def setUp(self):
@@ -549,19 +559,52 @@ class SomniPiEndToEnd(unittest.TestCase):
         plans = dict(PLANS)
         self.upstream.script = plan_script(plans)
         store = self.work / ".pi" / "somni"
-        for kind, plan in (("no_submission", [[("somni_search", {"query": "fee"})]]),
+        for logged, (kind, plan) in enumerate((("no_submission", [[("somni_search", {"query": "fee"})]]),
                            ("all_rejected", [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [bad]})})]]),
-                           ("provider_error", [{"http_error": 400, "text": "quota exhausted for this test"}])):
+                           ("provider_error", [{"http_error": 400, "text": "quota exhausted for this test"}])), 1):
             plans["Dream pass."] = plan
             self.pi.prompt(f"/somni-dream {kind}")
             self.pi.read(lambda r: r.get("type") == "agent_settled")
-        status = SomniMemory(store, "pi").load().status()["dream_failures"]
+            failures(store, logged)
+        status = failures(store, 3)
         self.assertEqual(status["by_cause"], {"all_rejected": 1, "no_submission": 1, "provider_error": 1})
         self.assertEqual(status["by_kind"], {"dream": 3})
         self.assertIn("quota exhausted for this test", status["last"]["detail"])
         log = [json.loads(line) for line in (store / "somni-v1" / "dream-failures.jsonl").read_text().splitlines()]
         self.assertEqual([(e["cause"], e["reads"], e["submissions"]) for e in log],
                          [("no_submission", 1, 0), ("all_rejected", 0, 1), ("provider_error", 0, 0)])
+
+    def test_a_dream_cut_off_by_the_provider_keeps_its_reads_for_the_retry(self):
+        self.pi.prompt("What is the fee")
+        store = self.work / ".pi" / "somni"
+        good = {"op": "add", "text": "Economy fees have a floor.", "status": "verified",
+                "evidence": [{"ref": "t000002", "quote": "\"fee\":50"}]}
+        plans = dict(PLANS)
+        plans["Dream pass."] = [[("somni_search", {"query": q})] for q in ("fee", "economy", "cabin", "price")] + [
+            [("somni_recall", {"query": "fee"})], {"http_error": 500, "text": "upstream overloaded"}]
+        self.upstream.script = plan_script(plans)
+        self.pi.prompt("/somni-dream fees")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        self.assertEqual(len(json.loads((store / "somni-v1" / "dream-cache.json").read_text())["reads"]), 5)
+        self.assertEqual(failures(store, 1)["by_cause"], {"provider_error": 1})
+
+        # The retry on the same records gets the five reads in its prompt and can submit at once.
+        plans["Dream pass."] = [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [good]})})]]
+        before = len(self.pi.tool_ends())
+        self.pi.prompt("/somni-dream fees")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        prompt = next(text_of(m.get("content")) for m in reversed(self.upstream.requests[-1]["messages"])
+                      if text_of(m.get("content")).startswith("Dream pass."))
+        self.assertIn("## Evidence from an interrupted attempt", prompt)
+        self.assertIn("These are the 5 read(s) it made", prompt)
+        self.assertIn('somni_search({"query":"cabin"}) ->', prompt)
+        self.assertIn('somni_recall({"query":"fee"}) ->', prompt)
+        self.assertNotIn("[dream budget left", prompt)  # cached without the old budget line
+        tools = [e["toolName"] for e in self.pi.tool_ends()[before:]]
+        self.assertEqual(tools, ["somni_dream"])  # no repeated reads
+        memory = SomniMemory(store, "pi").load()  # loading re-verifies the chains
+        self.assertEqual([c["text"] for c in memory.claims.values()], ["Economy fees have a floor."])
+        self.assertFalse((store / "somni-v1" / "dream-cache.json").exists())  # a committed pass clears it
 
     def test_print_dream_reports_summary_and_fails_when_model_skips_the_pass(self):
         self.pi.close()

@@ -77,6 +77,8 @@ const DREAM_MAX_READS = Math.floor(envNumber("SOMNI_DREAM_MAX_READS", 16, 1, 64)
 const DREAM_MAX_IMAGES = Math.floor(envNumber("SOMNI_DREAM_MAX_IMAGES", 16, 0, 64));
 const DREAM_MAX_SUBMISSIONS = Math.floor(envNumber("SOMNI_DREAM_MAX_SUBMISSIONS", 3, 1, 10));
 const LENIENT_IMAGE_EVIDENCE = process.env.SOMNI_LENIENT_IMAGE_EVIDENCE === "1";
+// A dream's evidence reads are kept until a pass commits; a retry on the same records within this window gets them back.
+const DREAM_CACHE_SECONDS = Math.floor(envNumber("SOMNI_DREAM_CACHE_MINUTES", 60, 0, 10_080) * 60);
 const MAX_SEARCH_LIMIT = 50;
 const MAX_RECALL_LIMIT = 20;
 const MAX_INDEX_QUERY_BYTES = 65_536;
@@ -122,7 +124,8 @@ function callTimeline(calls: CallTiming[]) {
 type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; result?: unknown };
 type DreamKind = "dream" | "wiki" | "daydream";
 type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string;
-	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string };
+	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string; resumed?: number };
+type CachedRead = { tool: string; args: unknown; text: string; images?: { ref: string; sha256: string }[] };
 const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
 	backend: undefined as Backend | undefined,
@@ -315,6 +318,38 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/**
+	 * If an earlier attempt on these same records was cut off, hand its evidence reads to this one, so the retry
+	 * doesn't spend turns repeating them. Images it viewed are attached again and stay citable.
+	 */
+	async function withCachedReads(content: string | (TextContent | ImageContent)[], run: DreamRun) {
+		if (!DREAM_CACHE_SECONDS) return content;
+		let reads: CachedRead[] = [];
+		try {
+			reads = await getBackend().request<CachedRead[]>("dream_cache_take", { kind: run.kind, max_age_seconds: DREAM_CACHE_SECONDS });
+		} catch {
+			return content;
+		}
+		if (!reads.length) return content;
+		run.resumed = reads.length;
+		const parts: (TextContent | ImageContent)[] = typeof content === "string" ? asText(content) : [...content];
+		parts.push(...asText(`\n\n## Evidence from an interrupted attempt\nAn earlier attempt on these same records stopped ` +
+			`before committing a pass. These are the ${reads.length} read(s) it made; their results are below, so you don't need ` +
+			`to repeat them (they don't count against your read budget). Cite them as usual.\n`));
+		for (const read of reads) {
+			parts.push(...asText(`\n${read.tool}(${clip(JSON.stringify(read.args ?? {}), 300)}) ->\n${read.text}`));
+			for (const { ref, sha256 } of read.images ?? []) {
+				try {
+					const image = await getBackend().request<ImageContent>("image", { ref, sha256, during_dream: true, max_images: DREAM_MAX_IMAGES });
+					parts.push(...asText(`Screenshot for [${ref}] image_sha256=${sha256}`), image);
+				} catch {
+					// Past the image budget or gone: the text above still names it.
+				}
+			}
+		}
+		return parts;
+	}
+
 	async function startDream(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
 			kind: "dream" | "wiki") {
 		const headless = ctx.mode === "print" || ctx.mode === "json";
@@ -324,11 +359,12 @@ export default function (pi: ExtensionAPI) {
 			if (state.dream || !ctx.isIdle()) throw new Error("Wait for the current Pi turn to settle first.");
 			run = { submitting: false, reads: 0, submissions: 0, kind: DAYDREAM_CHILD ? "daydream" : kind };
 			state.dream = run;
-			const content = await load();
-			if (content === undefined) {
+			const loaded = await load();
+			if (loaded === undefined) {
 				state.dream = undefined;
 				return;
 			}
+			const content = await withCachedReads(loaded, run);
 			// A daydream worker leaves the phase alone: the owning session is still recording.
 			if (!DAYDREAM_CHILD) await backend.request("phase", { phase: "closed" });
 			// A triggered custom message starts the turn before waitForIdle checks Pi's state.
@@ -339,6 +375,10 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			if (headless) process.exitCode = 1;
 			if (run?.started && !run.result) await recordFailure(failureOf(run, error as Error), run.kind, run);
+			if (run?.started && !run.result && DREAM_CACHE_SECONDS && run.reads > 0) {
+				notify(ctx, `Somni kept this dream's ${run.reads} evidence read(s); a retry on the same records within ` +
+					`${DREAM_CACHE_SECONDS / 60} min gets them back.`);
+			}
 			notify(ctx, `Somni dream failed. ${(error as Error).message}`);
 		} finally {
 			if (run) await finishDream(run);
@@ -951,6 +991,16 @@ ${candidateGuide(candidates)}`;
 	pi.on("tool_result", async (event) => {
 		const run = state.dream;
 		if (!run || event.parentToolCallId || !DREAM_TOOLS.has(event.toolName)) return;
+		if (DREAM_CACHE_SECONDS && !event.isError && event.toolName !== "somni_dream") {
+			const text = (event.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
+			const shown = event.toolName === "somni_image" ? [event.details as { ref: string; sha256: string }] : [];
+			try {
+				await getBackend().request("dream_cache_put", { kind: run.kind, tool: event.toolName, args: event.input ?? {}, text,
+					...(shown.length && shown[0]?.sha256 ? { images: shown.map(({ ref, sha256 }) => ({ ref, sha256 })) } : {}) });
+			} catch {
+				// The cache only saves a retry some turns; never fail the read over it.
+			}
+		}
 		let images = "";
 		try {
 			const used = await getBackend().request<number>("dream_images", {});

@@ -107,6 +107,9 @@ FAILURE_CAUSES = ("provider_error", "no_submission", "all_rejected", "invalid_su
                   "timeout", "other")
 FAILURE_KINDS = ("dream", "wiki", "daydream")
 MAX_FAILURES_BYTES = 1 << 20  # past this the oldest half is dropped; the counts say how many were dropped
+CACHE_FILE = "dream-cache.json"  # evidence reads of an unfinished dream, so a retry on the same records needn't repeat them
+MAX_CACHE_READS = 32
+MAX_CACHE_TEXT = 8_192
 MAX_ACTION_TOOLS = 256
 MAX_ACTION_TOOL_SCHEMA_BYTES = 4096
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
@@ -1710,6 +1713,73 @@ class SomniMemory:
         """The current lexicon: define/revise/retire events from every committed pass, in order."""
         return _action_module().fold(event for dream in self.dreams for event in dream.get("actions", ()))
 
+    def _cache_key(self, kind, head=None):
+        if kind not in FAILURE_KINDS:
+            raise MemoryError(f"dream kind must be one of {', '.join(FAILURE_KINDS)}")
+        transcript_head = self.state["transcript_head"] if head is None else sha(self.transcript[head - 1])
+        # A committed pass changes dream_count, so a cache never outlives the attempt it belongs to.
+        return {"kind": kind, "transcript_head": transcript_head, "dream_count": self.state["dream_count"]}
+
+    def cache_dream_read(self, read, head=None):
+        """Keep one evidence read of the current dream: {kind, tool, args, text, images?: [{ref, sha256}]}."""
+        if not isinstance(read, dict) or set(read) - {"kind", "tool", "args", "text", "images"}:
+            raise MemoryError("a cached dream read is {kind, tool, args, text, images?}")
+        tool, text, images = read.get("tool"), read.get("text"), read.get("images", [])
+        if not isinstance(tool, str) or not re.fullmatch(r"somni_[a-z_]{1,40}", tool) or not isinstance(text, str):
+            raise MemoryError("a cached dream read needs a Somni tool name and its result text")
+        if not isinstance(images, list) or len(images) > MAX_RECORD_IMAGES or not all(
+                isinstance(i, dict) and set(i) == {"ref", "sha256"} and isinstance(i["ref"], str)
+                and EVIDENCE_ID.fullmatch(i["ref"]) and isinstance(i["sha256"], str) and SHA256.fullmatch(i["sha256"])
+                for i in images):
+            raise MemoryError("cached dream images are [{ref, sha256}]")
+        args = read.get("args")
+        if len(canonical(args).encode("utf-8")) > 2_000:
+            args = {"omitted": "arguments over 2000 bytes"}
+        with self._locked():
+            self._load_locked()
+            key = self._cache_key(read.get("kind"), head)
+            path = self.store / CACHE_FILE
+            _no_symlink(path)
+            cache = self._read_cache()
+            if cache.get("key") != key:
+                cache = {"key": key, "started": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"), "reads": []}
+            entry = {"tool": tool, "args": args, "text": _clip_record(text, MAX_CACHE_TEXT, b" [cached excerpt truncated]"),
+                     **({"images": images} if images else {})}
+            if entry not in cache["reads"]:
+                cache["reads"] = (cache["reads"] + [entry])[-MAX_CACHE_READS:]
+            cache["updated"] = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+            _write_text_atomic(path, json.dumps(cache, ensure_ascii=False) + "\n")
+        return len(cache["reads"])
+
+    def _read_cache(self):
+        try:
+            cache = json.loads((self.store / CACHE_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return cache if isinstance(cache, dict) and isinstance(cache.get("reads"), list) else {}
+
+    def cached_dream_reads(self, kind, max_age_seconds=3600, head=None):
+        """The reads an interrupted attempt made on these same records, if it was recent enough; else []."""
+        if type(max_age_seconds) is not int or not 0 <= max_age_seconds <= 7 * 86400:
+            raise MemoryError("max_age_seconds must be 0-604800")
+        self.load()
+        cache = self._read_cache()
+        if not max_age_seconds or cache.get("key") != self._cache_key(kind, head):
+            return []
+        try:  # age from the latest read, so an attempt that keeps reading stays fresh
+            updated = _dt.datetime.fromisoformat(cache.get("updated") or cache["started"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        if (_dt.datetime.now(_dt.timezone.utc) - updated).total_seconds() > max_age_seconds:
+            return []
+        return cache["reads"]
+
+    def clear_dream_cache(self):
+        try:
+            (self.store / CACHE_FILE).unlink()
+        except FileNotFoundError:
+            pass
+
     def record_dream_failure(self, failure, context=None):
         """Log a dream attempt that committed nothing: its cause and what it had used.
 
@@ -2340,6 +2410,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         dream = memory.dream(parsed, partial=True, allow_empty=True, viewed_images=viewed,
                              learning=learning, actions=options, snapshot=daydream, usage=args.get("usage"),
                              lenient_images=args.get("lenient_images") is True)
+        memory.clear_dream_cache()
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
         return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning,
@@ -2419,6 +2490,10 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         return len(viewed)
     elif method == "dream_failure":
         return memory.record_dream_failure(args, context)
+    elif method == "dream_cache_put":
+        return memory.cache_dream_read(args, head=daydream)
+    elif method == "dream_cache_take":
+        return memory.cached_dream_reads(args.get("kind"), args.get("max_age_seconds", 3600), head=daydream)
     elif method == "wiki":
         # With python -I, explicitly add this package's root for the formatter.
         root = str(pathlib.Path(__file__).resolve().parent.parent)
