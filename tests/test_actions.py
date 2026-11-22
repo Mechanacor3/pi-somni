@@ -251,7 +251,8 @@ class ActionWordTest(unittest.TestCase):
                                    "refundable, and report what happened. (not run yet; a tool; calls cancel_booking, "
                                    "get_booking; replays t000001..t000003)")
         self.assertTrue(lines[1].startswith("- word `check_booking(booking_id: str)`"))
-        self.assertIn("Learned action words: call one as a tool", index)
+        self.assertIn("You have 2 learned action words. When one fits the next step, call it instead of making its "
+                      "tool calls one by one", index)
         # Only words this session registered are listed; none at all without the list.
         self.assertEqual(len([l for l in memory.inject(4096, words=["check_booking", "nope"]).splitlines()
                               if l.startswith("- word ")]), 1)
@@ -272,6 +273,13 @@ class ActionWordTest(unittest.TestCase):
                       self.m.load().inject(4096, words=["cancel_if_refundable"]))
         runs = self.m.action_workbench()["cancel_if_refundable"]["runs"]
         self.assertEqual([run["confirmed"] for run in runs], [False, True, None])
+        # Words whose recent runs all succeeded are named first, confirmed effects ahead of plain successes.
+        self.m.set_phase("open")
+        for _ in range(3):
+            self.tool("check_booking", {"booking_id": "BK-2"}, {"refundable": False, "confirmed": True})
+        self.m.set_phase("closed")
+        self.assertIn("You have 2 learned action words; most reliable: check_booking (3/3 confirmed). When one fits",
+                      self.m.load().inject(4096, words=both))
 
     def test_parameters_bind_by_name_after_the_word_is_stored(self):
         source = ('def zeta_first(zeta: str, alpha: int):\n    """Look up a booking and echo a number."""\n'

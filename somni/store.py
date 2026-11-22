@@ -1782,7 +1782,20 @@ class SomniMemory:
                       _bm25([_terms(f"{w['name']} {w['name']} {w['description']}") for w in words], words, query)}
             words.sort(key=lambda w: scores.get(id(w), 0), reverse=True)
         lines = []
-        runs = self.word_runs([w["name"] for w in words[:5]], per_word=10)
+        runs = self.word_runs([w["name"] for w in words], per_word=10)
+        # Agents tend to use words only when told to, so the section opens with an instruction, and names the
+        # words whose recent runs all succeeded (confirmed effects first).
+        reliable = []
+        for word in words:
+            done = runs[word["name"]]
+            if len(done) >= 2 and all(run["ok"] for run in done):
+                confirmed = sum(run["confirmed"] is True for run in done)
+                reliable.append((confirmed, len(done), word["name"],
+                                 f"{confirmed}/{len(done)} confirmed" if confirmed else f"{len(done)}/{len(done)} ok"))
+        reliable.sort(reverse=True)
+        best = "; most reliable: " + ", ".join(f"{name} ({score})" for _, _, name, score in reliable[:3]) if reliable else ""
+        intro = (f"You have {len(words)} learned action word{'s' if len(words) != 1 else ''}{best}. When one fits the "
+                 "next step, call it instead of making its tool calls one by one: it runs the whole sequence in one turn.\n")
         for word in words[:5]:
             declared = A.parse(word["source"])["params"]  # stored params are key-sorted; show the declared order
             params = ", ".join(f"{key}: {python.get(kind, kind)}" for key, kind in declared.items())
@@ -1805,7 +1818,6 @@ class SomniMemory:
             if size > budget:
                 break
             if not lines:
-                intro = "Learned action words: call one as a tool to run its whole sequence in one step.\n"
                 if size + len(intro.encode("utf-8")) > budget:
                     break
                 lines.append(intro)
