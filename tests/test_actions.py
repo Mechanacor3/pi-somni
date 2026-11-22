@@ -426,6 +426,44 @@ def test_other_booking_is_kept():
         runs = SomniMemory(self.m.workspace, self.m.subject_id).load().action_workbench()["cancel_if_refundable"]["runs"]
         self.assertEqual(runs[0]["calls"], timing)  # survives a reload through the hash-chained log
 
+    def test_status_counts_word_use_by_run_label(self):
+        self.define()
+        m = self.m
+        m.set_phase("open")
+        word = "cancel_if_refundable"
+        timing = [{"tool": t, "ok": True, "start_ms": 0, "ms": 1} for t in ("get_booking", "cancel_booking")]
+        one, two = {"run_label": "try 1"}, {"run_label": "try 2"}
+        m.record("tool_result", 'TOOL get_booking({"booking_id":"BK-5"}) -> {"refundable":true}', tool_ok=True,
+                 via_word=word, context=one)
+        m.record("tool_result", 'TOOL cancel_booking({"booking_id":"BK-5"}) -> {"status":"cancelled"}', tool_ok=True,
+                 via_word=word, context=one)
+        m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-5"}}) -> {{"cancelled":true,"confirmed":true}}',
+                 tool_ok=True, calls=timing, context=one)
+        m.record("tool_result", 'TOOL get_booking({"booking_id":"BK-6"}) -> {"refundable":false}', tool_ok=True, context=one)
+        m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-7"}}) -> {word} stopped at call 1', tool_ok=False, context=two)
+        m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-8"}}) -> {{"cancelled":true,"confirmed":false}}',
+                 tool_ok=True, context=two)
+        # A record from before via_word existed: the word's timing list marks the two calls before it as its own.
+        m.record("tool_result", 'TOOL get_booking({"booking_id":"BK-9"}) -> {"refundable":true}', tool_ok=True)
+        m.record("tool_result", 'TOOL cancel_booking({"booking_id":"BK-9"}) -> {"status":"cancelled"}', tool_ok=True)
+        m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-9"}}) -> {{"cancelled":true}}', tool_ok=True, calls=timing)
+        m.record("tool_result", 'TOOL weather({}) -> {"sky":"clear"}', tool_ok=True)  # not wrapped by any word
+        with self.assertRaisesRegex(SomniError, "via_word"):
+            m.record("tool_result", "TOOL x({}) -> 1", via_word="Not A Word")
+        m.set_phase("closed")
+        use = SomniMemory(m.workspace, m.subject_id).load().status()["word_use"]
+        self.assertEqual({k: use[k] for k in ("word_calls", "word_failed", "confirmed", "unconfirmed",
+                                              "calls_made_by_words", "direct_calls_to_wrapped_tools", "word_share")},
+                         {"word_calls": 4, "word_failed": 1, "confirmed": 1, "unconfirmed": 1, "calls_made_by_words": 4,
+                          "direct_calls_to_wrapped_tools": 4, "word_share": 0.5})
+        self.assertEqual(use["by_run_label"]["try 1"]["word_calls"], 1)
+        self.assertEqual(use["by_run_label"]["try 1"]["calls_made_by_words"], 2)
+        self.assertEqual(use["by_run_label"]["try 1"]["direct_calls_to_wrapped_tools"], 1)
+        self.assertEqual({k: use["by_run_label"]["try 2"][k] for k in ("word_calls", "word_failed", "unconfirmed")},
+                         {"word_calls": 2, "word_failed": 1, "unconfirmed": 1})
+        fresh = SomniMemory.create(tempfile.mkdtemp(), "s", "l", "a")
+        self.assertNotIn("word_use", fresh.status())  # a store without words reports nothing
+
 
 if __name__ == "__main__":
     unittest.main()

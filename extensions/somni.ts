@@ -36,12 +36,28 @@ import { Type, type ImageContent, type TextContent } from "@earendil-works/pi-ai
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Backend } from "./backend.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The skill's "Using a word" section. Pi lists a --skill skill only when the read tool is active, so a session
+ * without read gets this text in its memory index instead (once per session, with the first index that lists a word).
+ */
+const WORD_GUIDE = (() => {
+	try {
+		const skill = readFileSync(resolve(HERE, "../skills/somni-action-words/SKILL.md"), "utf8");
+		const section = skill.match(/^## Using a word\n([\s\S]*?)(?=^## )/m)?.[1]?.trim();
+		if (section) return `## Using a learned action word\n${section}`;
+	} catch {
+		// Fall through to the short version if the skill file is not shipped beside the extension.
+	}
+	return "## Using a learned action word\nCall it like any tool; it returns JSON. If one of its calls fails, the word " +
+		"stops and earlier calls stay done. Check the effect before you rely on its result.";
+})();
 const STORE_PY = process.env.SOMNI_STORE ?? resolve(HERE, "../somni/store.py");
 const PYTHON = process.env.SOMNI_PYTHON ?? "python3";
 const SUBJECT = process.env.SOMNI_SUBJECT ?? "pi";
@@ -131,8 +147,9 @@ const state = {
 	backend: undefined as Backend | undefined,
 	recordWarning: false, indexWarning: false,
 	words: new Map<string, string>(), // registered action word -> source
-	wordCalls: new Set<string>(), // tool call IDs of running action words
+	wordCalls: new Map<string, string>(), // tool call ID of each running action word -> its name
 	wordTimings: new Map<string, CallTiming[]>(), // a finished word's nested-call timings, until its result is recorded
+	wordGuideShown: false, // the "Using a word" guidance went into this session's index (sessions without read)
 	workspace: "",
 	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, calls: 0 },
 };
@@ -192,7 +209,7 @@ function notify(ctx: ExtensionContext, message: string) {
 
 async function record(source: "ordinary_observation" | "tool_result" | "agent_output", text: string, ctx: ExtensionContext,
 		options: { tool_ok?: boolean; index_bytes?: number; query?: string; images?: ImageContent[]; omitted_images?: number;
-			action_words?: string[]; calls?: CallTiming[] } = {}) {
+			action_words?: string[]; calls?: CallTiming[]; via_word?: string } = {}) {
 	if (!canRecord() || !text.trim()) return;
 	try {
 		const output = await getBackend().request<string>("record", {
@@ -475,7 +492,7 @@ export default function (pi: ExtensionAPI) {
 		let last: { tool: string; images: ImageContent[] } | undefined;
 		// Wall-clock timing of each nested call, so a dream can see when a word is too slow for what it does.
 		const started = Date.now();
-		state.wordCalls.add(toolCallId);
+		state.wordCalls.set(toolCallId, word.name);
 		try {
 			for (;;) {
 				const step = await getBackend().request<ActionStep>("action_step", { name: word.name, params, history, max_calls: ACTION_MAX_CALLS });
@@ -883,6 +900,7 @@ ${candidateGuide(candidates)}`;
 		state.writable = state.recordWarning = state.indexWarning = false;
 		state.wordCalls.clear();
 		state.wordTimings.clear();
+		state.wordGuideShown = false;
 		sentCatalog = "";
 		sentNames = new Set();
 		mkdirSync(workspace, { recursive: true });
@@ -966,7 +984,12 @@ ${candidateGuide(candidates)}`;
 		if (!/^-(?: n\d{6} | rule | page `| word `)/m.test(index)) {
 			return notice ? { message: { customType: "somni-index", content: notice.trim(), display: false } } : undefined;
 		}
-		return { message: { customType: "somni-index", content: notice + index, display: false } };
+		let guide = "";
+		if (ACTIONS && !state.wordGuideShown && /^- word `/m.test(index) && !pi.getActiveTools().includes("read")) {
+			state.wordGuideShown = true;
+			guide = `\n\n${WORD_GUIDE}`;
+		}
+		return { message: { customType: "somni-index", content: notice + index + guide, display: false } };
 	});
 
 	pi.on("tool_call", (event) => {
@@ -1029,7 +1052,9 @@ ${candidateGuide(candidates)}`;
 		// In one-shot runs MCP tools register after the turn starts; record their declarations once they are in use.
 		if (ACTIONS && !sentNames.has(event.toolName) && !state.words.has(event.toolName)) await recordToolCatalog(ctx);
 		const { text, options } = toolRecord(event.toolName, event.input, event.content);
-		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false, ...(calls?.length ? { calls } : {}) });
+		const via = event.parentToolCallId ? state.wordCalls.get(event.parentToolCallId) : undefined;
+		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false, ...(calls?.length ? { calls } : {}),
+			...(via ? { via_word: via } : {}) });
 	});
 
 	pi.on("message_end", async (event, ctx) => {

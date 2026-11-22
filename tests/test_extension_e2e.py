@@ -228,6 +228,10 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertTrue(all(type(c["start_ms"]) is int and type(c["ms"]) is int and c["ms"] >= 0 for c in timed))
         self.assertGreaterEqual(timed[1]["start_ms"], timed[0]["start_ms"] + timed[0]["ms"])
         self.assertNotIn("start_ms", texts[-1])  # not in the result text a calling word parses
+        results = [r for r in memory.transcript if r["source"] == "tool_result"]
+        self.assertEqual([r.get("via_word") for r in results[-3:]], ["quote_fees", "quote_fees", None])
+        use = memory.status()["word_use"]
+        self.assertEqual((use["word_calls"], use["calls_made_by_words"], use["direct_calls_to_wrapped_tools"]), (1, 2, 2))
         # The next dream's workbench shows that timeline beside the run.
         plans["Dream pass."] = [[("somni_action_try", {"inspect": "rpc"})]]
         self.pi.prompt("/somni-dream word timing")
@@ -304,6 +308,19 @@ class SomniPiEndToEnd(unittest.TestCase):
         index = "\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"])
         self.assertIn(f"- word `quote_fees(price: float)`: Quote economy and business cancellation fees for one fare. "
                       f"(not run yet; a tool; calls lookup_fee; replays {refs[0]}..{refs[1]})", index)
+        self.assertNotIn("## Using a learned action word", index)  # read is active: the skill is listed instead
+        self.pi.close()
+
+        # Without the read tool, Pi lists no --skill skill, so the index carries the word guidance, once per session.
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env,
+                            extra_args=["--no-builtin-tools"])
+        hidden = []
+        for _ in range(2):
+            self.pi.prompt("Quote both fees for 200")
+            hidden.append("\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]))
+        self.assertEqual(hidden[0].count("## Using a learned action word\nCall it like any tool."), 1)
+        self.assertIn("Check the effect with a tool before you say the work is done.", hidden[0])
+        self.assertEqual(hidden[1].count("## Using a learned action word"), 1)  # the first turn's, not a second copy
 
     def test_tools_that_register_late_are_still_declared_for_dreams(self):
         self.pi.close()

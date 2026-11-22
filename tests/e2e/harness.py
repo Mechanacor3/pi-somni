@@ -115,7 +115,7 @@ def plan_script(plans):
 
 
 class PiSession:
-    def __init__(self, extension, workspace, port, env=None, *, mode="rpc", prompt=None, package=None):
+    def __init__(self, extension, workspace, port, env=None, *, mode="rpc", prompt=None, package=None, extra_args=()):
         self.name = f"pi-plugin-e2e-{secrets.token_hex(4)}"
         models = {"providers": {"fake": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
                                          "apiKey": "not-a-real-key", "models": [{"id": "m", "name": "fake",
@@ -124,6 +124,7 @@ class PiSession:
         self.buffer = bytearray()
         cli = ["--mode", mode, "--no-session", "--offline", "--no-approve", "--no-extensions"]
         cli += ["--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--provider", "fake", "--model", "m"]
+        cli += list(extra_args)
         trailing = ["-p", prompt] if prompt is not None else []
         if BINARY:
             profile = workspace / self.name

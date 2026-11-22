@@ -160,6 +160,20 @@ DEFAULT_DREAM_IMAGES = 16
 MAX_DREAM_IMAGES = 64
 
 
+def _word_result(text, match):
+    """(args, result text, parsed result or None) of a recorded `TOOL name(args) -> result` line."""
+    try:
+        args, end = json.JSONDecoder().raw_decode(text, match.end())
+        body = text[end + 5:] if text.startswith(") -> ", end) else text[end:]
+    except ValueError:
+        args, body = None, text[match.end():]
+    try:
+        value = json.loads(body)
+    except ValueError:
+        value = None
+    return args, body, value
+
+
 def _op_name(operation):
     return operation.get("op", "?") if isinstance(operation, dict) else type(operation).__name__
 
@@ -1183,7 +1197,7 @@ class SomniMemory:
         return self.record_many([(source, text)], **kwargs)[0]
 
     def record_many(self, items, *, context=None, images=(), omitted_images=0, clip=False,
-                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None, calls=None):
+                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None, calls=None, via_word=None):
         """Append several (source, text) records under one lock.
 
         `calls` ([{tool, ok, start_ms, ms}]) times an action word's nested calls on the word's own result.
@@ -1195,6 +1209,9 @@ class SomniMemory:
             calls = _call_timings(calls)
             if len(items) != 1 or items[0][0] != "tool_result":
                 raise MemoryError("call timings require one tool result")
+        if via_word is not None and (not isinstance(via_word, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", via_word)
+                                     or len(items) != 1 or items[0][0] != "tool_result"):
+            raise MemoryError("via_word names the action word that made one tool call")
         context = _record_context(**(context or {}))
         if tool_ok is not None and (type(tool_ok) is not bool or len(items) != 1 or items[0][0] != "tool_result"):
             raise MemoryError("tool status requires one tool result")
@@ -1236,6 +1253,8 @@ class SomniMemory:
                     record["tool_ok"] = tool_ok
                 if calls:
                     record["calls"] = calls
+                if via_word:
+                    record["via_word"] = via_word
                 if attachments:
                     record["images"] = attachments
                 if omitted_images:
@@ -1906,22 +1925,63 @@ class SomniMemory:
             match = record.get("source") == "tool_result" and A.RECORD.match(record.get("text", ""))
             if not match or match[1] not in recent or len(recent[match[1]]) >= per_word:
                 continue
-            text = record["text"]
-            try:
-                args, end = json.JSONDecoder().raw_decode(text, match.end())
-                body = text[end + 5:] if text.startswith(") -> ", end) else text[end:]
-            except ValueError:
-                args, body = None, text[match.end():]
-            try:
-                value = json.loads(body)
-            except ValueError:
-                value = None
+            args, body, value = _word_result(record["text"], match)
             # Convention: a word returns a top-level boolean `confirmed` when a read-back proved its effect (or not).
             confirmed = value.get("confirmed") if isinstance(value, dict) else None
             recent[match[1]].append({"ref": record["id"], "ok": record.get("tool_ok") is not False, "args": args,
                                      "result": body[:300], "confirmed": confirmed if isinstance(confirmed, bool) else None,
                                      **({"calls": record["calls"]} if record.get("calls") else {})})
         return recent
+
+    def word_use(self, *, labels=50):
+        """How often the agent used its words: word calls (ok, failed, confirmed, unconfirmed), calls a word made,
+        and direct calls to the tools words wrap, in total and by run label (the most recent `labels`)."""
+        A = _action_module()
+        words = self.action_words()
+        names = set(words) | {event["name"] for dream in self.dreams for event in dream.get("actions", ())
+                              if isinstance(event.get("name"), str)}
+        if not names:
+            return None
+        wrapped = {tool for word in words.values() for tool in word["uses"]} - names
+        blank = {"word_calls": 0, "word_failed": 0, "confirmed": 0, "unconfirmed": 0, "calls_made_by_words": 0,
+                 "direct_calls_to_wrapped_tools": 0}
+        total, by_label = dict(blank), {}
+        results = [r for r in self.transcript if r.get("source") == "tool_result"]
+        nested = set()
+        for i, record in enumerate(results):
+            # Older records lack via_word; a word's timing list says how many of the records before it were its calls.
+            if record.get("calls") and not any("via_word" in r for r in results[max(0, i - len(record["calls"])):i]):
+                nested.update(range(max(0, i - len(record["calls"])), i))
+        for i, record in enumerate(results):
+            match = A.RECORD.match(record.get("text", ""))
+            if not match:
+                continue
+            name = match[1]
+            counts = [total, by_label.setdefault(record["run_label"], dict(blank))] if record.get("run_label") else [total]
+            if record.get("via_word") or i in nested:
+                key = "calls_made_by_words"
+            elif name in names:
+                key = "word_calls"
+            elif name in wrapped:
+                key = "direct_calls_to_wrapped_tools"
+            else:
+                continue
+            for count in counts:
+                count[key] += 1
+            if key != "word_calls":
+                continue
+            ok = record.get("tool_ok") is not False
+            _, _, value = _word_result(record["text"], match)
+            confirmed = value.get("confirmed") if isinstance(value, dict) else None
+            for count in counts:
+                count["word_failed"] += not ok
+                if ok and confirmed is True:
+                    count["confirmed"] += 1
+                elif ok and confirmed is False:
+                    count["unconfirmed"] += 1
+        calls = total["word_calls"] + total["direct_calls_to_wrapped_tools"]
+        return {**total, "word_share": round(total["word_calls"] / calls, 3) if calls else None,
+                "by_run_label": dict(list(by_label.items())[-labels:])}
 
     def action_workbench(self, *, runs=3, scan=4000):
         """What a dream needs to write or repair words: each word's tests, links, and recent runs."""
@@ -2178,6 +2238,7 @@ class SomniMemory:
             - sum(segment["count"] for segment in self._segments("transcript.jsonl")),
             "limits": {key: self._limit(key) for key in LIMIT_KEYS},
             "dream_failures": self.dream_failures(),
+            **({"word_use": use} if (use := self.word_use()) else {}),
         }
 
     def report(self):
@@ -2388,7 +2449,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             raise MemoryError("invalid tool result image list")
         ref = memory.record(args["source"], args["text"], context=context, images=images, omitted_images=omitted,
                             clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"),
-                            calls=args.get("calls"))
+                            calls=args.get("calls"), via_word=args.get("via_word"))
         return ref if index_bytes is None else memory.inject(index_bytes, query=query, learning=learning,
                                                             words=_index_word_names(args) if actions else None)
     elif method == "note":
