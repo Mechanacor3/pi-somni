@@ -35,8 +35,9 @@
 import { Type, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Backend } from "./backend.ts";
 
@@ -44,7 +45,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const STORE_PY = process.env.SOMNI_STORE ?? resolve(HERE, "../somni/store.py");
 const PYTHON = process.env.SOMNI_PYTHON ?? "python3";
 const SUBJECT = process.env.SOMNI_SUBJECT ?? "pi";
-const RECORD = process.env.SOMNI_RECORD !== "0";
+const RECORD = process.env.SOMNI_RECORD !== "0" && process.env.SOMNI_DAYDREAM !== "1";
 const configuredBytes = Number(process.env.SOMNI_INJECT_BYTES ?? 4096);
 const INJECT_BYTES = Number.isInteger(configuredBytes) ? Math.min(Math.max(configuredBytes, 256), 8192) : 4096;
 const LEARNING = process.env.SOMNI_CHEL_LEARNING === "1";
@@ -54,6 +55,20 @@ const MAX_ACTION_DEPTH = 4;
 const MAX_WORD_IMAGES = 2; // images a word passes on from its final call
 const configuredActionCalls = Number(process.env.SOMNI_ACTION_MAX_CALLS ?? 16);
 const ACTION_MAX_CALLS = Number.isInteger(configuredActionCalls) ? Math.min(64, Math.max(1, configuredActionCalls)) : 16;
+// Daydreams: live dream passes run by a child Pi while this session keeps recording.
+const DAYDREAM_CHILD = process.env.SOMNI_DAYDREAM === "1"; // this process is a daydream worker
+const envNumber = (name: string, fallback: number, min: number, max: number) => {
+	const value = Number(process.env[name] ?? fallback);
+	return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+};
+const DAYDREAM_TURNS = Math.floor(envNumber("SOMNI_DAYDREAM_EVERY_TURNS", 0, 0, 10_000));
+const DAYDREAM_MINUTES = envNumber("SOMNI_DAYDREAM_EVERY_MINUTES", 0, 0, 1440);
+const DAYDREAM_PER_HOUR = Math.floor(envNumber("SOMNI_DAYDREAM_PER_HOUR", 4, 1, 60));
+const DAYDREAM_TIMEOUT_MS = envNumber("SOMNI_DAYDREAM_TIMEOUT_SECONDS", 600, 10, 7200) * 1000;
+const DAYDREAMS = !DAYDREAM_CHILD && (DAYDREAM_TURNS > 0 || DAYDREAM_MINUTES > 0);
+const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what just happened in the latest records. Add or " +
+	"correct claims, and define, revise or retire action words, from what the newest records show. Keep the pass small; " +
+	"leave wiki pages to the night dream";
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try"]);
 const MAX_INDEX_QUERY_BYTES = 65_536;
 const MAX_RECORD_BYTES = 8000;
@@ -90,7 +105,26 @@ const state = {
 	recordWarning: false, indexWarning: false,
 	words: new Map<string, string>(), // registered action word -> source
 	wordCalls: new Set<string>(), // tool call IDs of running action words
+	workspace: "",
 };
+const day = {
+	child: undefined as ChildProcess | undefined,
+	starts: [] as number[], // start times in the last hour
+	lastCount: 0, // transcript count the last daydream started from
+	turns: 0,
+	timer: undefined as ReturnType<typeof setInterval> | undefined,
+	notice: "",
+};
+
+/** How to start another Pi, as Pi's own subagent example does; SOMNI_DAYDREAM_COMMAND overrides it. */
+function piInvocation(args: string[]) {
+	if (process.env.SOMNI_DAYDREAM_COMMAND) return { command: process.env.SOMNI_DAYDREAM_COMMAND, args };
+	const script = process.argv[1];
+	const virtual = script !== undefined && (script.startsWith("/$bunfs/root/") || /^[A-Za-z]:[\\/]~BUN[\\/]root[\\/]/.test(script));
+	if (script && !virtual && existsSync(script)) return { command: process.execPath, args: [script, ...args] };
+	if (!/^(node|bun)(\.exe)?$/.test(basename(process.execPath).toLowerCase())) return { command: process.execPath, args };
+	return { command: "pi", args };
+}
 
 function getBackend() {
 	if (!state.backend) throw new Error("Somni backend is unavailable.");
@@ -249,7 +283,8 @@ export default function (pi: ExtensionAPI) {
 				state.dream = undefined;
 				return;
 			}
-			await backend.request("phase", { phase: "closed" });
+			// A daydream worker leaves the phase alone: the owning session is still recording.
+			if (!DAYDREAM_CHILD) await backend.request("phase", { phase: "closed" });
 			// A triggered custom message starts the turn before waitForIdle checks Pi's state.
 			pi.sendMessage({ customType: "somni-dream-input", content, display: false }, { triggerTurn: true });
 			await ctx.waitForIdle();
@@ -267,6 +302,65 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.mode === "json" || ctx.mode === "print") return task;
 		// RPC clients get the handled reply first and can then wait for agent_settled.
 		void task.catch((error: Error) => notify(ctx, `Somni dream cleanup failed. ${error.message}`));
+	}
+
+	/**
+	 * Start a daydream if one is due: a child Pi runs /somni-dream against a `serve --daydream` backend,
+	 * which reads up to the current transcript head and commits one live pass while this session records on.
+	 * Never blocks: skipped while one runs, when nothing new was recorded, or past SOMNI_DAYDREAM_PER_HOUR.
+	 */
+	async function maybeDaydream(ctx: ExtensionContext) {
+		if (!DAYDREAMS || day.child || !canRecord()) return;
+		const now = Date.now();
+		day.starts = day.starts.filter((start) => now - start < 3_600_000);
+		if (day.starts.length >= DAYDREAM_PER_HOUR) return;
+		let status: { transcript_count: number; last_pass: { id: string } | null };
+		try {
+			status = await getBackend().request("status");
+		} catch {
+			return;
+		}
+		if (status.transcript_count <= day.lastCount) return;
+		day.lastCount = status.transcript_count;
+		day.starts.push(now);
+		day.turns = 0;
+		const before = status.last_pass?.id;
+		const model = process.env.SOMNI_DAYDREAM_MODEL || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+		const args = ["--mode", "json", "--no-session", "--no-approve", "--no-extensions", "--no-builtin-tools", "--no-mcp",
+			"--no-skills", "--no-prompt-templates", "--no-context-files", "-e", fileURLToPath(import.meta.url),
+			...(ACTIONS ? ["--skill", resolve(HERE, "../skills/somni-action-words")] : []),
+			...(model ? ["--model", model] : []),
+			...(process.env.SOMNI_DAYDREAM_THINKING ? ["--thinking", process.env.SOMNI_DAYDREAM_THINKING] : []),
+			"-p", `/somni-dream ${DAYDREAM_FOCUS}`];
+		const invocation = piInvocation(args);
+		let stderr = "";
+		const child = spawn(invocation.command, invocation.args, {
+			cwd: ctx.cwd, shell: false, stdio: ["ignore", "ignore", "pipe"],
+			env: { ...process.env, SOMNI_DAYDREAM: "1", SOMNI_RECORD: "0", SOMNI_WORKSPACE: state.workspace },
+		});
+		day.child = child;
+		child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
+		const timeout = setTimeout(() => child.kill("SIGTERM"), DAYDREAM_TIMEOUT_MS);
+		child.on("error", (error) => { stderr += ` ${error.message}`; });
+		child.on("close", async (code, signal) => {
+			clearTimeout(timeout);
+			if (day.child === child) day.child = undefined;
+			try {
+				const after = await getBackend().request<{ last_pass: any }>("status");
+				const pass = after.last_pass;
+				if (pass && pass.id !== before && pass.live) {
+					const words = pass.action_count ? `, ${pass.action_count} action word change(s)` : "";
+					day.notice = `Somni daydream ${pass.id}: +${pass.added_count ?? 0} claim(s), ${pass.merged_count ?? 0} merged` +
+						`${words}, ${pass.rejected_count} rejected (records up to ${pass.transcript_count}).`;
+				} else {
+					day.notice = `Somni daydream made no pass (${signal ? `stopped by ${signal}` : `exit ${code}`}). ` +
+						clip(stderr.trim().split("\n").slice(-3).join(" "), 300);
+				}
+			} catch (error) {
+				day.notice = `Somni daydream finished, but its result could not be read. ${(error as Error).message}`;
+			}
+			notify(ctx, day.notice);
+		});
 	}
 
 	/** Tools an action word may call: everything callable except Somni's own tools (and SOMNI_ACTION_TOOLS, if set). */
@@ -654,6 +748,11 @@ ${candidateGuide(candidates)}`;
 		if (state.dream) await finishDream(state.dream);
 	});
 
+	pi.on("turn_end", async (_event, ctx) => {
+		if (!DAYDREAMS || DAYDREAM_TURNS === 0 || state.dream) return;
+		if (++day.turns >= DAYDREAM_TURNS) await maybeDaydream(ctx);
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		const workspace = process.env.SOMNI_WORKSPACE ?? join(ctx.cwd, ".pi", "somni");
 		state.dream = undefined;
@@ -662,12 +761,14 @@ ${candidateGuide(candidates)}`;
 		sentCatalog = "";
 		sentNames = new Set();
 		mkdirSync(workspace, { recursive: true });
+		state.workspace = workspace;
 		// Isolate imports and avoid bytecode writes beside the extension.
 		const args = ["-I", "-B", STORE_PY, "--workspace", workspace, "--subject-id", SUBJECT, "serve",
 			"--image-bytes", IMAGE_BYTES, "--image-max-edge", IMAGE_MAX_EDGE];
 		if (process.env.SOMNI_RUN_LABEL !== undefined) args.push(`--run-label=${process.env.SOMNI_RUN_LABEL}`);
 		if (process.env.SOMNI_TAGS !== undefined) args.push(`--tags=${process.env.SOMNI_TAGS}`);
-		if (RECORD) args.push("--record");
+		if (RECORD && !DAYDREAM_CHILD) args.push("--record");
+		if (DAYDREAM_CHILD) args.push("--daydream");
 		if (LEARNING) args.push("--learning");
 		if (ACTIONS) args.push("--actions");
 		const backend = new Backend(PYTHON, args, (error) => {
@@ -690,6 +791,11 @@ ${candidateGuide(candidates)}`;
 			}
 			await registerWords(ctx);
 			await recordToolCatalog(ctx);
+			if (DAYDREAMS && DAYDREAM_MINUTES > 0 && writable) {
+				if (day.timer) clearInterval(day.timer);
+				day.timer = setInterval(() => { if (lastCtx && !state.dream) void maybeDaydream(lastCtx); }, DAYDREAM_MINUTES * 60_000);
+				day.timer.unref?.();
+			}
 			if (RECORD && !writable) {
 				notify(ctx, "Somni opened without recording because another Pi session is recording in this Somni workspace.");
 			}
@@ -700,6 +806,9 @@ ${candidateGuide(candidates)}`;
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (day.timer) clearInterval(day.timer);
+		day.timer = undefined;
+		day.child?.kill("SIGTERM");
 		const backend = state.backend;
 		state.backend = undefined;
 		state.writable = false;
@@ -727,8 +836,12 @@ ${candidateGuide(candidates)}`;
 			}
 			return undefined;
 		}
-		if (!/^-(?: n\d{6} | rule | page `| word `)/m.test(index)) return undefined;
-		return { message: { customType: "somni-index", content: index, display: false } };
+		const notice = day.notice ? `${day.notice}\n\n` : "";
+		day.notice = "";
+		if (!/^-(?: n\d{6} | rule | page `| word `)/m.test(index)) {
+			return notice ? { message: { customType: "somni-index", content: notice.trim(), display: false } } : undefined;
+		}
+		return { message: { customType: "somni-index", content: notice + index, display: false } };
 	});
 
 	pi.on("tool_call", (event) => {

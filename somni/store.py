@@ -2136,6 +2136,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         if not writable:
             raise MemoryError("Somni memory changes require the session that owns recording")
         return memory.load().record_action_tools(args.get("tools"))
+    elif method == "status":
+        return memory.load().status()
     elif method == "action_catalog" and actions:
         A = _action_module()
         catalog = memory.load().action_tool_catalog()

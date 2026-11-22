@@ -196,6 +196,14 @@ can be `null`. Claims inherit the union of run labels and tags from the records 
 | `SOMNI_ACTIONS` | off | `1` enables [action words](#action-words-experimental): dreamed Python functions that call session tools, registered as Pi tools |
 | `SOMNI_ACTION_TOOLS` | all non-Somni tools | Comma-separated tools that action words may call |
 | `SOMNI_ACTION_MAX_CALLS` | `16` | Tool calls per action word run, clamped to 1–64 |
+| `SOMNI_DAYDREAM_EVERY_TURNS` | off | Start a daydream (see *Long sessions* below) after this many model turns (each `turn_end`) |
+| `SOMNI_DAYDREAM_EVERY_MINUTES` | off | Or start one on this interval |
+| `SOMNI_DAYDREAM_PER_HOUR` | `4` | At most this many daydreams start per hour, clamped to 1–60 |
+| `SOMNI_DAYDREAM_MODEL` | the session's model | Model for daydreams, as `provider/id` |
+| `SOMNI_DAYDREAM_THINKING` | Pi's default | Thinking level for daydreams |
+| `SOMNI_DAYDREAM_TIMEOUT_SECONDS` | `600` | Stop a daydream that runs longer, clamped to 10–7200 |
+| `SOMNI_DAYDREAM_FOCUS` | claims and words from the newest records | Focus text passed to the daydream's `/somni-dream` |
+| `SOMNI_DAYDREAM_COMMAND` | the running Pi | Command used to start the daydream's Pi |
 | `SOMNI_LINK_STYLE` | `markdown` | Vault link style: `markdown` (relative `[Title](path.md)` links) or `wikilink` (Obsidian `[[slug\|Title]]`) |
 | `SOMNI_DREAM_RECORDS` | `120` | Number of recent transcript records sent to `/somni-dream`, clamped to 1–120 |
 | `SOMNI_DREAM_RECORD_BYTES` | `1500` | UTF-8 text excerpt per dream record, including the truncation marker, clamped to 64–8192. IDs, metadata, and attachments have separate bounds |
@@ -225,7 +233,7 @@ The extension can be mounted read-only with `SOMNI_WORKSPACE` on a separate writ
 
 **Long sessions.** The transcript, claim and dream logs are hash-chained across **segments**. Before an append would take a live log past 8 MiB, Somni seals it into `somni-v1/segments/<log>-NNNNNN.jsonl` and records the segment's count, head and SHA-256 in `state.json`. Sealed segments are immutable and are re-checked against their hash when they change on disk. Routine re-verification only re-parses the live tail. An interrupted seal is finished on the next load. Default limits are 65,536 transcript records and 4,096 dream passes. A store's `manifest.json` `limits` can raise `max_transcript_records` and `max_dream_passes` to 1,048,576. `status --json` reports `segments`, `transcript_live_records`, and the effective `limits`.
 
-**Daydreams (backend, experimental).** `store.py serve --daydream` opens a backend beside the session that owns recording, without taking its lease. It pins the transcript head H it sees at start. `recent` stops at H, and the only write it accepts is one dream pass. That pass is a *live* pass, marked `"live": true` and bound to H instead of the current head, and it can cite only records up to H. The store lock serializes it with the owner's appends, and the owner picks up the new claims and words at its next turn. Scheduling daydreams from Pi is the next step.
+**Daydreams (backend, experimental).** `store.py serve --daydream` opens a backend beside the session that owns recording, without taking its lease. It pins the transcript head H it sees at start. `recent` stops at H, and the only write it accepts is one dream pass. That pass is a *live* pass, marked `"live": true` and bound to H instead of the current head, and it can cite only records up to H. The store lock serializes it with the owner's appends, and the owner picks up the new claims and words at its next turn. To have Pi schedule them, set `SOMNI_DAYDREAM_EVERY_TURNS` or `SOMNI_DAYDREAM_EVERY_MINUTES`. When one is due, the session that owns recording starts a child Pi (`pi --mode json -p "/somni-dream <focus>"`) whose Somni backend runs in `--daydream` mode, and it never waits for it. A daydream is skipped while another is running, when nothing has been recorded since the last one, or once `SOMNI_DAYDREAM_PER_HOUR` have started in the past hour. A child that runs past `SOMNI_DAYDREAM_TIMEOUT_SECONDS` is stopped. The default focus is claims and action words from the newest records, and wiki pages are left to the night dream. At the next turn, the session registers any new or revised words and prepends a one-line notice to the injected index, for example `Somni daydream d000012: +2 claim(s), 0 merged, 1 action word change(s), 0 rejected (records up to 481).`
 The child reuses a verified snapshot for up to 128
 store accesses or 60 seconds. It runs the next full check on access once either limit is
 reached, when it detects an outside file change, during recovery, and after a dream. New
