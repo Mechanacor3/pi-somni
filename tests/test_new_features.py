@@ -50,7 +50,7 @@ class FeatureTest(unittest.TestCase):
         record = self.memory.dream({"schema": 1, "operations": [good, bad]}, partial=True)
         self.assertEqual(record["operation_count"], 1)
         self.assertEqual(record["rejected"][0]["index"], 1)
-        with self.assertRaisesRegex(SomniError, "no valid operations"):
+        with self.assertRaisesRegex(SomniError, r"nothing committed: all 1 operation\(s\) were rejected\. op 0 \(add\)"):
             self.memory.dream({"schema": 1, "operations": [bad]}, partial=True)
         self.assertEqual(SomniMemory(self.ws, "s").load().dreams[0]["rejected"], record["rejected"])
 
@@ -130,7 +130,7 @@ class FeatureTest(unittest.TestCase):
         proposal = {"schema": 1, "operations": [{**operation, "evidence": evidence}]}
         with self.assertRaisesRegex(SomniError, "view the cited image"):
             memory.dream(proposal, viewed_images=set())
-        with self.assertRaisesRegex(SomniError, "match an image"):
+        with self.assertRaisesRegex(SomniError, "has no stored images|has no image"):
             memory.dream({"schema": 1, "operations": [{**operation, "evidence": [{"ref": missing, "image_sha256": digest}]}]})
         viewed = set()
         attachments = _recent(memory, True, viewed)["attachments"]

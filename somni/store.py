@@ -146,6 +146,37 @@ def token_estimate(value):
     return (size + 3) // 4
 
 
+MIN_DIGEST_PREFIX = 6
+DEFAULT_DREAM_IMAGES = 16
+MAX_DREAM_IMAGES = 64
+
+
+def _op_name(operation):
+    return operation.get("op", "?") if isinstance(operation, dict) else type(operation).__name__
+
+
+def _resolve_digest(record, ref, digest):
+    """The full SHA-256 of the image on `record` that `digest` names: the digest itself or a unique prefix of it.
+
+    Otherwise the error lists the digests the record actually has, so the caller can fix the citation in one step.
+    """
+    images = [image["sha256"] for image in record.get("images", [])]
+    text = digest.strip().lower() if isinstance(digest, str) else ""
+    if text in images:
+        return text
+    matches = [full for full in images if len(text) >= MIN_DIGEST_PREFIX and re.fullmatch(r"[0-9a-f]+", text)
+               and full.startswith(text)]
+    if len(matches) == 1:
+        return matches[0]
+    raw = digest if isinstance(digest, str) else repr(digest)
+    shown = repr(raw if len(raw) <= 16 else raw[:16] + "...")
+    if not images:
+        raise MemoryError(f"{ref} has no stored images (image_sha256 {shown} cannot be cited there)")
+    if len(matches) > 1:
+        raise MemoryError(f"image_sha256 prefix {shown} matches several images on {ref}: {', '.join(matches)}")
+    raise MemoryError(f"{ref} has no image {shown}; its image_sha256 values are: {', '.join(images)}")
+
+
 def _call_timings(calls):
     """Validate an action word's nested-call timings: [{tool, ok, start_ms, ms}], in call order."""
     if not isinstance(calls, list) or len(calls) > MAX_RECORD_CALLS:
@@ -414,6 +445,8 @@ class _Horizon(dict):
 
 
 class SomniMemory:
+    _image_downgrades = None  # a list while a lenient-image dream pass is being prepared
+
     def __init__(self, workspace, subject_id, *, scheduled_verification=False):
         raw = pathlib.Path(workspace)
         _no_symlink(raw)
@@ -713,9 +746,8 @@ class SomniMemory:
             if quote is not None and (not isinstance(quote, str) or not quote or quote not in records[ref]["text"]):
                 raise MemoryError("evidence quote must occur exactly in the referenced transcript")
             digest = item.get("image_sha256")
-            if "image_sha256" in item and (not isinstance(digest, str) or not SHA256.fullmatch(digest)
-                    or not any(image["sha256"] == digest for image in records[ref].get("images", []))):
-                raise MemoryError("evidence image SHA-256 must match an image on the referenced transcript record")
+            if "image_sha256" in item:
+                digest = _resolve_digest(records[ref], ref, digest)
             if status == "verified" and quote is None and digest is None:
                 raise MemoryError("verified claims require an exact quote or stored image for every evidence reference")
             normalized.append({"ref": ref, **({"quote": quote} if quote is not None else {}),
@@ -1122,11 +1154,11 @@ class SomniMemory:
         return descriptor
 
     def _image_descriptor(self, ref, digest):
-        record = self._records_by_id.get(ref, {})
-        for descriptor in record.get("images", []):
-            if descriptor["sha256"] == digest:
-                return descriptor
-        raise MemoryError("image not found on the referenced transcript record")
+        record = self._records_by_id.get(ref)
+        if record is None:
+            raise MemoryError(f"transcript record {ref!r} does not exist")
+        full = _resolve_digest(record, ref, digest)
+        return next(descriptor for descriptor in record["images"] if descriptor["sha256"] == full)
 
     def image(self, ref, digest):
         descriptor = self._image_descriptor(ref, digest)
@@ -1244,7 +1276,7 @@ class SomniMemory:
         return claim_id
 
     def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False, actions=None,
-              snapshot=None, usage=None):
+              snapshot=None, usage=None, lenient_images=False):
         """Apply one offline consolidation pass.
 
         By default the pass is all-or-nothing.  With ``partial=True`` an operation
@@ -1259,9 +1291,13 @@ class SomniMemory:
         ``snapshot`` (a transcript count H) makes this a live pass, a daydream: it may run
         while a session keeps recording, may cite only records 1..H, and is bound to the
         transcript head at H rather than the current head.
+
+        ``lenient_images`` keeps a citation's {ref} when only its image digest is wrong or unviewed,
+        downgrading a verified claim that is left without proof; the pass lists each downgrade.
         """
         if not isinstance(proposal, dict) or proposal.get("schema") != SCHEMA or set(proposal) != {"schema", "operations"}:
-            raise MemoryError("dream proposal must contain schema and operations")
+            raise MemoryError(f'a dream proposal is exactly {{"schema": {SCHEMA}, "operations": [...]}}; '
+                              f"got {'keys ' + ', '.join(sorted(map(str, proposal))) if isinstance(proposal, dict) else type(proposal).__name__}")
         operations = proposal["operations"]
         minimum = 0 if allow_empty else 1
         if not isinstance(operations, list) or not minimum <= len(operations) <= 32:
@@ -1286,14 +1322,19 @@ class SomniMemory:
                 # Evidence is limited to the snapshot: records after H do not exist for this pass.
                 self._records_by_id = _Horizon({r["id"]: r for r in self.transcript[:snapshot]})
                 self._records_by_id.horizon = self.transcript[snapshot - 1]["id"]
+            self._image_downgrades = [] if lenient_images else None
             try:
                 prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, learning, actions)
+                downgrades = self._image_downgrades or []
             finally:
                 self._records_by_id = records
+                self._image_downgrades = None
             if not prepared and operations:
-                raise MemoryError("dream pass has no valid operations: " + "; ".join(r["reason"] for r in rejected)[:600])
+                listed = "; ".join(f"op {r['index']} ({_op_name(operations[r['index']])}): {r['reason']}" for r in rejected)
+                raise MemoryError(f"nothing committed: all {len(operations)} operation(s) were rejected. {listed[:1500]}")
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected,
-                               author=(actions or {}).get("author", "dream"), snapshot=snapshot, usage=usage)
+                               author=(actions or {}).get("author", "dream"), snapshot=snapshot, usage=usage,
+                               downgrades=downgrades)
             self._load_locked(force=True)
             if self.dreams[-1].get("actions"):
                 self.write_action_files(self.dreams[-1]["actions"])
@@ -1314,6 +1355,8 @@ class SomniMemory:
             prepared = []
             rejected = link_rejections.copy()
             next_claim = self.state["next_claim"]
+            if self._image_downgrades is not None:
+                self._image_downgrades = []
             for index, operation in enumerate(operations):
                 if index in rejected:
                     continue
@@ -1336,6 +1379,8 @@ class SomniMemory:
                             raise MemoryError(str(exc)) from exc
                         prepared.append(("ledger_propose", revision))
                         continue
+                    if self._image_downgrades is not None:
+                        operation = self._lenient_image_evidence(operation, viewed_images, index)
                     next_claim = self._prepare_dream_op(operation, simulated, pages, prepared, next_claim, viewed_images)
                 except (MemoryError, OSError) as exc:
                     if not partial or "claim limit reached" in str(exc):
@@ -1393,6 +1438,40 @@ class SomniMemory:
             if blocked_drop is None:
                 blocked_drop = drop_index, f"cannot drop {target!r}: page {source!r} would still link to it"
         return blocked_drop
+
+    def _lenient_image_evidence(self, operation, viewed_images, index):
+        """With lenient image evidence, keep a citation's {ref} when only its image is wrong or unviewed.
+
+        A verified claim whose item is left with neither quote nor image becomes uncertain.  Each change
+        is recorded so the pass shows what was downgraded.
+        """
+        if not isinstance(operation, dict) or not isinstance(operation.get("evidence"), list):
+            return operation
+        evidence, changes = [], []
+        for item in operation["evidence"]:
+            if not isinstance(item, dict) or "image_sha256" not in item or not isinstance(item.get("ref"), str):
+                evidence.append(item)
+                continue
+            record = self._records_by_id.get(item["ref"])
+            try:
+                full = _resolve_digest(record or {}, item["ref"], item["image_sha256"])
+                problem = None if viewed_images is None or (item["ref"], full) in viewed_images else "image not viewed in this dream"
+            except MemoryError as exc:
+                problem = str(exc)
+            if problem is None:
+                evidence.append(item)
+                continue
+            evidence.append({key: value for key, value in item.items() if key != "image_sha256"})
+            changes.append({"index": index, "ref": item["ref"], "reason": problem[:200]})
+        if not changes:
+            return operation
+        operation = {**operation, "evidence": evidence}
+        if operation.get("status") == "verified" and any("quote" not in item and "image_sha256" not in item
+                                                         for item in evidence if isinstance(item, dict)):
+            operation["status"] = "uncertain"
+            changes[-1]["status"] = "verified -> uncertain"
+        self._image_downgrades.extend(changes)
+        return operation
 
     def _prepare_dream_op(self, operation, simulated, pages, prepared, next_claim, viewed_images):
         if not isinstance(operation, dict):
@@ -1481,7 +1560,8 @@ class SomniMemory:
             raise MemoryError("unknown dream operation")
         return next_claim
 
-    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None, usage=None):
+    def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None, usage=None,
+                      downgrades=()):
         learning = [body for op, body in prepared if op == "ledger_propose"]
         words = [body for op, body in prepared if op == "action"]
         prepared = [(op, body) for op, body in prepared if op not in {"ledger_propose", "action"}]
@@ -1522,6 +1602,8 @@ class SomniMemory:
             dream["author"] = author
         if snapshot is not None:
             dream["live"] = True  # a daydream: committed while recording continued past its snapshot
+        if downgrades:
+            dream["image_downgrades"] = list(downgrades)
         if usage:
             dream["usage"] = usage  # what the dreaming model reported spending, up to this submission
         if learning:
@@ -2095,6 +2177,7 @@ def _dream_summary(dream):
             **({"broken_dependents": broken} if (broken := {k: v for e in dream.get("actions", ())
                                                            for k, v in e.get("broken_dependents", {}).items()}) else {}),
             **({"rejected": dream["rejected"]} if dream.get("rejected") else {}),
+            **({"image_downgrades": dream["image_downgrades"]} if dream.get("image_downgrades") else {}),
             **({"live": True} if dream.get("live") else {}),
             **({"usage": dream["usage"]} if dream.get("usage") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
@@ -2174,8 +2257,13 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         if actions:
             options = _dream_actions(args)
             options["reserved"] = sorted(set(options["reserved"]) | set(memory.load().action_tool_catalog()))
-        dream = memory.dream(json.loads(proposal), partial=True, allow_empty=True, viewed_images=viewed,
-                             learning=learning, actions=options, snapshot=daydream, usage=args.get("usage"))
+        try:
+            parsed = json.loads(proposal)
+        except ValueError as exc:
+            raise MemoryError(f"proposal_json is not valid JSON ({exc}); nothing committed") from None
+        dream = memory.dream(parsed, partial=True, allow_empty=True, viewed_images=viewed,
+                             learning=learning, actions=options, snapshot=daydream, usage=args.get("usage"),
+                             lenient_images=args.get("lenient_images") is True)
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
         return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning,
@@ -2238,13 +2326,21 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
                        record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
                        record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES), head=daydream)
     elif method == "image":
-        ref, digest = args["ref"], args["sha256"]
-        image = memory.load().image(ref, digest)
+        ref = args["ref"]
+        memory.load()
+        digest = memory._image_descriptor(ref, args["sha256"])["sha256"]
         if args.get("during_dream"):
-            if len(viewed) >= 12 and (ref, digest) not in viewed:
-                raise MemoryError("this dream reached its image retrieval limit")
+            cap = args.get("max_images", DEFAULT_DREAM_IMAGES)
+            if type(cap) is not int or not 0 <= cap <= MAX_DREAM_IMAGES:
+                raise MemoryError(f"max_images must be 0-{MAX_DREAM_IMAGES}")
+            if len(viewed) >= cap and (ref, digest) not in viewed:
+                raise MemoryError(f"this dream reached its image limit ({cap} images). Cite the images you have "
+                                  "already viewed, use text quotes, or submit the pass now")
             viewed.add((ref, digest))
-        return image
+        image = memory.image(ref, digest)
+        return {"sha256": digest, "image": image} if args.get("resolve") else image
+    elif method == "dream_images":
+        return len(viewed)
     elif method == "wiki":
         # With python -I, explicitly add this package's root for the formatter.
         root = str(pathlib.Path(__file__).resolve().parent.parent)

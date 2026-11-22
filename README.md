@@ -125,7 +125,7 @@ The yes case must match the rule and support every prediction. The no case must 
 
 The ledger also accepts Chel's `retract` and `define_verb` proposals. A **verb** is a pure function used by a rule. Chel checks its syntax and runs its worked examples in an isolated Python process with CPU, address-space, file-size, and process limits. Somni requires distinct worked inputs and both outcomes for Boolean verbs. Chel tests redefinitions against active rules that use the verb. Running a verb gives it no Pi tool capabilities.
 
-Accepted proposals and their test references are committed in the Somni dream chain. Use `python3 somni/store.py --workspace W --subject-id S ledger` to replay the ledger and inspect rule states, support counts, and verb names. The CLI accepts `--learning` on `dream` and `inject` to apply proposals and preview matching rules. Replay can run recorded verbs in Chel's worker. Offline dream and wiki turns allow up to 16 Somni evidence reads and three submission attempts, with one committed pass.
+Accepted proposals and their test references are committed in the Somni dream chain. Use `python3 somni/store.py --workspace W --subject-id S ledger` to replay the ledger and inspect rule states, support counts, and verb names. The CLI accepts `--learning` on `dream` and `inject` to apply proposals and preview matching rules. Replay can run recorded verbs in Chel's worker. Offline dream and wiki turns allow 16 Somni evidence reads, 16 viewed images and three submission attempts by default (`SOMNI_DREAM_MAX_READS`, `SOMNI_DREAM_MAX_IMAGES`, `SOMNI_DREAM_MAX_SUBMISSIONS`), with one committed pass. Every Somni tool result in a dream ends with what is left, for example `[dream budget left: images 9/16, reads 11/16, submissions 3/3]`. When a budget runs out, the message says what to do next. Arguments are forgiving: a `somni_search` or `somni_recall` `limit` outside its range is clamped and the result says so. An `image_sha256` may be a unique prefix of at least six hex characters, and a digest that doesn't belong to the cited record gets back the digests that record does have. A submission whose operations are all rejected commits nothing, lists each operation's reason, and says how many attempts are left. A submission with some valid operations commits those and lists the rest. With `SOMNI_LENIENT_IMAGE_EVIDENCE=1`, a citation whose image is wrong or wasn't viewed keeps its `{ref}`. A verified claim left without a quote or image becomes uncertain, and the pass records each change in `image_downgrades`.
 
 ### Action words (experimental)
 
@@ -204,6 +204,10 @@ can be `null`. Claims inherit the union of run labels and tags from the records 
 | `SOMNI_DAYDREAM_TIMEOUT_SECONDS` | `600` | Stop a daydream that runs longer, clamped to 10–7200 |
 | `SOMNI_DAYDREAM_FOCUS` | claims and words from the newest records | Focus text passed to the daydream's `/somni-dream` |
 | `SOMNI_DAYDREAM_COMMAND` | the running Pi | Command used to start the daydream's Pi |
+| `SOMNI_DREAM_MAX_READS` | `16` | Somni evidence reads per dream or wiki turn, clamped to 1–64 |
+| `SOMNI_DREAM_MAX_IMAGES` | `16` | Distinct images a dream may view, including those attached to its prompt, clamped to 0–64 |
+| `SOMNI_DREAM_MAX_SUBMISSIONS` | `3` | `somni_dream` attempts per dream, clamped to 1–10 |
+| `SOMNI_LENIENT_IMAGE_EVIDENCE` | unset | `1` keeps a citation's `{ref}` when only its image is wrong, downgrading the claim if needed |
 | `SOMNI_LINK_STYLE` | `markdown` | Vault link style: `markdown` (relative `[Title](path.md)` links) or `wikilink` (Obsidian `[[slug\|Title]]`) |
 | `SOMNI_DREAM_RECORDS` | `120` | Number of recent transcript records sent to `/somni-dream`, clamped to 1–120 |
 | `SOMNI_DREAM_RECORD_BYTES` | `1500` | UTF-8 text excerpt per dream record, including the truncation marker, clamped to 64–8192. IDs, metadata, and attachments have separate bounds |

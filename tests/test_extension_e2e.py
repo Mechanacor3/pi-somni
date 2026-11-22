@@ -510,6 +510,39 @@ class SomniPiEndToEnd(unittest.TestCase):
             "transcript_count": status["transcript_count"], "added_count": 1, "rejected_count": 0, "merged_count": 0,
         })
 
+    def test_dream_tools_show_the_budget_left_and_a_rejected_pass_can_be_resubmitted(self):
+        self.pi.close()
+        env = {"SOMNI_DREAM_MAX_READS": "3", "SOMNI_DREAM_MAX_SUBMISSIONS": "2", "SOMNI_DREAM_MAX_IMAGES": "5"}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        self.pi.prompt("What is the fee")
+        bad = {"op": "add", "text": "Bad quote.", "status": "verified", "evidence": [{"ref": "t000002", "quote": "nope"}]}
+        good = {"op": "add", "text": "Look up the fee first.", "status": "uncertain", "evidence": [{"ref": "t000002"}]}
+        plans = dict(PLANS)
+        plans["Dream pass."] = [[("somni_search", {"query": "fee", "limit": 80})],
+                                [("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [bad]})})],
+                                [("somni_recall", {"query": "fee"})],
+                                [("somni_search", {"query": "economy"})],
+                                [("somni_search", {"query": "again"})],
+                                [("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [good]})})]]
+        self.upstream.script = plan_script(plans)
+        self.pi.prompt("/somni-dream fees")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        ends = [e for e in self.pi.tool_ends() if e["toolName"].startswith("somni_")]
+        texts = [text_of(e["result"]["content"]) for e in ends]
+        self.assertEqual([e["toolName"] for e in ends], ["somni_search", "somni_dream", "somni_recall", "somni_search",
+                                                         "somni_search", "somni_dream"])
+        self.assertTrue(texts[0].startswith("(limit 80 clamped to 50)\n"))
+        self.assertTrue(texts[0].endswith("[dream budget left: images 5/5, reads 2/3, submissions 2/2]"))
+        self.assertTrue(ends[1]["isError"])
+        self.assertIn("nothing committed: all 1 operation(s) were rejected. op 0 (add): evidence quote", texts[1])
+        self.assertIn("submissions 1/2] Nothing was committed. Fix or drop the rejected operations and resubmit; "
+                      "1 attempt left.", texts[1])
+        self.assertTrue(texts[3].endswith("reads 0/3, submissions 1/2] No reads left: submit the pass now."))
+        self.assertIn("Dream evidence read limit reached (3 reads). Submit the pass now", texts[4])
+        self.assertFalse(ends[5]["isError"], texts[5])
+        memory = SomniMemory(self.work / ".pi" / "somni", "pi").load()
+        self.assertEqual([c["text"] for c in memory.claims.values()], ["Look up the fee first."])
+
     def test_print_dream_reports_summary_and_fails_when_model_skips_the_pass(self):
         self.pi.close()
         self.upstream.script = plan_script({})

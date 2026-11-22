@@ -72,6 +72,13 @@ const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what just ha
 	"leave wiki pages to the night dream";
 const AUTH_ERROR = /\b(401|403)\b|unauthori[sz]ed|authenticat|token expired|credential|not logged in|api key/i;
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try"]);
+// Dream budgets. Every Somni tool result in a dream ends with what is left of them.
+const DREAM_MAX_READS = Math.floor(envNumber("SOMNI_DREAM_MAX_READS", 16, 1, 64));
+const DREAM_MAX_IMAGES = Math.floor(envNumber("SOMNI_DREAM_MAX_IMAGES", 16, 0, 64));
+const DREAM_MAX_SUBMISSIONS = Math.floor(envNumber("SOMNI_DREAM_MAX_SUBMISSIONS", 3, 1, 10));
+const LENIENT_IMAGE_EVIDENCE = process.env.SOMNI_LENIENT_IMAGE_EVIDENCE === "1";
+const MAX_SEARCH_LIMIT = 50;
+const MAX_RECALL_LIMIT = 20;
 const MAX_INDEX_QUERY_BYTES = 65_536;
 const MAX_RECORD_BYTES = 8000;
 const configuredToolBytes = Number(process.env.SOMNI_TOOL_RESULT_BYTES ?? 4096);
@@ -86,7 +93,7 @@ const MAX_RECORD_IMAGES = 4;
 const IMAGE_BYTES = process.env.SOMNI_IMAGE_BYTES ?? "262144";
 const IMAGE_MAX_EDGE = process.env.SOMNI_IMAGE_MAX_EDGE ?? "0";
 const Evidence = Type.Array(Type.Object({
-	ref: Type.String(), quote: Type.Optional(Type.String()), image_sha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
+	ref: Type.String(), quote: Type.Optional(Type.String()), image_sha256: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
 }), { minItems: 1, maxItems: 16 });
 
 type RecordContext = { tags?: string[]; run_label?: string; run_labels?: string[] };
@@ -100,6 +107,12 @@ type DreamResult = {
 };
 type ActionWord = { name: string; description: string; params: Record<string, string>; uses: string[]; source: string };
 type CallTiming = { tool: string; ok: boolean; start_ms: number; ms: number };
+
+/** A model-supplied limit, clamped into 1..max instead of failing the call; `note` says so when it changed. */
+function clampLimit(requested: number | undefined, fallback: number, max: number) {
+	const value = Math.min(max, Math.max(1, Math.floor(requested ?? fallback)));
+	return { value, note: requested !== undefined && requested !== value ? `(limit ${requested} clamped to ${value})\n` : "" };
+}
 
 /** "key +0ms 640ms, mouse_click +655ms 912ms FAILED": when each nested call began (from the word's start) and how long it took. */
 function callTimeline(calls: CallTiming[]) {
@@ -598,37 +611,41 @@ ${candidateGuide(candidates)}`;
 		name: "somni_recall",
 		label: "Somni recall",
 		description: "Recall the wiki pages and memory claims most relevant to a query (pages cite claims; claims cite transcript evidence).",
-		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
+		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ description: `1-${MAX_RECALL_LIMIT}` })) }),
 		async execute(_id: string, params: { query: string; limit?: number }) {
-			const hits = await getBackend().request<any[]>("recall", { query: params.query.slice(0, 2000), limit: params.limit ?? 5 });
-			const lines = hits.slice(0, params.limit ?? 5).map((h) => {
+			const limit = clampLimit(params.limit, 5, MAX_RECALL_LIMIT);
+			const hits = await getBackend().request<any[]>("recall", { query: params.query.slice(0, 2000), limit: limit.value });
+			const lines = hits.slice(0, limit.value).map((h) => {
 				if (h.kind === "rule") return `Rule ${h.id} (${h.support} supporting transitions): ${h.text}\n${JSON.stringify({ when: h.when, then: h.then })}`;
 				if (h.slug) return `# ${h.title} (page ${h.slug})\n${h.body}`;
 				const lineage = h.merged_from ? `; merged from ${h.merged_from.join(", ")}` : "";
 				return `${h.id} [${h.status}; ${h.evidence.length} cited${lineage}]${contextLabel(h)} ${h.text}`;
 			});
-			return { content: asText(lines.join("\n\n") || "no matching memory"), details: hits };
+			return { content: asText(limit.note + (lines.join("\n\n") || "no matching memory")), details: hits };
 		},
 	});
 	pi.registerTool({
 		name: "somni_search",
 		label: "Somni search",
 		description: "Search your transcript text, run labels, and tags for an exact phrase. Use it to find evidence IDs and image digests.",
-		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })) }),
+		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ description: `1-${MAX_SEARCH_LIMIT}` })) }),
 		async execute(_id: string, params: { query: string; limit?: number }) {
-			const out = await getBackend().request<TranscriptRecord[]>("search", { query: params.query.slice(0, 256), limit: params.limit ?? 10 });
-			return { content: asText(out.map((r) => describeRecord(r, 600)).join("\n") || "no matches"), details: out };
+			const limit = clampLimit(params.limit, 10, MAX_SEARCH_LIMIT);
+			const out = await getBackend().request<TranscriptRecord[]>("search", { query: params.query.slice(0, 256), limit: limit.value });
+			return { content: asText(limit.note + (out.map((r) => describeRecord(r, 600)).join("\n") || "no matches")), details: out };
 		},
 	});
 	pi.registerTool({
 		name: "somni_image",
 		label: "Somni image",
 		description: "View a screenshot or other stored image by its transcript record ID and SHA-256 from somni_search.",
-		parameters: Type.Object({ ref: Type.String({ pattern: "^t[0-9]{6}$" }), sha256: Type.String({ pattern: "^[0-9a-f]{64}$" }) }),
+		parameters: Type.Object({ ref: Type.String({ pattern: "^t[0-9]{6}$" }),
+			sha256: Type.String({ minLength: 1, maxLength: 64, description: "The image's SHA-256, or a unique prefix of it" }) }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!ctx.model?.input.includes("image")) throw new Error("Viewing Somni images requires a vision-capable Pi model.");
-			const image = await getBackend().request<ImageContent>("image", { ...params, during_dream: Boolean(state.dream) });
-			return { content: [...asText(`[${params.ref}] image_sha256=${params.sha256}`), image], details: params };
+			const { sha256, image } = await getBackend().request<{ sha256: string; image: ImageContent }>("image", {
+				...params, during_dream: Boolean(state.dream), max_images: DREAM_MAX_IMAGES, resolve: true });
+			return { content: [...asText(`[${params.ref}] image_sha256=${sha256}`), image], details: { ref: params.ref, sha256 } };
 		},
 	});
 	pi.registerTool({
@@ -669,6 +686,7 @@ ${candidateGuide(candidates)}`;
 			try {
 				const out = await backend.request<DreamResult>("dream", {
 					proposal_json: params.proposal_json,
+					...(LENIENT_IMAGE_EVIDENCE ? { lenient_images: true } : {}),
 					// A daydream worker reports what it spent up to this submission; it lands on the live pass.
 					...(DAYDREAM_CHILD ? { usage: { ...state.usage, duration_ms: Math.round(process.uptime() * 1000) } } : {}),
 					...(ACTIONS ? {
@@ -887,10 +905,36 @@ ${candidateGuide(candidates)}`;
 			return { block: true, reason: "Offline dreams may only inspect Somni evidence and submit one pass." };
 		}
 		if (event.toolName === "somni_dream") {
-			if (++run.submissions > 3) return { block: true, reason: "Dream submission attempt limit reached." };
-		} else if (++run.reads > 16) {
-			return { block: true, reason: "Dream evidence read limit reached. Submit the pass." };
+			if (++run.submissions > DREAM_MAX_SUBMISSIONS) {
+				return { block: true, reason: `Dream submission limit reached (${DREAM_MAX_SUBMISSIONS}); this dream ends without a pass.` };
+			}
+		} else if (++run.reads > DREAM_MAX_READS) {
+			return { block: true, reason: `Dream evidence read limit reached (${DREAM_MAX_READS} reads). Submit the pass now with ` +
+				"somni_dream; you can still cite every record you have already read." };
 		}
+	});
+
+	// Each Somni tool result in a dream ends with the budget that is left, so the dreamer can plan its reads.
+	pi.on("tool_result", async (event) => {
+		const run = state.dream;
+		if (!run || event.parentToolCallId || !DREAM_TOOLS.has(event.toolName)) return;
+		let images = "";
+		try {
+			const used = await getBackend().request<number>("dream_images", {});
+			images = `images ${Math.max(0, DREAM_MAX_IMAGES - used)}/${DREAM_MAX_IMAGES}, `;
+		} catch {
+			// The budget line is advisory; a backend hiccup must not fail the tool result.
+		}
+		const left = Math.max(0, DREAM_MAX_SUBMISSIONS - run.submissions);
+		let line = `[dream budget left: ${images}reads ${Math.max(0, DREAM_MAX_READS - Math.min(run.reads, DREAM_MAX_READS))}/` +
+			`${DREAM_MAX_READS}, submissions ${left}/${DREAM_MAX_SUBMISSIONS}]`;
+		if (event.toolName === "somni_dream" && event.isError) {
+			line += left ? ` Nothing was committed. Fix or drop the rejected operations and resubmit; ${left} attempt${left === 1 ? "" : "s"} left.`
+				: " No attempts left; this dream ends without a pass.";
+		} else if (run.reads >= DREAM_MAX_READS && !run.result) {
+			line += " No reads left: submit the pass now.";
+		}
+		return { content: [...(event.content ?? []), ...asText(line)] };
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
