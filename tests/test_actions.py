@@ -464,6 +464,42 @@ def test_other_booking_is_kept():
         fresh = SomniMemory.create(tempfile.mkdtemp(), "s", "l", "a")
         self.assertNotIn("word_use", fresh.status())  # a store without words reports nothing
 
+    def test_a_word_is_not_retired_for_failures_of_older_code(self):
+        from somni.store import SOMNI_VERSION
+        self.define()
+        m, word = self.m, "cancel_if_refundable"
+        current = {"source": A.source_hash(m.load().action_words()[word]["source"]), "somni": SOMNI_VERSION}
+        m.set_phase("open")
+        unstamped = m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-1"}}) -> {word} stopped at call 1', tool_ok=False)
+        old_source = m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-2"}}) -> {word} stopped at call 2', tool_ok=False,
+                              word_stamp={**current, "source": "0" * 16})
+        old_somni = m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-3"}}) -> {{"cancelled":false,"confirmed":false}}',
+                             tool_ok=True, word_stamp={**current, "somni": "0.0.1"})
+        m.set_phase("closed")
+        runs = {r["ref"]: r.get("stale") for r in m.load().word_runs([word], per_word=10)[word]}
+        self.assertEqual(runs, {unstamped: "unstamped run (recorded before runs carried versions)",
+                                old_source: "older source of this word", old_somni: "older Somni (0.0.1)"})
+        retire = {"op": "retire_action", "name": word, "reason": "it keeps failing"}
+        with self.assertRaisesRegex(SomniError, r"failed runs .* are all from older code"):
+            self.dream(retire)
+        with self.assertRaisesRegex(SomniError, rf"cites no failing run of its current source .*{old_source}: older source"):
+            self.dream({**retire, "runs": [old_source, old_somni]})
+        with self.assertRaisesRegex(SomniError, "t000002 is not a recorded run"):
+            self.dream({**retire, "runs": ["t000002"]})
+        self.assertIn(word, m.load().action_words())
+        # A failure of the current version is grounds; an uncited retire records the runs it rests on.
+        m.set_phase("open")
+        fresh = m.record("tool_result", f'TOOL {word}({{"booking_id":"BK-4"}}) -> {word} stopped at call 1', tool_ok=False,
+                         word_stamp=current)
+        m.set_phase("closed")
+        dream = self.dream(retire)
+        self.assertEqual(dream["actions"][0], {"op": "retire", "name": word, "reason": "it keeps failing", "runs": [fresh]})
+
+    def test_a_word_without_failures_can_be_retired_as_redundant(self):
+        self.define()
+        dream = self.dream({"op": "retire_action", "name": "cancel_if_refundable", "reason": "superseded"})
+        self.assertEqual(dream["actions"][0]["op"], "retire")
+
 
 if __name__ == "__main__":
     unittest.main()

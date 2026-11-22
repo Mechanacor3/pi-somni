@@ -37,6 +37,7 @@ container regardless.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 import subprocess
@@ -834,13 +835,21 @@ def candidates(records, words=(), *, limit=MINE_LIMIT):
 
 
 def check_retire(operation, words):
-    require(isinstance(operation, dict) and set(operation) == {"op", "name", "reason"},
-            "retire_action needs exactly name and reason")
+    require(isinstance(operation, dict) and {"op", "name", "reason"} <= set(operation) <= {"op", "name", "reason", "runs"},
+            "retire_action needs name and reason, and optionally runs (the failing runs it is retired for)")
     require(operation["name"] in words, "retire_action targets an unknown action word")
     require(isinstance(operation["reason"], str) and operation["reason"].strip(), "retire_action needs a reason")
+    runs = operation.get("runs", [])
+    require(isinstance(runs, list) and len(runs) <= 8 and all(isinstance(r, str) and REF.fullmatch(r) for r in runs),
+            "retire_action runs must be up to 8 transcript ids like t000123")
     users = sorted(w["name"] for w in words.values() if operation["name"] in w["uses"])
     require(not users, f"retire {', '.join(users)} first; they call {operation['name']}")
-    return {"name": operation["name"], "reason": operation["reason"].strip()}
+    return {"name": operation["name"], "reason": operation["reason"].strip(), **({"runs": sorted(set(runs))} if runs else {})}
+
+
+def source_hash(source):
+    """A short digest that changes when a word's source does: run records carry it."""
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
 
 
 def fold(events, words=None):

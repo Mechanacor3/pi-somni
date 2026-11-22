@@ -209,7 +209,7 @@ function notify(ctx: ExtensionContext, message: string) {
 
 async function record(source: "ordinary_observation" | "tool_result" | "agent_output", text: string, ctx: ExtensionContext,
 		options: { tool_ok?: boolean; index_bytes?: number; query?: string; images?: ImageContent[]; omitted_images?: number;
-			action_words?: string[]; calls?: CallTiming[]; via_word?: string } = {}) {
+			action_words?: string[]; calls?: CallTiming[]; via_word?: string; word?: boolean } = {}) {
 	if (!canRecord() || !text.trim()) return;
 	try {
 		const output = await getBackend().request<string>("record", {
@@ -616,7 +616,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	type Workbench = Record<string, { tests: { params: unknown; refs: string[]; result?: unknown }[]; selftests: string[];
-		uses_words: string[]; used_by: string[]; runs: { ref: string; ok: boolean; args: unknown; result: string; confirmed: boolean | null; calls?: CallTiming[] }[] }>;
+		uses_words: string[]; used_by: string[]; runs: { ref: string; ok: boolean; args: unknown; result: string; confirmed: boolean | null; calls?: CallTiming[];
+			stale?: string }[] }>;
 
 	/** Live tool declarations for the backend, which merges them with the task-session catalog and adds signatures. */
 	function liveTools() {
@@ -645,7 +646,8 @@ export default function (pi: ExtensionAPI) {
 			if (info?.selftests.length) lines.push(`Self-tests in the source: ${info.selftests.join(", ")}.`);
 			for (const run of info?.runs ?? []) {
 				const status = !run.ok ? "FAILED" : run.confirmed === true ? "ok, confirmed" : run.confirmed === false ? "ok, UNCONFIRMED" : "ok";
-				lines.push(`Run ${run.ref} ${status}: ${clip(JSON.stringify(run.args), 160)} -> ${clip(run.result, 240)}`);
+				const stale = run.stale ? ` [${run.stale}: not grounds to retire]` : "";
+				lines.push(`Run ${run.ref} ${status}${stale}: ${clip(JSON.stringify(run.args), 160)} -> ${clip(run.result, 240)}`);
 				if (run.calls?.length) lines.push(`  timing: ${callTimeline(run.calls)}`);
 			}
 			if (info && !info.runs.length) lines.push("No recorded runs yet.");
@@ -657,7 +659,7 @@ export default function (pi: ExtensionAPI) {
 
 An action word is one Python function, built from a sequence of tool calls that recurs in the transcript, that the agent can then call as a single tool. Write one as a developer would: read the words and their recent runs below, try your source with somni_action_try, then submit it.
 
-Submit {"op":"define_action","source":"<python>","tests":[...]}. Repair with {"op":"revise_action","source":...,"tests"?:[...]}; remove with {"op":"retire_action","name":...,"reason":...}. Revise or retire a word when its runs show it did not have its effect. A word that other words use cannot be retired; revise or retire them first, in the same pass.
+Submit {"op":"define_action","source":"<python>","tests":[...]}. Repair with {"op":"revise_action","source":...,"tests"?:[...]}; remove with {"op":"retire_action","name":...,"reason":...,"runs":["t000123"]}, citing the failing runs it is retired for. Revise or retire a word when its runs show it did not have its effect. Runs marked as older source or older Somni failed on code that has changed since; they are not grounds to retire, and a retirement that cites only them is rejected. A word that other words use cannot be retired; revise or retire them first, in the same pass.
 
 Writing a word:
 - One \`def name(param: str|int|float|bool|list|dict, ...)\` whose body starts with a one-line docstring (the tool description). Allowed: assignments, if, for over lists or range, comprehensions, arithmetic, indexing, .get/.items/.keys/.values/.lower/.split and similar, and abs min max round int float str len bool sorted sum any all range divmod. No while, try, lambda, classes or I/O.
@@ -1054,7 +1056,7 @@ ${candidateGuide(candidates)}`;
 		const { text, options } = toolRecord(event.toolName, event.input, event.content);
 		const via = event.parentToolCallId ? state.wordCalls.get(event.parentToolCallId) : undefined;
 		await record("tool_result", text, ctx, { ...options, tool_ok: event.isError === false, ...(calls?.length ? { calls } : {}),
-			...(via ? { via_word: via } : {}) });
+			...(via ? { via_word: via } : {}), ...(state.words.has(event.toolName) ? { word: true } : {}) });
 	});
 
 	pi.on("message_end", async (event, ctx) => {

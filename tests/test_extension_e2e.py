@@ -230,6 +230,9 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertNotIn("start_ms", texts[-1])  # not in the result text a calling word parses
         results = [r for r in memory.transcript if r["source"] == "tool_result"]
         self.assertEqual([r.get("via_word") for r in results[-3:]], ["quote_fees", "quote_fees", None])
+        version = json.loads((REPO / "package.json").read_text())["version"]
+        self.assertEqual(results[-1]["word"]["somni"], version)  # which word version, on which Somni, made the run
+        self.assertNotIn("word", results[-2])
         use = memory.status()["word_use"]
         self.assertEqual((use["word_calls"], use["calls_made_by_words"], use["direct_calls_to_wrapped_tools"]), (1, 2, 2))
         # The next dream's workbench shows that timeline beside the run.

@@ -107,6 +107,14 @@ FAILURE_CAUSES = ("provider_error", "no_submission", "all_rejected", "invalid_su
                   "timeout", "other")
 FAILURE_KINDS = ("dream", "wiki", "daydream")
 MAX_FAILURES_BYTES = 1 << 20  # past this the oldest half is dropped; the counts say how many were dropped
+def _somni_version():
+    try:
+        return json.loads((pathlib.Path(__file__).resolve().parent.parent / "package.json").read_text())["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unknown"
+
+
+SOMNI_VERSION = _somni_version()  # stamped on word runs, so a dream can tell runs of older code
 CACHE_FILE = "dream-cache.json"  # evidence reads of an unfinished dream, so a retry on the same records needn't repeat them
 MAX_CACHE_READS = 32
 MAX_CACHE_TEXT = 8_192
@@ -158,6 +166,14 @@ def token_estimate(value):
 MIN_DIGEST_PREFIX = 6
 DEFAULT_DREAM_IMAGES = 16
 MAX_DREAM_IMAGES = 64
+
+
+def _word_stamp(memory, args):
+    """{source, somni} for a word's own result record: which version of the word, on which Somni, made this run."""
+    A = _action_module()
+    match = A.RECORD.match(args.get("text", "")) if isinstance(args.get("text"), str) else None
+    word = memory.load().action_words().get(match[1]) if match else None
+    return {"source": A.source_hash(word["source"]), "somni": SOMNI_VERSION} if word else None
 
 
 def _word_result(text, match):
@@ -1197,7 +1213,8 @@ class SomniMemory:
         return self.record_many([(source, text)], **kwargs)[0]
 
     def record_many(self, items, *, context=None, images=(), omitted_images=0, clip=False,
-                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None, calls=None, via_word=None):
+                    image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None, calls=None, via_word=None,
+                    word_stamp=None):
         """Append several (source, text) records under one lock.
 
         `calls` ([{tool, ok, start_ms, ms}]) times an action word's nested calls on the word's own result.
@@ -1255,6 +1272,8 @@ class SomniMemory:
                     record["calls"] = calls
                 if via_word:
                     record["via_word"] = via_word
+                if word_stamp:
+                    record["word"] = word_stamp
                 if attachments:
                     record["images"] = attachments
                 if omitted_images:
@@ -1432,6 +1451,8 @@ class SomniMemory:
         try:
             if kind == "retire_action":
                 body = A.check_retire(operation, words)
+                if actions.get("author") != "human":  # a human deleting the file needs no evidence
+                    self._check_retire_evidence(body, words[body["name"]])
                 del words[body["name"]]
                 return {"op": "retire", **body}
             if kind == "define_action":
@@ -1918,8 +1939,12 @@ class SomniMemory:
         return catalog
 
     def word_runs(self, names, *, per_word=3, scan=4000):
-        """The most recent runs of each named word in the transcript, newest first."""
+        """The most recent runs of each named word in the transcript, newest first.
+
+        A run of an older version of the word, or on an older Somni, is marked `stale` with the reason.
+        """
         A = _action_module()
+        words = self.action_words()
         recent = {name: [] for name in names}
         for record in reversed(self.transcript[-scan:]):
             match = record.get("source") == "tool_result" and A.RECORD.match(record.get("text", ""))
@@ -1928,10 +1953,45 @@ class SomniMemory:
             args, body, value = _word_result(record["text"], match)
             # Convention: a word returns a top-level boolean `confirmed` when a read-back proved its effect (or not).
             confirmed = value.get("confirmed") if isinstance(value, dict) else None
+            stale = self._run_staleness(record, words.get(match[1]))
             recent[match[1]].append({"ref": record["id"], "ok": record.get("tool_ok") is not False, "args": args,
                                      "result": body[:300], "confirmed": confirmed if isinstance(confirmed, bool) else None,
-                                     **({"calls": record["calls"]} if record.get("calls") else {})})
+                                     **({"calls": record["calls"]} if record.get("calls") else {}),
+                                     **({"stale": stale} if stale else {})})
         return recent
+
+    @staticmethod
+    def _run_staleness(record, word):
+        """Why a word run no longer describes the current word on the current Somni, or None."""
+        stamp = record.get("word")
+        if not isinstance(stamp, dict):
+            return "unstamped run (recorded before runs carried versions)"
+        if word is not None and stamp.get("source") != _action_module().source_hash(word["source"]):
+            return "older source of this word"
+        if stamp.get("somni") != SOMNI_VERSION:
+            return f"older Somni ({stamp.get('somni')})"
+        return None
+
+    def _check_retire_evidence(self, body, word):
+        """A dream may retire a word for failing only on failures of its current source on the current Somni."""
+        runs = {run["ref"]: run for run in self.word_runs([body["name"]], per_word=64, scan=len(self.transcript))[body["name"]]}
+        failing = {ref: run for ref, run in runs.items() if not run["ok"] or run["confirmed"] is False}
+        current = {ref for ref, run in failing.items() if "stale" not in run}
+        cited = body.get("runs", [])
+        for ref in cited:
+            if ref not in runs:
+                raise MemoryError(f"{ref} is not a recorded run of {body['name']}")
+        if cited:
+            if not current & set(cited):
+                why = "; ".join(f"{ref}: {runs[ref].get('stale') or 'it succeeded'}" for ref in cited)
+                raise MemoryError(f"retire_action for {body['name']} cites no failing run of its current source on the current "
+                                  f"Somni ({why}). Those failures may be fixed already: revise the word, or keep it")
+        elif failing and not current:
+            raise MemoryError(f"{body['name']}'s failed runs ({', '.join(sorted(failing))}) are all from older code "
+                              f"({runs[min(failing)].get('stale')}). Those failures may be fixed already: revise the word, "
+                              "keep it, or cite a failing run of the current version")
+        if not cited and current:
+            body["runs"] = sorted(current)[-8:]
 
     def word_use(self, *, labels=50):
         """How often the agent used its words: word calls (ok, failed, confirmed, unconfirmed), calls a word made,
@@ -2449,7 +2509,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             raise MemoryError("invalid tool result image list")
         ref = memory.record(args["source"], args["text"], context=context, images=images, omitted_images=omitted,
                             clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"),
-                            calls=args.get("calls"), via_word=args.get("via_word"))
+                            calls=args.get("calls"), via_word=args.get("via_word"),
+                            word_stamp=_word_stamp(memory, args) if actions and args.get("word") is True else None)
         return ref if index_bytes is None else memory.inject(index_bytes, query=query, learning=learning,
                                                             words=_index_word_names(args) if actions else None)
     elif method == "note":
