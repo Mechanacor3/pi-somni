@@ -121,9 +121,11 @@ const DAYDREAM_TIMEOUT_MS = envNumber("SOMNI_DAYDREAM_TIMEOUT_SECONDS", 300, 10,
 const DAYDREAM_PROMPT_BYTES = Math.floor(envNumber("SOMNI_DAYDREAM_PROMPT_BYTES", 16384, 2048, 131072));
 const STUB_CHARS = 240;
 const DAYDREAMS = !DAYDREAM_CHILD && (DAYDREAM_TURNS > 0 || DAYDREAM_MINUTES > 0);
-const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what just happened in the latest records. Add or " +
-	"correct claims, and define, revise or retire action words, from what the newest records show. Keep the pass small; " +
-	"leave wiki pages to the night dream";
+const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what will help later in this session and in future " +
+	"ones, from the newest records: what the user told you (preferences, corrections, and facts about them and their " +
+	"work), facts the work turned up and where they came from, and steps or checks that worked or failed. An answer the " +
+	"agent could not find is not a fact, so never turn a failed lookup into a claim. Keep the pass small; leave wiki " +
+	"pages to the night dream";
 const AUTH_ERROR = /\b(401|403)\b|unauthori[sz]ed|authenticat|token expired|credential|not logged in|api key/i;
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try"]);
 // Dream budgets. Every Somni tool result in a dream ends with what is left of them.
@@ -204,7 +206,19 @@ const day = {
 	before: undefined as string | undefined, // the last pass when the running daydream started
 	announced: undefined as string | undefined, // the live pass whose notice is already queued
 	forkBroken: false, // a forked daydream failed, so this session's daydreams start cold
+	lessons: "", // the claims the announced pass added, shown to the model with its notice
 };
+
+/** The claims a live pass added, one line each, for the hidden notice: the session can use them right away. */
+async function passLessons(pass: any) {
+	if (!pass?.added_ids?.length) return "";
+	try {
+		const claims = await getBackend().request<{ id: string; text: string; status: string }[]>("claims", { ids: pass.added_ids });
+		return claims.map((c) => `- ${c.id} (${c.status}): ${c.text}`).join("\n");
+	} catch {
+		return "";
+	}
+}
 
 /** The one-line notice for a committed live pass, or undefined if `pass` isn't a new one. */
 function livePassNotice(pass: any) {
@@ -385,6 +399,24 @@ function daydreamListing(records: TranscriptRecord[]) {
 	}
 	const note = omitted ? `[${omitted} older record(s) left out to keep this daydream small; somni_search finds them]\n` : "";
 	return note + lines.reverse().join("\n");
+}
+
+/**
+ * A forked daydream's prompt: a dream step. The fork holds the session's conversation, so it needs only record IDs to
+ * cite, not their text. It writes lessons as unverified claims; the night's dream checks them against the records.
+ */
+function dreamStepPrompt(focus: string, recent: Recent) {
+	const anchors = recent.records.map((r) => `[${r.id}] (${r.source}) ${clip(r.text.replace(/\s+/g, " "), 100)}`);
+	return "Dream step. You are a copy of this session, forked to reflect while the session keeps working. Don't continue " +
+		"the user's task or call its tools. Earlier dream steps appear above as \"Somni daydream\" notices with what they " +
+		`added. From the work since the last step, write down the lessons worth keeping: ${focus}.\n\n` +
+		"Call somni_dream once. Each lesson is one add operation with status \"uncertain\", one or two sentences of text, " +
+		'evidence [{"ref":"t000123"}] citing the records below where it shows (no quotes needed), salience 1–5 (3 for an ' +
+		"ordinary lesson, 5 only for what matters in most sessions) and an optional one-line gist. Don't repeat what an " +
+		"earlier step or the memory index already holds; correct or retract a claim the work has shown to be wrong. Use an " +
+		"empty operations array if nothing new was learned. Tonight's dream checks these lessons against the records.\n\n" +
+		(recent.reviewed_through ? `Records through ${recent.reviewed_through} were reviewed by earlier steps.\n` : "") +
+		`Records since then (ID, source and the start of each; the full text is in the conversation above):\n${anchors.join("\n")}`;
 }
 
 function summary(result: DreamResult) {
@@ -578,6 +610,7 @@ export default function (pi: ExtensionAPI) {
 					const notice = livePassNotice(pass);
 					if (!notice) return done();
 					day.notice = notice;
+					day.lessons = await passLessons(pass);
 				} else if (AUTH_ERROR.test(stderr)) {
 					day.notice = "Somni daydream skipped: auth. The daydream's Pi could not authenticate with its provider. " +
 						clip(stderr.trim().split("\n").slice(-2).join(" "), 240);
@@ -945,6 +978,7 @@ ${candidateGuide(candidates)}`;
 				include_images: ctx.model?.input.includes("image") ?? false,
 				record_limit: DREAM_RECORDS, record_bytes: DREAM_RECORD_BYTES,
 			});
+			if (FORK_OF) return asText(dreamStepPrompt(args?.trim() || DAYDREAM_FOCUS, recent));
 			let learningGuide = "";
 			if (LEARNING) {
 				const ledger = await getBackend().request("ledger");
@@ -963,9 +997,13 @@ ${candidateGuide(candidates)}`;
 				await getBackend().request<Workbench>("action_workbench")) : "";
 			const focus = args?.trim() || "what will help in future sessions with this user and their work: their preferences and corrections, " +
 				"project facts and conventions, steps and checks that worked or failed, and chores that recur";
-			const forked = FORK_OF ? "You are a copy of this session, forked to dream while the session keeps working. The " +
-				"conversation above is your context for what matters; don't continue the user's task or call its tools. " : "";
-			const prompt = forked + `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
+			// The night's dream starts from the day's unverified lessons, so it checks them and builds on them.
+			const lessons = DAYDREAM_CHILD ? [] : await getBackend().request<{ id: string; text: string; refs: string[] }[]>("day_lessons");
+			const dayGuide = lessons.length ? `Today's dream steps added these unverified claims while the work went on. Check ` +
+				`each against the records: correct it to a verified claim with exact quotes when they support it, merge ` +
+				`duplicates, and retract what they don't support (a lookup that found nothing is not a fact). Then add what ` +
+				`they missed.\n${lessons.map((c) => `- ${c.id}: ${c.text} [${c.refs.join(", ")}]`).join("\n")}\n\n` : "";
+			const prompt = dayGuide + `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
 				`For 'verified', cite an exact quote from the record or cite a screenshot you viewed as ` +
 				`{"ref":"t000001","image_sha256":"<digest>"}. Use somni_image for images not attached here. ` +
@@ -1141,15 +1179,22 @@ ${candidateGuide(candidates)}`;
 		if (day.child && !day.notice) {
 			// A daydream that has committed its pass but not yet exited is announced now, not a turn later.
 			try {
-				day.notice = livePassNotice((await getBackend().request<{ last_pass: any }>("status")).last_pass) ?? "";
+				const pass = (await getBackend().request<{ last_pass: any }>("status")).last_pass;
+				day.notice = livePassNotice(pass) ?? "";
 				// The exit handler skips a pass announced here, so the user's notice is shown here too.
-				if (day.notice) notify(ctx, day.notice);
+				if (day.notice) {
+					notify(ctx, day.notice);
+					day.lessons = await passLessons(pass);
+				}
 			} catch {
 				// The worker's exit handler reports it instead.
 			}
 		}
-		const notice = day.notice ? `${day.notice}\n\n` : "";
+		const lessons = day.notice && day.lessons ? `\nWhat this dream step added to memory (unverified claims until the night's ` +
+			`dream checks them):\n${day.lessons}` : "";
+		const notice = day.notice ? `${day.notice}${lessons}\n\n` : "";
 		day.notice = "";
+		day.lessons = "";
 		if (!/^-(?: n\d{6} | rule | page `| word `)/m.test(index)) {
 			return notice ? { message: { customType: "somni-index", content: notice.trim(), display: false } } : undefined;
 		}

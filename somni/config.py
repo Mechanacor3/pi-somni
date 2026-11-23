@@ -119,7 +119,7 @@ SETTINGS = (
     Setting("daydreams.max_reads", "SOMNI_DAYDREAM_MAX_READS", "int", 6,
             "Somni evidence reads per daydream (at most `dreams.max_reads`)", 1, 64),
     Setting("daydreams.focus", "SOMNI_DAYDREAM_FOCUS", "text", "", "Focus text passed to the daydream's `/somni-dream`",
-            default_text="claims and words from the newest records"),
+            default_text="lessons from the newest records: what you said, facts found, steps that worked or failed"),
     Setting("daydreams.command", "SOMNI_DAYDREAM_COMMAND", "str", "", "Command used to start the daydream's Pi",
             default_text="the running Pi"),
 )

@@ -68,7 +68,7 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `daydreams.fork` | `SOMNI_DAYDREAM_FORK` | off | Run each daydream as a fork of the session, so it starts from the session's own context and prompt cache instead of a cold prompt. Needs a saved session and the session's model |
 | `daydreams.prompt_bytes` | `SOMNI_DAYDREAM_PROMPT_BYTES` | `16384` | Size of the record listing in a daydream's prompt, newest first. Tool results appear as one-line stubs the daydream can read in full with `somni_search "t000123"` (2048–131072) |
 | `daydreams.max_reads` | `SOMNI_DAYDREAM_MAX_READS` | `6` | Somni evidence reads per daydream (at most `dreams.max_reads`) (1–64) |
-| `daydreams.focus` | `SOMNI_DAYDREAM_FOCUS` | claims and words from the newest records | Focus text passed to the daydream's `/somni-dream` |
+| `daydreams.focus` | `SOMNI_DAYDREAM_FOCUS` | lessons from the newest records: what you said, facts found, steps that worked or failed | Focus text passed to the daydream's `/somni-dream` |
 | `daydreams.command` | `SOMNI_DAYDREAM_COMMAND` | the running Pi | Command used to start the daydream's Pi |
 | | `SOMNI_CONFIG` | unset | Config file to read instead of the user and project files; `none` reads none |
 | | `SOMNI_RUN_LABEL` | unset | Label on each recorded event, up to 96 UTF-8 bytes |

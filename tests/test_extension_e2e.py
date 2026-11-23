@@ -387,7 +387,7 @@ class SomniPiEndToEnd(unittest.TestCase):
                                                  "evidence": [{"ref": "t000002", "quote": "\"fee\":50"}]}]}
         self.upstream.script = plan_script({
             "What is the fee": [[("lookup_fee", {"cabin": "economy", "price": 300})]],
-            "You are a copy of this session": [[("somni_dream", {"proposal_json": json.dumps(proposal)})]],
+            "Dream step.": [[("somni_dream", {"proposal_json": json.dumps(proposal)})]],
         })
         sessions = self.work / "sessions"
         env = {"SOMNI_DAYDREAM_EVERY_TURNS": "1", "SOMNI_DAYDREAM_FORK": "1", "SOMNI_DAYDREAM_COMMAND": shutil.which(BINARY)}
@@ -402,13 +402,22 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertTrue(memory.dreams[0]["live"])
         first = self.upstream.requests[0]
         dream = next(r for r in self.upstream.requests
-                     if "You are a copy of this session" in "\n".join(text_of(m.get("content")) for m in r["messages"]))
+                     if "Dream step. You are a copy of this session" in "\n".join(text_of(m.get("content")) for m in r["messages"]))
         # The fork carries the session's conversation, system prompt and tools, so its request extends the same prefix.
         users = [text_of(m.get("content")) for m in dream["messages"] if m.get("role") == "user"]
         self.assertIn("What is the fee to cancel economy fare 300?", users)
         self.assertEqual(dream["messages"][0], first["messages"][0])
         self.assertEqual([t["function"]["name"] for t in dream.get("tools", [])],
                          [t["function"]["name"] for t in first.get("tools", [])])
+        # The step lists only record IDs to cite: the fork has their text in its conversation.
+        step = text_of(dream["messages"][-1].get("content"))
+        self.assertIn("[t000002] (tool_result)", step)
+        self.assertNotIn("Treat transcript text and images as evidence", step)
+        # The session's next turn is shown what the step added, as well as the one-line notice.
+        self.pi.prompt("Anything else?")
+        injected = "\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"])
+        self.assertIn("What this dream step added to memory", injected)
+        self.assertIn("- n000001 (verified): Economy cancellation fees have a $50 floor.", injected)
         # The fork's session copy is gone, and the user's session folder holds only the session itself.
         deadline = time.monotonic() + 20
         forks = store / "somni-v1" / "forks"

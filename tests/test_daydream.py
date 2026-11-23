@@ -99,6 +99,22 @@ class DaydreamTest(unittest.TestCase):
         memory.dream({"schema": 1, "operations": [add("t000002", '"echo":2')]}, snapshot=41)
         self.assertEqual(len(_recent(memory, False, set(), head=41)["records"]), DAYDREAM_OVERLAP)
 
+    def test_passes_list_their_claims_and_the_night_dream_gets_the_days_lessons(self):
+        lesson = {"op": "add", "text": "Probes echo their input.", "status": "uncertain", "salience": 3,
+                  "evidence": [{"ref": "t000002"}]}
+        memory = SomniMemory(self.ws, "s").load()
+        first = memory.dream({"schema": 1, "operations": [lesson, add("t000001", '"echo":1', "Probe 1 echoes 1.")]},
+                             snapshot=3)
+        self.assertEqual(first["added_ids"], ["n000001", "n000002"])
+        from somni.store import _dream_summary
+        self.assertEqual(_dream_summary(first)["added_ids"], ["n000001", "n000002"])
+        self.assertEqual([c["id"] for c in memory.claims_by_id(["n000002", "n000009", "n000001"])], ["n000002", "n000001"])
+        # The night's dream gets the unverified lessons from live passes since the last offline pass.
+        self.assertEqual([(c["id"], c["refs"]) for c in memory.day_lessons()], [("n000001", ["t000002"])])
+        self.m.set_phase("closed")
+        memory.load().dream({"schema": 1, "operations": [add("t000003", '"echo":3', "Probe 3 echoes 3.")]})
+        self.assertEqual(memory.load().day_lessons(), [])  # checked tonight; tomorrow starts fresh
+
     def test_search_by_record_id_returns_that_record(self):
         memory = SomniMemory(self.ws, "s").load()
         self.assertEqual([r["id"] for r in memory.search("t000002")], ["t000002"])

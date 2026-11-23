@@ -1645,6 +1645,8 @@ class SomniMemory:
         merged = sum(op == "add" and "merged_from" in body for op, body in prepared)
         dream["added_count"] = sum(op == "add" for op, _ in prepared) - merged
         dream["merged_count"] = merged
+        if added := [body["id"] for op, body in prepared if op == "add"]:
+            dream["added_ids"] = added  # the claims this pass created, so a session can show them
         if words:
             dream["actions"] = words
             dream["operation_count"] += len(words)
@@ -1680,6 +1682,22 @@ class SomniMemory:
             "dream_count": pass_number, "dreams_head": sha(dream),
             **({"wiki_events": wiki_seq, "wiki_head": wiki_head} if wiki_bytes else {}),
         })
+
+    def claims_by_id(self, ids):
+        """The active claims among ``ids``, in that order."""
+        if not isinstance(ids, list) or len(ids) > 64 or not all(isinstance(i, str) for i in ids):
+            raise MemoryError("claim ids must be a list of up to 64 strings")
+        return [{"id": i, "text": c["text"], "status": c["status"], "refs": [e["ref"] for e in c["evidence"]]}
+                for i in ids if (c := self.claims.get(i)) and c["state"] == "active"]
+
+    def day_lessons(self, limit=64):
+        """Unverified claims that daydreams added since the last offline dream: tonight's dream checks them."""
+        ids = []
+        for dream in reversed(self.dreams):
+            if not dream.get("live"):
+                break
+            ids = dream.get("added_ids", []) + ids
+        return [c for c in self.claims_by_id(ids[-limit:]) if c["status"] == "uncertain"]
 
     def search(self, query, limit=20):
         if not isinstance(query, str) or not query.strip() or len(query) > 256 or not 1 <= limit <= 50:
@@ -2452,6 +2470,7 @@ def _dream_summary(dream):
             **({"image_downgrades": dream["image_downgrades"]} if dream.get("image_downgrades") else {}),
             **({"live": True} if dream.get("live") else {}),
             **({"usage": dream["usage"]} if dream.get("usage") else {}),
+            **({"added_ids": dream["added_ids"]} if dream.get("added_ids") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
             "operation_count": dream["operation_count"], "transcript_count": dream["transcript_count"],
             "transcript_head": dream["transcript_head"]}
@@ -2556,6 +2575,10 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
                                     words=_index_word_names(args) if actions else None)
     elif method == "search":
         return memory.load().search(args["query"], args["limit"])
+    elif method == "claims":
+        return memory.load().claims_by_id(args.get("ids", []))
+    elif method == "day_lessons":
+        return memory.load().day_lessons()
     elif method == "recall":
         memory.load()
         query, limit = args["query"], args["limit"]

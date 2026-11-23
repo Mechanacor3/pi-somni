@@ -10,7 +10,9 @@ learned an hour ago after Pi has compacted it out of context. Turn them on with 
 (`pi --mode json -p "/somni-dream <focus>"`) and never waits for it. A daydream is skipped while another is running,
 when nothing has been recorded since the last one, or once `SOMNI_DAYDREAM_PER_HOUR` (default 4) have started in the
 past hour. A child that runs past `SOMNI_DAYDREAM_TIMEOUT_SECONDS` (default 300) is stopped. The default focus is
-claims and action words from the newest records; wiki pages are left to the night's `/somni-dream` and `/somni-wiki`.
+lessons from the newest records: what you told the agent, facts the work turned up, and steps that worked or failed.
+It says that a lookup that found nothing is not a fact. Wiki pages are left to the night's `/somni-dream` and
+`/somni-wiki`.
 A daydream reviews only the records since the last pass, plus the eight before them for context (at most
 `SOMNI_DREAM_RECORDS`), so frequent daydreams don't resend records that earlier passes already reviewed. An offline
 `/somni-dream` still reviews the newest `SOMNI_DREAM_RECORDS` records.
@@ -40,6 +42,14 @@ except its own evidence tools, and the fork's prompt tells it not to continue yo
 kept under the store's `forks/` folder only while it runs, so it never shows up in your session list. A fork needs a
 saved session (not `--no-session`) and your session's model: with `daydreams.model` set, daydreams start cold. If a
 fork fails to start, the session's later daydreams start cold, and the notice says so.
+
+**Dream steps and the night's dream.** A forked daydream is a *dream step*: it reflects on the work since the last
+step and writes the lessons down as unverified (`uncertain`) claims citing their records, without quoting them. The
+records' text is already in its conversation, so its prompt lists only their IDs. When a step commits, the session's
+next turn is shown what it added, so the agent can use those lessons right away, and the next step sees earlier
+steps in its own conversation. The night's `/somni-dream` starts from the day's unverified lessons: it checks each
+against the records, turns it into a verified claim with quotes, merges duplicates and retracts what the records don't
+support, then adds what the steps missed.
 
 **How it stays consistent.** The child's backend runs `store.py serve --daydream`, beside the session that owns
 recording, without taking its lease. It pins the transcript head H it sees at start. `recent` stops at H, and the only
