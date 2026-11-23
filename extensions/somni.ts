@@ -738,7 +738,8 @@ ${candidateGuide(candidates)}`;
 		name: "somni_note",
 		label: "Somni note",
 		description:
-			"Add a durable memory claim. Cite transcript IDs as evidence; 'verified' requires an exact quote " +
+			"Add a durable memory claim: something that will help in a later session, such as the user's preference or correction, " +
+			"a project fact, or a fix that worked. Never save secrets. Cite transcript IDs as evidence; 'verified' requires an exact quote " +
 			"or the image_sha256 of a stored image from each record. Use 'uncertain' for interpretations. Salience 1-5. " +
 			"For longer claims, an optional one-line gist of up to 160 UTF-8 bytes appears in the memory index.",
 		parameters: Type.Object({
@@ -837,13 +838,14 @@ ${candidateGuide(candidates)}`;
 				await getBackend().request<any>("action_catalog", { live: liveTools() }),
 				await getBackend().request<Candidate[]>("action_candidates"),
 				await getBackend().request<Workbench>("action_workbench")) : "";
-			const focus = args?.trim() || "lessons that will help in future sessions";
+			const focus = args?.trim() || "what will help in future sessions with this user and their work: their preferences and corrections, " +
+				"project facts and conventions, steps and checks that worked or failed, and chores that recur";
 			const prompt = `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
 				`For 'verified', cite an exact quote from the record or cite a screenshot you viewed as ` +
 				`{"ref":"t000001","image_sha256":"<digest>"}. Use somni_image for images not attached here. ` +
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
-				`Reserve 5 for at most two claims that matter in most future runs. Add an optional one-line gist ` +
+				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
 				learningGuide + actionsGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				recent.records.map((r) => describeRecord(r)).join("\n");
@@ -865,7 +867,7 @@ ${candidateGuide(candidates)}`;
 				pi.sendMessage({ customType: "somni-wiki", content: "Every active claim is already on a wiki page.", display: true });
 				return;
 			}
-			const goal = args?.trim() || "what will help in future sessions";
+			const goal = args?.trim() || "what will help in future sessions with this user and their work";
 			return `Wiki pass. Goal: ${goal}. ${info.guide} Gather the claims below into pages and call somni_dream once with ` +
 					`page operations: {"op":"page","slug":"lowercase-hyphenated or folder/page","title":...,"body":markdown citing [nXXXXXX] and ` +
 					`linking [[slug]],"claims":[...]}. Extend an existing page by reusing its slug.\n\n## Existing pages\n${info.pages}\n\n## Claims not yet on a page\n${info.claims}`;

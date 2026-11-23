@@ -1,7 +1,16 @@
 # pi-somni
 
-**Somni** is a memory plugin for the [Pi coding agent](https://pi.dev). It keeps three memory layers
-and consolidates them offline ("dreaming"):
+**Somni** gives the [Pi coding agent](https://pi.dev) a memory that gets better the more you work with it.
+It remembers what you told it, what worked and what went wrong, and your project's conventions.
+With action words on, it can also turn chores you repeat into one-step tools. Every memory cites the
+session it came from, and you can read all of it as markdown.
+
+**New here? Start with [Using Somni day to day](docs/everyday-use.md)**: setup, the daily loop,
+correcting a memory, and privacy. The rest of this README is the reference.
+
+## How it works
+
+Somni keeps three memory layers and consolidates them offline ("dreaming"):
 
 1. **Transcript**: a canonical, hash-chained, append-only record of what the agent saw
    (prompts, bounded tool results, and screenshots) and said.
@@ -36,9 +45,11 @@ The design follows Anthropic's engineering essay
 (see [Background and credits](#background-and-credits)). Somni is a small, independent
 interpretation of it, not Anthropic's implementation.
 
-**Measured with the Python STATE-Bench adapter:** the wiki + search condition scored an estimated
-+4.7 percentage points in pooled task completion (95% interval −0.4 to +9.8) and +9.3 in travel.
-See [evaluation methods, results, and tests](EVALUATION.md) for the full comparison and replay.
+**Does it help?** The real test is your own work: fewer repeat questions and fewer repeated mistakes.
+To measure it, we use the public STATE-Bench benchmark of multi-step service tasks as a stand-in for
+"better at day-to-day work". With the Python adapter, the wiki + search condition scored an estimated
++4.7 percentage points in pooled task completion (95% interval −0.4 to +9.8). See
+[evaluation methods, results, and tests](EVALUATION.md) for the full comparison and replay.
 
 ## Install
 
@@ -53,6 +64,8 @@ pi -e git:github.com/Mechanacor3/pi-somni
 ## Use
 
 ### Record, dream, and recall
+
+For everyday habits, see [Using Somni day to day](docs/everyday-use.md). A quick check that it works:
 
 1. Start Pi in a project directory. For a first run, give it a harmless example such as “Our
    sandbox smoke test uses port 8042. Remember this using evidence from this session.”
@@ -70,6 +83,10 @@ In a session Somni records automatically, and adds these tools:
 | `somni_image` | Load image evidence by transcript ID and SHA-256 |
 | `somni_note` | Add a cited claim while working |
 | `somni_dream` | Submit a consolidation pass during `/somni-dream` or `/somni-wiki` |
+
+Two skills come with the package. `somni-memory` tells the agent how to use the index, when to
+recall, and what is worth a note. `somni-action-words` covers action words. Pi lists a skill only
+when the `read` tool is active.
 
 Run `/somni-dream [focus]` to consolidate recent transcript into claims, and
 `/somni-wiki [goal]` to gather claims that are not yet on a page into linked wiki pages.

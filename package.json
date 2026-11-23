@@ -9,7 +9,7 @@
   "files": [
     "extensions/", "skills/", "somni/*.py", "somni/chel/*.py", "adapters/**/*.py",
     "evals/__init__.py", "evals/state_bench/__init__.py", "evals/state_bench/somni_state_bench.py",
-    "README.md", "EVALUATION.md", "LICENSE"
+    "README.md", "EVALUATION.md", "docs/everyday-use.md", "LICENSE"
   ],
   "pi": {"extensions": ["./extensions/somni.ts"], "skills": ["./skills"]},
   "peerDependencies": {

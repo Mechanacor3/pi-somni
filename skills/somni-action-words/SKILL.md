@@ -5,7 +5,7 @@ description: Somni action words are learned Python functions that call this sess
 
 # Somni action words
 
-An action word is a short Python function that Somni learned from your own transcript. It runs a sequence of tool calls that recurred, so you can make the whole sequence with one tool call instead of one turn per call. Each word appears in your tool list under its own name, with a description ending in "Learned action word: calls ...". The memory index at the start of a turn lists the words most relevant to your task as `- word `name(params)`: ...` lines.
+An action word is a short Python function that Somni learned from your own transcript. It runs a sequence of tool calls that recurred, so you can make the whole sequence with one tool call instead of one turn per call. Words are for the chores that keep coming up in this user's work: done in one step, the same way each time, with the checks that worked before. Each word appears in your tool list under its own name, with a description ending in "Learned action word: calls ...". The memory index at the start of a turn lists the words most relevant to your task as `- word `name(params)`: ...` lines.
 
 ## Using a word
 
