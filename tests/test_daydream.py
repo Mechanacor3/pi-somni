@@ -78,6 +78,27 @@ class DaydreamTest(unittest.TestCase):
                 SomniMemory(self.ws, "s").load().dream({"schema": 1, "operations": [add("t000002", '"echo":2')]},
                                                        snapshot=3, usage=bad)
 
+    def test_a_daydream_reviews_records_after_the_last_pass_not_the_whole_window(self):
+        from somni.store import DAYDREAM_OVERLAP, _recent
+        for i in range(4, 41):
+            self.m.record("tool_result", f'TOOL probe({{"i":{i}}}) -> {{"echo":{i}}}', tool_ok=True)
+        memory = SomniMemory(self.ws, "s").load()
+        first = _recent(memory, False, set(), head=30)  # no pass yet: the newest records up to the head
+        self.assertEqual((len(first["records"]), first["records"][-1]["id"]), (30, "t000030"))
+        self.assertNotIn("reviewed_through", first)
+        memory.dream({"schema": 1, "operations": [add("t000001", '"echo":1')]}, snapshot=30)
+        self.m.record("tool_result", 'TOOL probe({"i":41}) -> {"echo":41}', tool_ok=True)
+        later = _recent(memory.load(), False, set(), head=41)
+        ids = [r["id"] for r in later["records"]]
+        self.assertEqual(ids[0], f"t{31 - DAYDREAM_OVERLAP:06d}")  # a few reviewed records, for context
+        self.assertEqual(ids[-1], "t000041")
+        self.assertEqual(later["reviewed_through"], f"t{30 - DAYDREAM_OVERLAP:06d}")
+        # An offline dream still reviews the whole window.
+        self.assertEqual(len(_recent(memory, False, set())["records"]), 41)
+        # A daydream with almost nothing new still gets some context.
+        memory.dream({"schema": 1, "operations": [add("t000002", '"echo":2')]}, snapshot=41)
+        self.assertEqual(len(_recent(memory, False, set(), head=41)["records"]), DAYDREAM_OVERLAP)
+
     def test_daydream_backend_runs_beside_the_recording_owner(self):
         self.m.set_phase("closed")
         owner = Backend(self.ws, "--record")

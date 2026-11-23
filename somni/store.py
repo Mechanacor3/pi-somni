@@ -2453,13 +2453,25 @@ def _dream_summary(dream):
             "transcript_head": dream["transcript_head"]}
 
 
+DAYDREAM_OVERLAP = 8  # records before the last pass's head that a daydream sees again, for context
+
+
 def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORDS,
             record_bytes=DEFAULT_DREAM_RECORD_BYTES, head=None):
+    """The records a dream reviews: the newest `record_limit` up to the head. A daydream (`head` set) starts a few
+    records before the last pass's head instead, so it doesn't resend records earlier passes already reviewed."""
     if type(record_limit) is not int or not 1 <= record_limit <= DEFAULT_DREAM_RECORDS:
         raise MemoryError(f"dream record limit must be 1-{DEFAULT_DREAM_RECORDS}")
     if type(record_bytes) is not int or not 64 <= record_bytes <= MAX_RECORD_BYTES:
         raise MemoryError(f"dream record excerpt must be 64-{MAX_RECORD_BYTES} bytes")
-    records = (memory.transcript if head is None else memory.transcript[:head])[-record_limit:]
+    records = memory.transcript if head is None else memory.transcript[:head]
+    reviewed = None
+    if head is not None and memory.dreams:
+        start = min(max(0, memory.dreams[-1]["transcript_count"] - DAYDREAM_OVERLAP), max(0, len(records) - DAYDREAM_OVERLAP))
+        if start:
+            reviewed = records[start - 1]["id"]  # this record and those before it were reviewed by earlier passes
+        records = records[start:]
+    records = records[-record_limit:]
     attachments = []
     budget = 1024 * 1024
     viewed.clear()
@@ -2481,7 +2493,7 @@ def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORD
             if len(attachments) == MAX_RECORD_IMAGES:
                 break
     excerpts = [{**r, "text": _clip_record(r["text"], record_bytes, b" [excerpt truncated]")} for r in records]
-    return {"records": excerpts, "attachments": attachments}
+    return {"records": excerpts, "attachments": attachments, **({"reviewed_through": reviewed} if reviewed else {})}
 
 
 def _action_module():

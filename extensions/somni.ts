@@ -150,7 +150,8 @@ type RecordContext = { tags?: string[]; run_label?: string; run_labels?: string[
 type TranscriptRecord = RecordContext & {
 	id: string; source: string; text: string; tool_ok?: boolean; images?: { sha256: string }[]; omitted_images?: number;
 };
-type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[] };
+type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[];
+	reviewed_through?: string };
 type DreamResult = {
 	id: string; learning_count?: number; action_count?: number; added_count: number; merged_count: number; rejected_count: number;
 	rejected?: { index: number; reason: string }[];
@@ -895,6 +896,8 @@ ${candidateGuide(candidates)}`;
 				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
 				learningGuide + actionsGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
+				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +
+					`use somni_recall to see what they produced and somni_search if you need one of them.\n\n` : "") +
 				recent.records.map((r) => describeRecord(r)).join("\n");
 			const content: (TextContent | ImageContent)[] = asText(prompt);
 			for (const { ref, sha256, image } of recent.attachments) {

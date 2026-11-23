@@ -11,6 +11,9 @@ learned an hour ago after Pi has compacted it out of context. Turn them on with 
 when nothing has been recorded since the last one, or once `SOMNI_DAYDREAM_PER_HOUR` (default 4) have started in the
 past hour. A child that runs past `SOMNI_DAYDREAM_TIMEOUT_SECONDS` (default 600) is stopped. The default focus is
 claims and action words from the newest records; wiki pages are left to the night's `/somni-dream` and `/somni-wiki`.
+A daydream reviews only the records since the last pass, plus the eight before them for context (at most
+`SOMNI_DREAM_RECORDS`), so frequent daydreams don't resend records that earlier passes already reviewed. An offline
+`/somni-dream` still reviews the newest `SOMNI_DREAM_RECORDS` records.
 
 **What you see.** When the pass commits, Pi shows a one-line notice, and the next turn's injected index starts with it,
 for example `Somni daydream d000012: +2 claim(s), 0 merged, 1 action word change(s), 0 rejected (records up to 481,
