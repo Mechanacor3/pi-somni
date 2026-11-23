@@ -36,7 +36,7 @@ import { Type, type ImageContent, type TextContent } from "@earendil-works/pi-ai
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Backend } from "./backend.ts";
@@ -106,6 +106,9 @@ const configuredActionCalls = Number(process.env.SOMNI_ACTION_MAX_CALLS ?? 16);
 const ACTION_MAX_CALLS = Number.isInteger(configuredActionCalls) ? Math.min(64, Math.max(1, configuredActionCalls)) : 16;
 // Daydreams: live dream passes run by a child Pi while this session keeps recording.
 const DAYDREAM_CHILD = process.env.SOMNI_DAYDREAM === "1"; // this process is a daydream worker
+// A forked daydream worker: the parent session's ID, which stays the provider's prompt cache key.
+const FORK_OF = DAYDREAM_CHILD ? process.env.SOMNI_DAYDREAM_FORK_OF || undefined : undefined;
+const DAYDREAM_FORK = process.env.SOMNI_DAYDREAM_FORK === "1";
 const envNumber = (name: string, fallback: number, min: number, max: number) => {
 	const value = Number(process.env[name] ?? fallback);
 	return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
@@ -200,6 +203,7 @@ const day = {
 	notice: "",
 	before: undefined as string | undefined, // the last pass when the running daydream started
 	announced: undefined as string | undefined, // the live pass whose notice is already queued
+	forkBroken: false, // a forked daydream failed, so this session's daydreams start cold
 };
 
 /** The one-line notice for a committed live pass, or undefined if `pass` isn't a new one. */
@@ -222,6 +226,34 @@ function piInvocation(args: string[]) {
 	if (script && !virtual && existsSync(script)) return { command: process.execPath, args: [script, ...args] };
 	if (!/^(node|bun)(\.exe)?$/.test(basename(process.execPath).toLowerCase())) return { command: process.execPath, args };
 	return { command: "pi", args };
+}
+
+// Pi flags that pick the mode, session or prompt. A forked daydream drops them and keeps every other flag, so it loads
+// the same extensions, tools and system prompt as its session and its requests start with the same cached prefix.
+const FORK_DROP_VALUE = new Set(["--mode", "--session", "--session-id", "--fork", "--session-dir", "--name", "-n",
+	"--export", "--use-theme", "--tui-mode"]);
+const FORK_DROP = new Set(["--print", "-p", "--continue", "-c", "--resume", "-r", "--no-session", "--verbose"]);
+const FORK_KEEP_VALUE = new Set(["--provider", "--model", "--api-key", "--system-prompt", "--append-system-prompt",
+	"--models", "--tools", "-t", "--exclude-tools", "-xt", "--thinking", "--extension", "-e", "--skill",
+	"--prompt-template", "--theme"]);
+
+/** The session's own Pi arguments, without its mode, session or messages. */
+export function forkArgs(argv: string[]) {
+	const kept: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--") break; // the rest are messages
+		const flag = arg.split("=", 1)[0];
+		if (FORK_DROP_VALUE.has(flag)) {
+			if (!arg.includes("=")) i++;
+		} else if (FORK_KEEP_VALUE.has(flag)) {
+			kept.push(arg);
+			if (!arg.includes("=") && i + 1 < argv.length) kept.push(argv[++i]);
+		} else if (arg.startsWith("-") && !FORK_DROP.has(flag)) {
+			kept.push(arg); // other flags are taken to be switches; a message after one is dropped
+		}
+	}
+	return kept;
 }
 
 function getBackend() {
@@ -508,7 +540,14 @@ export default function (pi: ExtensionAPI) {
 		day.turns = 0;
 		day.before = status.last_pass?.id;
 		const model = process.env.SOMNI_DAYDREAM_MODEL || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
-		const args = ["--mode", "json", "--no-session", "--no-approve", "--no-extensions", "--no-builtin-tools", "--no-mcp",
+		// A fork starts from the saved session and its cached prefix; it needs the session's model to reuse the cache.
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		const fork = DAYDREAM_FORK && !day.forkBroken && sessionFile && existsSync(sessionFile) && !process.env.SOMNI_DAYDREAM_MODEL;
+		const forkDir = fork ? join(state.workspace, "somni-v1", "forks", `${process.pid}-${now}`) : undefined;
+		if (forkDir) mkdirSync(forkDir, { recursive: true });
+		const args = fork ? [...forkArgs(process.argv.slice(2)), "--mode", "json", "--fork", sessionFile, "--session-dir", forkDir!,
+			...(process.env.SOMNI_DAYDREAM_THINKING ? ["--thinking", process.env.SOMNI_DAYDREAM_THINKING] : []),
+			"-p", `/somni-dream ${DAYDREAM_FOCUS}`] : ["--mode", "json", "--no-session", "--no-approve", "--no-extensions", "--no-builtin-tools", "--no-mcp",
 			"--no-skills", "--no-prompt-templates", "--no-context-files", "-e", fileURLToPath(import.meta.url),
 			...(ACTIONS ? ["--skill", resolve(HERE, "../skills/somni-action-words")] : []),
 			...(model ? ["--model", model] : []),
@@ -518,7 +557,8 @@ export default function (pi: ExtensionAPI) {
 		let stderr = "";
 		const child = spawn(invocation.command, invocation.args, {
 			cwd: ctx.cwd, shell: false, stdio: ["ignore", "ignore", "pipe"],
-			env: { ...process.env, SOMNI_DAYDREAM: "1", SOMNI_RECORD: "0", SOMNI_WORKSPACE: state.workspace },
+			env: { ...process.env, SOMNI_DAYDREAM: "1", SOMNI_RECORD: "0", SOMNI_WORKSPACE: state.workspace,
+				...(fork ? { SOMNI_DAYDREAM_FORK_OF: ctx.sessionManager.getSessionId() } : {}) },
 		});
 		day.child = child;
 		child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
@@ -529,6 +569,7 @@ export default function (pi: ExtensionAPI) {
 			clearTimeout(timeout);
 			// day.child stays set until the notice is settled, so a turn starting meanwhile checks the store itself.
 			const done = () => { if (day.child === child) day.child = undefined; };
+			if (forkDir) rmSync(forkDir, { recursive: true, force: true }); // the fork's session copy
 			try {
 				const after = await getBackend().request<{ last_pass: any }>("status");
 				const pass = after.last_pass;
@@ -544,6 +585,10 @@ export default function (pi: ExtensionAPI) {
 					if (timedOut) await recordFailure({ cause: "timeout", detail: `stopped after ${DAYDREAM_TIMEOUT_MS / 1000}s` }, "daydream");
 					day.notice = `Somni daydream made no pass (${signal ? `stopped by ${signal}` : `exit ${code}`}). ` +
 						clip(stderr.trim().split("\n").slice(-3).join(" "), 300);
+					if (forkDir && !timedOut) {
+						day.forkBroken = true;
+						day.notice += " Later daydreams in this session start cold instead of forking it.";
+					}
 				}
 			} catch (error) {
 				day.notice = `Somni daydream finished, but its result could not be read. ${(error as Error).message}`;
@@ -918,7 +963,9 @@ ${candidateGuide(candidates)}`;
 				await getBackend().request<Workbench>("action_workbench")) : "";
 			const focus = args?.trim() || "what will help in future sessions with this user and their work: their preferences and corrections, " +
 				"project facts and conventions, steps and checks that worked or failed, and chores that recur";
-			const prompt = `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
+			const forked = FORK_OF ? "You are a copy of this session, forked to dream while the session keeps working. The " +
+				"conversation above is your context for what matters; don't continue the user's task or call its tools. " : "";
+			const prompt = forked + `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
 				`For 'verified', cite an exact quote from the record or cite a screenshot you viewed as ` +
 				`{"ref":"t000001","image_sha256":"<digest>"}. Use somni_image for images not attached here. ` +
@@ -1113,6 +1160,17 @@ ${candidateGuide(candidates)}`;
 		}
 		return { message: { customType: "somni-index", content: notice + index + guide, display: false } };
 	});
+
+	// A forked daydream keeps its session's prompt cache key, so its requests can reuse the session's cached prefix.
+	if (FORK_OF) {
+		pi.on("before_provider_request", (event) => {
+			const payload = event.payload as { prompt_cache_key?: string };
+			if (payload && typeof payload === "object" && "prompt_cache_key" in payload && payload.prompt_cache_key) {
+				return { ...payload, prompt_cache_key: FORK_OF.slice(0, 64) };
+			}
+			return undefined;
+		});
+	}
 
 	pi.on("tool_call", (event) => {
 		const run = state.dream;

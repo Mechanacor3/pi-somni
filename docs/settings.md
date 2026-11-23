@@ -65,6 +65,7 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `daydreams.model` | `SOMNI_DAYDREAM_MODEL` | the session's model | Model for daydreams, as `provider/id` |
 | `daydreams.thinking` | `SOMNI_DAYDREAM_THINKING` | Pi's default | Thinking level for daydreams |
 | `daydreams.timeout_seconds` | `SOMNI_DAYDREAM_TIMEOUT_SECONDS` | `300` | Stop a daydream that runs longer (10–7200) |
+| `daydreams.fork` | `SOMNI_DAYDREAM_FORK` | off | Run each daydream as a fork of the session, so it starts from the session's own context and prompt cache instead of a cold prompt. Needs a saved session and the session's model |
 | `daydreams.prompt_bytes` | `SOMNI_DAYDREAM_PROMPT_BYTES` | `16384` | Size of the record listing in a daydream's prompt, newest first. Tool results appear as one-line stubs the daydream can read in full with `somni_search "t000123"` (2048–131072) |
 | `daydreams.max_reads` | `SOMNI_DAYDREAM_MAX_READS` | `6` | Somni evidence reads per daydream (at most `dreams.max_reads`) (1–64) |
 | `daydreams.focus` | `SOMNI_DAYDREAM_FOCUS` | claims and words from the newest records | Focus text passed to the daydream's `/somni-dream` |
@@ -73,7 +74,8 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | | `SOMNI_RUN_LABEL` | unset | Label on each recorded event, up to 96 UTF-8 bytes |
 | | `SOMNI_TAGS` | unset | JSON array of up to eight printable tags, each up to 96 UTF-8 bytes |
 | | `SOMNI_DAYDREAM` | unset | Set by Somni in a daydream worker |
+| | `SOMNI_DAYDREAM_FORK_OF` | unset | Set by Somni in a forked daydream worker: the parent session's ID |
 | | `SOMNI_STORE` | unset | Path to an alternative `store.py` (development) |
 
-`SOMNI_RUN_LABEL`, `SOMNI_TAGS`, `SOMNI_CONFIG`, `SOMNI_DAYDREAM` and `SOMNI_STORE` are environment-only: they are set
+`SOMNI_RUN_LABEL`, `SOMNI_TAGS`, `SOMNI_CONFIG`, `SOMNI_DAYDREAM`, `SOMNI_DAYDREAM_FORK_OF` and `SOMNI_STORE` are environment-only: they are set
 per run or by Somni itself.

@@ -110,6 +110,9 @@ SETTINGS = (
             default_text="Pi's default"),
     Setting("daydreams.timeout_seconds", "SOMNI_DAYDREAM_TIMEOUT_SECONDS", "number", 300,
             "Stop a daydream that runs longer", 10, 7200),
+    Setting("daydreams.fork", "SOMNI_DAYDREAM_FORK", "bool", False,
+            "Run each daydream as a fork of the session, so it starts from the session's own context and prompt cache "
+            "instead of a cold prompt. Needs a saved session and the session's model"),
     Setting("daydreams.prompt_bytes", "SOMNI_DAYDREAM_PROMPT_BYTES", "int", 16384,
             "Size of the record listing in a daydream's prompt, newest first. Tool results appear as one-line stubs "
             "the daydream can read in full with `somni_search \"t000123\"`", 2048, 131072),
@@ -129,6 +132,7 @@ ENV_ONLY = {
     "SOMNI_RUN_LABEL": "Label on each recorded event, up to 96 UTF-8 bytes",
     "SOMNI_TAGS": "JSON array of up to eight printable tags, each up to 96 UTF-8 bytes",
     "SOMNI_DAYDREAM": "Set by Somni in a daydream worker",
+    "SOMNI_DAYDREAM_FORK_OF": "Set by Somni in a forked daydream worker: the parent session's ID",
     "SOMNI_STORE": "Path to an alternative `store.py` (development)",
 }
 TRUE_WORDS, FALSE_WORDS = {"true", "yes", "on", "1"}, {"false", "no", "off", "0"}

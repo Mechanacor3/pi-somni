@@ -379,6 +379,44 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.pi.prompt("Anything else?")
         self.assertEqual(sum("Somni daydream d000001" in message for message in shown()), 1, shown())
 
+    @unittest.skipUnless(BINARY, "the daydream worker starts the host Pi binary")
+    def test_a_forked_daydream_starts_from_the_session_and_keeps_its_prefix(self):
+        self.pi.close()
+        proposal = {"schema": 1, "operations": [{"op": "add", "text": "Economy cancellation fees have a $50 floor.",
+                                                 "status": "verified", "salience": 3,
+                                                 "evidence": [{"ref": "t000002", "quote": "\"fee\":50"}]}]}
+        self.upstream.script = plan_script({
+            "What is the fee": [[("lookup_fee", {"cabin": "economy", "price": 300})]],
+            "You are a copy of this session": [[("somni_dream", {"proposal_json": json.dumps(proposal)})]],
+        })
+        sessions = self.work / "sessions"
+        env = {"SOMNI_DAYDREAM_EVERY_TURNS": "1", "SOMNI_DAYDREAM_FORK": "1", "SOMNI_DAYDREAM_COMMAND": shutil.which(BINARY)}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env, sessions=sessions)
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        store = self.work / ".pi" / "somni"
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not SomniMemory(store, "pi").load().dreams:
+            time.sleep(0.5)
+        memory = SomniMemory(store, "pi").load()
+        self.assertEqual(len(memory.dreams), 1, "the forked daydream did not commit a pass")
+        self.assertTrue(memory.dreams[0]["live"])
+        first = self.upstream.requests[0]
+        dream = next(r for r in self.upstream.requests
+                     if "You are a copy of this session" in "\n".join(text_of(m.get("content")) for m in r["messages"]))
+        # The fork carries the session's conversation, system prompt and tools, so its request extends the same prefix.
+        users = [text_of(m.get("content")) for m in dream["messages"] if m.get("role") == "user"]
+        self.assertIn("What is the fee to cancel economy fare 300?", users)
+        self.assertEqual(dream["messages"][0], first["messages"][0])
+        self.assertEqual([t["function"]["name"] for t in dream.get("tools", [])],
+                         [t["function"]["name"] for t in first.get("tools", [])])
+        # The fork's session copy is gone, and the user's session folder holds only the session itself.
+        deadline = time.monotonic() + 20
+        forks = store / "somni-v1" / "forks"
+        while time.monotonic() < deadline and forks.exists() and any(forks.iterdir()):
+            time.sleep(0.5)
+        self.assertFalse(forks.exists() and any(forks.iterdir()))
+        self.assertEqual(len([p for p in sessions.rglob("*.jsonl")]), 1)
+
     def test_word_passes_on_images_from_its_final_call_only(self):
         self.pi.close()
         folder = self.work / ".pi" / "somni" / "somni-v1" / "actions"

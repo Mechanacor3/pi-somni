@@ -32,6 +32,15 @@ turns feel slower while it runs. The daydream's Pi totals the usage its provider
 `cacheRead`, `cacheWrite`, `totalTokens`, `cost`, model `calls`, `duration_ms`) and submits it with the pass. It is
 stored in the hash-chained pass record as `usage`, covering spend up to the submission.
 
+**Forked daydreams.** With `daydreams.fork: true`, a daydream starts as a fork of your saved session
+(`pi --fork`), with your session's own Pi arguments, so it loads the same extensions, tools and system prompt. It
+begins from your whole conversation, and its requests start with the same prefix as your session's, which the
+provider has usually cached already. It keeps your session's prompt cache key. Somni blocks every tool in the fork
+except its own evidence tools, and the fork's prompt tells it not to continue your task. The fork's session copy is
+kept under the store's `forks/` folder only while it runs, so it never shows up in your session list. A fork needs a
+saved session (not `--no-session`) and your session's model: with `daydreams.model` set, daydreams start cold. If a
+fork fails to start, the session's later daydreams start cold, and the notice says so.
+
 **How it stays consistent.** The child's backend runs `store.py serve --daydream`, beside the session that owns
 recording, without taking its lease. It pins the transcript head H it sees at start. `recent` stops at H, and the only
 write it accepts is one dream pass. That pass is a *live* pass, marked `"live": true` and bound to H instead of the
