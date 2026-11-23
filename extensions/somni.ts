@@ -193,7 +193,21 @@ const day = {
 	turns: 0,
 	timer: undefined as ReturnType<typeof setInterval> | undefined,
 	notice: "",
+	before: undefined as string | undefined, // the last pass when the running daydream started
+	announced: undefined as string | undefined, // the live pass whose notice is already queued
 };
+
+/** The one-line notice for a committed live pass, or undefined if `pass` isn't a new one. */
+function livePassNotice(pass: any) {
+	if (!pass || !pass.live || pass.id === day.before || pass.id === day.announced) return undefined;
+	day.announced = pass.id;
+	const words = pass.action_count ? `, ${pass.action_count} action word change(s)` : "";
+	const u = pass.usage;
+	const spent = u ? `, $${u.cost.toFixed(2)}, ${Math.round(u.totalTokens / 1000)}k tok, ` +
+		`${Math.round((u.duration_ms ?? 0) / 1000)}s` : "";
+	return `Somni daydream ${pass.id}: +${pass.added_count ?? 0} claim(s), ${pass.merged_count ?? 0} merged` +
+		`${words}, ${pass.rejected_count} rejected (records up to ${pass.transcript_count}${spent}).`;
+}
 
 /** How to start another Pi, as Pi's own subagent example does; SOMNI_DAYDREAM_COMMAND overrides it. */
 function piInvocation(args: string[]) {
@@ -463,7 +477,7 @@ export default function (pi: ExtensionAPI) {
 		day.lastCount = status.transcript_count;
 		day.starts.push(now);
 		day.turns = 0;
-		const before = status.last_pass?.id;
+		day.before = status.last_pass?.id;
 		const model = process.env.SOMNI_DAYDREAM_MODEL || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 		const args = ["--mode", "json", "--no-session", "--no-approve", "--no-extensions", "--no-builtin-tools", "--no-mcp",
 			"--no-skills", "--no-prompt-templates", "--no-context-files", "-e", fileURLToPath(import.meta.url),
@@ -484,17 +498,16 @@ export default function (pi: ExtensionAPI) {
 		child.on("error", (error) => { stderr += ` ${error.message}`; });
 		child.on("close", async (code, signal) => {
 			clearTimeout(timeout);
-			if (day.child === child) day.child = undefined;
+			// day.child stays set until the notice is settled, so a turn starting meanwhile checks the store itself.
+			const done = () => { if (day.child === child) day.child = undefined; };
 			try {
 				const after = await getBackend().request<{ last_pass: any }>("status");
 				const pass = after.last_pass;
-				if (pass && pass.id !== before && pass.live) {
-					const words = pass.action_count ? `, ${pass.action_count} action word change(s)` : "";
-					const u = pass.usage;
-					const spent = u ? `, $${u.cost.toFixed(2)}, ${Math.round(u.totalTokens / 1000)}k tok, ` +
-						`${Math.round((u.duration_ms ?? 0) / 1000)}s` : "";
-					day.notice = `Somni daydream ${pass.id}: +${pass.added_count ?? 0} claim(s), ${pass.merged_count ?? 0} merged` +
-						`${words}, ${pass.rejected_count} rejected (records up to ${pass.transcript_count}${spent}).`;
+				if (pass?.live && pass.id !== day.before) {
+					// The next turn may have announced it already, while this worker was still exiting.
+					const notice = livePassNotice(pass);
+					if (!notice) return done();
+					day.notice = notice;
 				} else if (AUTH_ERROR.test(stderr)) {
 					day.notice = "Somni daydream skipped: auth. The daydream's Pi could not authenticate with its provider. " +
 						clip(stderr.trim().split("\n").slice(-2).join(" "), 240);
@@ -506,6 +519,7 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) {
 				day.notice = `Somni daydream finished, but its result could not be read. ${(error as Error).message}`;
 			}
+			done();
 			notify(ctx, day.notice);
 		});
 	}
@@ -1043,6 +1057,14 @@ ${candidateGuide(candidates)}`;
 				notify(ctx, `Somni could not load its memory index. ${(error as Error).message}`);
 			}
 			return undefined;
+		}
+		if (day.child && !day.notice) {
+			// A daydream that has committed its pass but not yet exited is announced now, not a turn later.
+			try {
+				day.notice = livePassNotice((await getBackend().request<{ last_pass: any }>("status")).last_pass) ?? "";
+			} catch {
+				// The worker's exit handler reports it instead.
+			}
 		}
 		const notice = day.notice ? `${day.notice}\n\n` : "";
 		day.notice = "";
