@@ -641,6 +641,26 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(out.splitlines()[-1], "Somni dream d000001: 0 added, 0 rejected, 0 merged.")
 
+    def test_a_config_file_sets_options_and_somni_doctor_checks_it_offline(self):
+        self.pi.close()
+        (self.work / ".pi" / "somni.conf").write_text("store:\n  path: memory-here\nindex.bytes: 300\nactions.enable: true\n")
+        code, out, err = PiSession("extensions/somni.ts", self.work, self.upstream.port, mode="text",
+                                   prompt="Anything new?").finish()
+        self.assertEqual(code, 0, err)
+        self.assertIn("Somni config: 1 problem(s)", err)
+        self.assertIn("somni.conf:4: actions.enable is not a Somni setting; did you mean actions.enabled?", err)
+        self.assertTrue((self.work / "memory-here" / "somni-v1").is_dir())  # store.path from the file
+        requests = len(self.upstream.requests)
+        code, _, out = PiSession("extensions/somni.ts", self.work, self.upstream.port, mode="text",
+                                 prompt="/somni-doctor").finish()  # headless Pi reports on stderr
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.upstream.requests), requests)  # no model call
+        self.assertIn("Somni doctor (pi-somni", out)
+        self.assertIn("did you mean actions.enabled?", out)
+        self.assertRegex(out, r"index\.bytes\s+300\s+\(.*somni\.conf:3\)")  # sourced from the file, not the environment
+        self.assertIn("also holds a store", out)  # the session before the file used .pi/somni
+        self.assertIn("bin/somni doctor", out)
+
     def test_dream_can_fetch_an_image_outside_the_attachment_limit(self):
         self.pi.prompt("Anything else?")
         self.pi.close()

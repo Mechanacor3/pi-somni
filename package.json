@@ -7,10 +7,11 @@
   "type": "module",
   "repository": {"type": "git", "url": "git+https://github.com/Mechanacor3/pi-somni.git"},
   "files": [
-    "extensions/", "skills/", "somni/*.py", "somni/chel/*.py", "adapters/**/*.py",
+    "bin/", "extensions/", "skills/", "somni/*.py", "somni/chel/*.py", "adapters/**/*.py",
     "evals/__init__.py", "evals/state_bench/__init__.py", "evals/state_bench/somni_state_bench.py",
     "README.md", "EVALUATION.md", "docs/everyday-use.md", "LICENSE"
   ],
+  "bin": {"somni": "bin/somni"},
   "pi": {"extensions": ["./extensions/somni.ts"], "skills": ["./skills"]},
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

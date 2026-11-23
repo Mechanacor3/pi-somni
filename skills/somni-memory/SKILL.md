@@ -58,6 +58,12 @@ the notes into pages. During those commands, follow the dream prompt. Keep what 
 this user's work later: preferences, corrections, project facts and conventions, and steps and
 checks that worked or failed.
 
+## Settings and problems
+
+Somni's settings live in `~/.config/somni/somni.conf` and the project's `.pi/somni.conf`. When the
+user asks to change how memory works, or memory seems not to work, suggest `/somni-doctor`. It
+checks the settings and the store without a model call and says what to fix.
+
 ## Action words
 
 If the index lists learned action words, see the `somni-action-words` skill. A word does a

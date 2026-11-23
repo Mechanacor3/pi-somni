@@ -35,13 +35,45 @@
 import { Type, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Backend } from "./backend.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const CONFIG_PY = resolve(HERE, "../somni/config.py");
+
+/**
+ * somni.conf. Settings from SOMNI_CONFIG, or from ~/.config/somni/somni.conf and <cwd>/.pi/somni.conf, fill in
+ * each SOMNI_* variable that the environment leaves unset; everything below reads the variables, and the backend
+ * and daydream workers inherit them. somni/config.py is the one parser and schema, shared with `somni doctor`.
+ */
+const CONFIG = (() => {
+	const applied = new Set<string>();
+	const problems: string[] = [];
+	const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+	const user = join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "somni", "somni.conf");
+	if (process.env.SOMNI_CONFIG === undefined && !existsSync(user) && !existsSync(join(process.cwd(), ".pi", "somni.conf"))) {
+		return { applied, problems };
+	}
+	const out = spawnSync(process.env.SOMNI_PYTHON ?? "python3", ["-I", "-B", CONFIG_PY, "resolve", "--cwd", process.cwd(), "--json"],
+		{ encoding: "utf8", timeout: 15_000 });
+	try {
+		if (out.error || out.status !== 0) throw new Error(out.error?.message || out.stderr.trim() || `exit ${out.status}`);
+		const resolved = JSON.parse(out.stdout) as { env: Record<string, string>; errors: { file?: string; line?: number; message: string }[] };
+		for (const [name, value] of Object.entries(resolved.env)) {
+			if (process.env[name] === undefined) {
+				process.env[name] = value;
+				applied.add(name);
+			}
+		}
+		for (const e of resolved.errors) problems.push(`${e.file ? basename(e.file) : "config"}${e.line ? `:${e.line}` : ""}: ${e.message}`);
+	} catch (error) {
+		problems.push(`could not read the config files: ${(error as Error).message}`);
+	}
+	return { applied, problems };
+})();
 
 /**
  * The skill's "Using a word" section. Pi lists a --skill skill only when the read tool is active, so a session
@@ -149,6 +181,7 @@ const state = {
 	words: new Map<string, string>(), // registered action word -> source
 	wordCalls: new Map<string, string>(), // tool call ID of each running action word -> its name
 	wordTimings: new Map<string, CallTiming[]>(), // a finished word's nested-call timings, until its result is recorded
+	configWarned: false, // config file problems were shown (once per process)
 	wordGuideShown: false, // the "Using a word" guidance went into this session's index (sessions without read)
 	workspace: "",
 	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, calls: 0 },
@@ -857,6 +890,29 @@ ${candidateGuide(candidates)}`;
 		}, "dream"),
 	});
 
+	pi.registerCommand("somni-doctor", {
+		description: "Check Somni's settings, runtime and memory store offline (no model call): `/somni-doctor [all]`",
+		handler: async (args, ctx) => {
+			// The doctor re-reads the config files itself, so hide the variables this process filled in from them.
+			const env = { ...process.env };
+			for (const name of CONFIG.applied) delete env[name];
+			const session = { tools: pi.getActiveTools(), writable: state.writable };
+			const argv = ["-I", "-B", resolve(HERE, "../somni/doctor.py"), "--cwd", ctx.cwd, "--session-json", JSON.stringify(session)];
+			if (args?.trim() === "all") argv.push("--all");
+			const report = await new Promise<string>((done) => {
+				const child = spawn(process.env.SOMNI_PYTHON ?? "python3", argv, { env, stdio: ["ignore", "pipe", "pipe"] });
+				let out = "", err = "";
+				child.stdout.on("data", (chunk) => { out += chunk; });
+				child.stderr.on("data", (chunk) => { err += chunk; });
+				child.on("error", (error) => done(`Somni doctor could not start: ${error.message}`));
+				child.on("close", () => done((out || err).trim() + `\n\nOffline: ${resolve(HERE, "../bin/somni")} doctor`));
+			});
+			// Headless Pi keeps stdout for the model's reply, so the report goes to stderr there.
+			if (ctx.mode === "print" || ctx.mode === "json") console.error(report);
+			else pi.sendMessage({ customType: "somni-doctor", content: report, display: true });
+		},
+	});
+
 	pi.registerCommand("somni-wiki", {
 		description: "Gather claims into linked wiki pages (dreaming that builds representations)",
 		handler: (args, ctx) => submitCommand(ctx, async () => {
@@ -899,6 +955,11 @@ ${candidateGuide(candidates)}`;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (CONFIG.problems.length && !state.configWarned) {
+			state.configWarned = true;
+			notify(ctx, `Somni config: ${CONFIG.problems.length} problem(s); those settings keep their previous values. ` +
+				`${CONFIG.problems.slice(0, 3).join("; ")}${CONFIG.problems.length > 3 ? "; ..." : ""}. Run /somni-doctor for details.`);
+		}
 		const workspace = process.env.SOMNI_WORKSPACE ?? join(ctx.cwd, ".pi", "somni");
 		state.dream = undefined;
 		state.writable = state.recordWarning = state.indexWarning = false;

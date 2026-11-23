@@ -30,6 +30,29 @@ the agent saw in your sessions, which can include file contents and command outp
 echo ".pi/somni/" >> .gitignore
 ```
 
+Then run `/somni-doctor` in Pi. It checks your settings, the Python backend and the memory store
+without calling a model, and says what to fix.
+
+### Your settings file
+
+Somni works with no settings. When you want to change something, put it in a settings file:
+
+- `~/.config/somni/somni.conf` holds your personal defaults, for every project.
+- `.pi/somni.conf` in a project overrides them for that project.
+
+It's YAML:
+
+```yaml
+actions:
+  enabled: true          # let dreams write action words
+daydreams:
+  every_minutes: 30
+```
+
+`/somni-doctor` points out a misspelled setting or a bad value, with the file and line. The
+README's [settings table](../README.md#settings-and-somni-doctor) lists every setting. Every
+setting also has an environment variable, which wins over the files, for scripts and one-off runs.
+
 ## The daily loop
 
 1. **Work as usual.** Somni records each session automatically: your prompts, the agent's
@@ -74,7 +97,7 @@ The vault is a view, so editing it changes nothing. Tell the agent instead:
 
 ## Chores in one step (optional)
 
-Start Pi with `SOMNI_ACTIONS=1` to let dreams write action words. A dream looks for sequences of
+Set `actions.enabled: true` in your settings file to let dreams write action words. A dream looks for sequences of
 tool calls that keep recurring, such as "check the service status, restart it, check again". It
 can turn one into a function like `restart_and_check(service)`. The agent then sees the word
 in its tool list and memory index, and calls it in one step.
@@ -84,18 +107,22 @@ in its tool list and memory index, and calls it in one step.
 - You can write a word yourself. The [action-words skill](../skills/somni-action-words/SKILL.md)
   shows the format.
 - A word can only do what the agent could already do with its tools, and each of its calls goes
-  through Pi's normal checks. If the agent has a shell tool, limit words to safe tools:
+  through Pi's normal checks. If the agent has a shell tool, limit words to safe tools.
+  `/somni-doctor` warns when words could call a shell:
 
-  ```bash
-  export SOMNI_ACTION_TOOLS=read,grep,mcp__tracker__get_issue,mcp__tracker__comment
+  ```yaml
+  actions:
+    enabled: true
+    tools: [read, grep, mcp__tracker__get_issue, mcp__tracker__comment]
   ```
 
 ## Long sessions (optional)
 
 If one Pi session runs for hours, Somni can dream in the background while you keep working:
 
-```bash
-export SOMNI_DAYDREAM_EVERY_MINUTES=30
+```yaml
+daydreams:
+  every_minutes: 30
 ```
 
 A daydream runs in a separate Pi process and never blocks your session. The next prompt's index
@@ -106,8 +133,10 @@ shows a one-line notice of what it added. It is experimental. A night `/somni-dr
 
 To share one memory across several projects, point them all at the same store:
 
-```bash
-export SOMNI_WORKSPACE=~/.local/share/somni
+```yaml
+# ~/.config/somni/somni.conf
+store:
+  path: ~/.local/share/somni
 ```
 
 Only one Pi session records into a store at a time. A second session can still read the memory,
@@ -117,21 +146,21 @@ but it doesn't record until the first one exits.
 
 - Everything stays on your machine, in the store directory. Somni sends memory to a model only
   as the agent's own context, and during the dreams and daydreams you run.
-- `SOMNI_RECORD=0 pi` runs a session that uses memory but records nothing.
+- `SOMNI_RECORD=0 pi` runs one session that uses memory but records nothing. To stop recording
+  in a project, set `store.record: false` in its `.pi/somni.conf`.
 - To start fresh, close Pi and move the store directory somewhere private. The next session
   creates a new one.
 
 ## Checking that it helps
 
 Your own sense is the real test: does the agent ask you fewer repeat questions and repeat fewer
-mistakes? For numbers, run this from a pi-somni checkout:
+mistakes? For numbers, `/somni-doctor` shows how many records, notes, pages, dreams and
+action words the store holds, and how many dreams failed. For how often the agent used its words,
+run this from the pi-somni package directory and look at `word_use`:
 
 ```bash
 python3 somni/store.py --workspace /path/to/project/.pi/somni --subject-id pi status --json
 ```
-
-It shows how many notes and action words the store holds, how often the agent used its words,
-and any dreams that failed.
 
 We also measure it on a public benchmark of multi-step customer-service tasks, as a stand-in for
 "does memory make the agent better at real work". See [EVALUATION.md](../EVALUATION.md).
