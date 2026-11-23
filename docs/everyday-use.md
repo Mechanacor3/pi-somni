@@ -22,7 +22,8 @@ covers the habits that make it pay off.
 pi install git:github.com/Mechanacor3/pi-somni
 ```
 
-Somni needs `python3` 3.10 or newer. By default each project gets its own memory in
+Somni is tested on Pi 1.5.2 and the latest Pi release; on other versions some features may fail. It needs
+`python3` 3.10 or newer. By default each project gets its own memory in
 `.pi/somni/` inside the directory where you start Pi. Add it to `.gitignore`: it holds what
 the agent saw in your sessions, which can include file contents and command output.
 

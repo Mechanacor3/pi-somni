@@ -18,7 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        pi: ["1.0.0", "1.5.2"]
+        # Pi releases Somni is tested on: a fixed known-good version and the newest release.
+        pi: ["1.5.2", "latest"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,6 +34,7 @@ jobs:
           PI_OFFLINE: "1"
         run: |
           npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@$PI_VERSION"
+          echo "Pi $(npm ls --global --depth=0 @earendil-works/pi-coding-agent | grep -o 'pi-coding-agent@[^ ]*')"
           archive=$(npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP")
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           PI_PLUGIN_E2E_BINARY="$(command -v pi)" PI_PLUGIN_E2E_PACKAGE="$RUNNER_TEMP/package" \

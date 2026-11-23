@@ -197,5 +197,5 @@ python3 -m unittest discover -s evals/state_bench/tests -t .
 # Run the Pi client test using the local Pi executable and a scripted model:
 PI_PLUGIN_E2E_BINARY="$(command -v pi)" python3 -m unittest tests.test_extension_e2e -v
 # Or use the test image:
-docker build -t pi-plugin-e2e:pi-1.0.0 tests/e2e && python3 -m unittest tests.test_extension_e2e
+docker build -t pi-plugin-e2e:pi-1.5.2 tests/e2e && python3 -m unittest tests.test_extension_e2e
 ```

@@ -53,7 +53,10 @@ To measure it, we use the public STATE-Bench benchmark of multi-step service tas
 
 ## Install
 
-Requires Pi 1.0+ and `python3` (3.10 or newer) on `PATH`. Optional image downscaling uses Pillow.
+Requires `python3` (3.10 or newer) on `PATH`. Optional image downscaling uses Pillow.
+
+**Pi versions.** Somni is tested on Pi 1.5.2 and on the latest Pi release. Other versions may work, but some features may
+fail on them; daydreams, for example, fail on Pi 1.0.0.
 
 ```bash
 pi install git:github.com/Mechanacor3/pi-somni

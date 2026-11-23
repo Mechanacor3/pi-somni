@@ -17,7 +17,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-IMAGE = os.environ.get("PI_PLUGIN_E2E_IMAGE", "pi-plugin-e2e:pi-1.0.0")
+IMAGE = os.environ.get("PI_PLUGIN_E2E_IMAGE", "pi-plugin-e2e:pi-1.5.2")
 BINARY = os.environ.get("PI_PLUGIN_E2E_BINARY")
 PACKAGE = pathlib.Path(os.environ["PI_PLUGIN_E2E_PACKAGE"]).resolve() if "PI_PLUGIN_E2E_PACKAGE" in os.environ else None
 REPO = pathlib.Path(__file__).resolve().parents[2]
