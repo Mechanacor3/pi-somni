@@ -1062,6 +1062,8 @@ ${candidateGuide(candidates)}`;
 			// A daydream that has committed its pass but not yet exited is announced now, not a turn later.
 			try {
 				day.notice = livePassNotice((await getBackend().request<{ last_pass: any }>("status")).last_pass) ?? "";
+				// The exit handler skips a pass announced here, so the user's notice is shown here too.
+				if (day.notice) notify(ctx, day.notice);
 			} catch {
 				// The worker's exit handler reports it instead.
 			}

@@ -347,7 +347,11 @@ class SomniPiEndToEnd(unittest.TestCase):
             "Dream pass.": [[("somni_dream", {"proposal_json": json.dumps(proposal)})]],
             "Anything else": [],
         })
-        env = {"SOMNI_DAYDREAM_EVERY_TURNS": "1", "SOMNI_DAYDREAM_COMMAND": shutil.which(BINARY)}
+        # The worker lingers after its pass commits, so the next turn starts while it is still running.
+        linger = self.work / "linger-pi"
+        linger.write_text(f'#!/bin/sh\n"{shutil.which(BINARY)}" "$@"\nstatus=$?\nsleep 4\nexit $status\n')
+        linger.chmod(0o755)
+        env = {"SOMNI_DAYDREAM_EVERY_TURNS": "1", "SOMNI_DAYDREAM_COMMAND": str(linger)}
         self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
         self.pi.prompt("What is the fee to cancel economy fare 300?")
         store = self.work / ".pi" / "somni"
@@ -368,6 +372,12 @@ class SomniPiEndToEnd(unittest.TestCase):
                                    r"\(records up to \d+, \$\d+\.\d\d, \d+k tok, \d+s\)")
         self.assertIn("Economy cancellation fees have a $50 floor.", injected)
         self.assertGreater(len(SomniMemory(store, "pi").load().transcript), live["transcript_count"])
+        # That turn announced the pass to the user too, and the worker's exit doesn't announce it again.
+        shown = lambda: [e.get("message", "") for e in self.pi.events if e.get("method") == "notify"]
+        self.assertEqual(sum("Somni daydream d000001" in message for message in shown()), 1, shown())
+        time.sleep(5)
+        self.pi.prompt("Anything else?")
+        self.assertEqual(sum("Somni daydream d000001" in message for message in shown()), 1, shown())
 
     def test_word_passes_on_images_from_its_final_call_only(self):
         self.pi.close()
