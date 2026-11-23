@@ -51,7 +51,7 @@ daydreams:
 ```
 
 `/somni-doctor` points out a misspelled setting or a bad value, with the file and line. The
-README's [settings table](../README.md#settings-and-somni-doctor) lists every setting. Every
+The [settings table](settings.md) lists every setting. Every
 setting also has an environment variable, which wins over the files, for scripts and one-off runs.
 
 ## The daily loop

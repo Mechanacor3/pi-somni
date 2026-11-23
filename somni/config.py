@@ -19,7 +19,7 @@ The file format is a strict subset of YAML: nested ``key: value`` maps (spaces, 
 
 Stdlib only.  CLI: ``config.py resolve --cwd DIR --json`` (used by the extension),
 ``config.py template`` (a commented file listing every setting), ``config.py table``
-(the README's settings table).
+(the settings table in docs/settings.md).
 """
 from __future__ import annotations
 
@@ -93,13 +93,13 @@ SETTINGS = (
     Setting("learning.chel", "SOMNI_CHEL_LEARNING", "bool", False,
             "Chel rule and verb proposals in dreams, and rule retrieval in sessions"),
     Setting("actions.enabled", "SOMNI_ACTIONS", "bool", False,
-            "[Action words](#action-words-experimental): dreamed Python functions that call session tools, "
+            "[Action words](action-words.md): dreamed Python functions that call session tools, "
             "registered as Pi tools"),
     Setting("actions.tools", "SOMNI_ACTION_TOOLS", "list", None, "The tools action words may call",
             default_text="all non-Somni tools"),
     Setting("actions.max_calls", "SOMNI_ACTION_MAX_CALLS", "int", 16, "Tool calls per action word run", 1, 64),
     Setting("daydreams.every_turns", "SOMNI_DAYDREAM_EVERY_TURNS", "int", 0,
-            "Start a daydream (see *Long sessions*) after this many model turns. `0` is off", 0, 10000),
+            "Start a daydream (see [Daydreams](long-sessions.md#daydreams-experimental)) after this many model turns. `0` is off", 0, 10000),
     Setting("daydreams.every_minutes", "SOMNI_DAYDREAM_EVERY_MINUTES", "number", 0,
             "Or start one on this interval. `0` is off", 0, 1440),
     Setting("daydreams.per_hour", "SOMNI_DAYDREAM_PER_HOUR", "int", 4, "At most this many daydreams start per hour",
@@ -613,7 +613,7 @@ def template():
 
 
 def table():
-    """The README's settings table."""
+    """The settings table in docs/settings.md."""
     rows = ["| Config key | Environment variable | Default | Meaning |", "|---|---|---|---|"]
     for s in SETTINGS:
         if s.default_text:
@@ -638,7 +638,7 @@ def main(argv=None):
     res.add_argument("--cwd", default=os.getcwd())
     res.add_argument("--json", action="store_true")
     sub.add_parser("template", help="print a commented config file listing every setting")
-    sub.add_parser("table", help="print the README settings table")
+    sub.add_parser("table", help="print the settings table (docs/settings.md)")
     args = ap.parse_args(argv)
     if args.command == "template":
         sys.stdout.write(template())

@@ -4,7 +4,7 @@
     somni doctor [--cwd DIR] [--all] [--json]   check settings, runtime and the store
     somni config template                       print a commented config file with every setting
     somni config show [--cwd DIR]               print every setting's value and where it came from
-    somni config table                          print the README settings table
+    somni config table                          print the settings table in docs/settings.md
 """
 import pathlib
 import sys

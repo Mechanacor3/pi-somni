@@ -160,8 +160,8 @@ class SchemaCoverage(unittest.TestCase):
         self.assertEqual(sorted(used - known), [], "add new variables to SETTINGS in somni/config.py")
         self.assertEqual(sorted(set(C.BY_ENV) - used), [], "SETTINGS lists a variable nothing reads")
 
-    def test_the_readme_table_is_generated_from_the_schema(self):
-        self.assertIn(C.table(), (ROOT / "README.md").read_text(), "regenerate with `bin/somni config table`")
+    def test_the_settings_table_is_generated_from_the_schema(self):
+        self.assertIn(C.table(), (ROOT / "docs/settings.md").read_text(), "regenerate with `bin/somni config table`")
 
     def test_the_template_uncommented_is_a_valid_config(self):
         lines = []
