@@ -787,10 +787,13 @@ def candidates(records, words=(), *, limit=MINE_LIMIT):
     argument fields that vary between occurrences (the word's parameters).
     """
     runs, run, label = [], [], object()
-    for record in [r for r in records if r.get("source") in {"tool_result", "ordinary_observation"}][-MINE_SCAN:]:
-        if record.get("source") != "tool_result" or record.get("run_label") != label:
+    scanned = [r for r in records if r.get("source") in {"tool_result", "ordinary_observation"}][-MINE_SCAN:]
+    # Sessions that record into one store (a sub-agent beside its parent) interleave; mine each session's own order.
+    session = lambda r: next((t for t in r.get("tags", ()) if t.startswith("contributor")), "")
+    for record in sorted(scanned, key=session):  # stable: each session keeps its own order
+        if record.get("source") != "tool_result" or (record.get("run_label"), session(record)) != label:
             runs.append(run)
-            run, label = [], record.get("run_label")
+            run, label = [], (record.get("run_label"), session(record))
             if record.get("source") != "tool_result":
                 continue
         try:

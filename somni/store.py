@@ -2528,10 +2528,12 @@ def _action_module():
 
 
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
-                    resize=None, viewed=None, learning=False, actions=False, daydream=None):
+                    resize=None, viewed=None, learning=False, actions=False, daydream=None, contributor=False):
     if daydream is not None and method in {"phase", "record", "note", "wiki", "action_tools"}:
         raise MemoryError("a daydream may only read memory and submit its pass")
-    if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable:
+    # A contributor (a second Pi on the store, such as a sub-agent) may append records; the owner keeps the rest.
+    if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable \
+            and not (contributor and method == "record"):
         raise MemoryError("Somni memory changes require the session that owns recording")
     if method == "phase":
         memory.set_phase(args["phase"], allow_same=True)
@@ -2717,7 +2719,8 @@ def _dream_actions(args):
     return {"author": "dream", "allow": allow, "reserved": reserved}
 
 
-def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False, actions=False, daydream=False):
+def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False, actions=False, daydream=False,
+           session_label=None):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
 
@@ -2769,8 +2772,14 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
             memory.set_phase("open", allow_same=True)
         else:
             memory.load()
+        # Another session owns recording: this one contributes its records, tagged so dreams can tell them apart.
+        contributor = bool(record and owner is False)
+        if contributor:
+            tags = [*context.get("tags", []), f"contributor:{session_label}" if session_label else "contributor"]
+            context = _record_context(context.get("run_label"), tags[-8:])
         try:
-            reply(0, result={"writable": owner is not False, **({"action_sync": synced} if synced else {})})
+            reply(0, result={"writable": owner is not False, **({"contributor": True} if contributor else {}),
+                             **({"action_sync": synced} if synced else {})})
             while line := sys.stdin.buffer.readline(MAX_BACKEND_REQUEST + 1):
                 if len(line) > MAX_BACKEND_REQUEST:
                     raise MemoryError("Somni backend request exceeds byte limit")
@@ -2780,7 +2789,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
                     request_id = request["id"]
                     result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
                                              image_bytes=image_bytes, resize=resize, viewed=viewed, learning=learning,
-                                             actions=actions)
+                                             actions=actions, contributor=contributor)
                     reply(request_id, result=result)
                 except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                     reply(request_id, error=str(exc))
@@ -2832,6 +2841,7 @@ def parser():
     serve.add_argument("--record", action="store_true")
     serve.add_argument("--run-label")
     serve.add_argument("--tags", default="[]")
+    serve.add_argument("--session-label", help="tag for this session's records when another session owns recording")
     serve.add_argument("--image-bytes", type=int, default=DEFAULT_IMAGE_BYTES)
     serve.add_argument("--image-max-edge", type=int, default=0)
     record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES), required=True); record.add_argument("--text", required=True)
@@ -2860,7 +2870,7 @@ def main():
         if args.command == "serve":
             _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
                    image_bytes=args.image_bytes, image_max_edge=args.image_max_edge, learning=args.learning,
-                   actions=args.actions, daydream=args.daydream)
+                   actions=args.actions, daydream=args.daydream, session_label=args.session_label)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":

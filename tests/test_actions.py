@@ -242,6 +242,20 @@ class ActionWordTest(unittest.TestCase):
                  for refs in top["refs"]]
         self.assertEqual(self.define(word, tests)["actions"][0]["name"], "cancel")
 
+    def test_a_contributing_session_does_not_break_the_owners_runs(self):
+        self.m.set_phase("open")
+        sub = {"tags": ["contributor:sub-1"]}
+        for booking in ("BK-3", "BK-4", "BK-5"):
+            self.m.record("ordinary_observation", f"USER: cancel {booking}")
+            self.tool("get_booking", {"booking_id": booking}, {"booking_id": booking, "refundable": True})
+            # A sub-agent records into the same store between the owner's two calls.
+            self.m.record("tool_result", f'TOOL lookup_fee({{"booking": "{booking}"}}) -> {{"fee": 5}}', tool_ok=True,
+                          context=sub)
+            self.tool("cancel_booking", {"booking_id": booking, "reason": "customer request"}, {"status": "cancelled"})
+        self.m.set_phase("closed")
+        top = A.candidates(self.m.load().transcript)[0]
+        self.assertEqual((top["tools"], top["count"]), (["get_booking", "cancel_booking"], 4))  # setUp adds one
+
     def test_index_lists_registered_words_ranked_by_the_prompt(self):
         self.define()
         self.dream({"op": "define_action", "tests": [{"params": {"booking_id": "BK-2"}, "refs": ["t000003"]}],

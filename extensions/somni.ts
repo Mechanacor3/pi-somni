@@ -186,6 +186,7 @@ type DreamRun = { reads: number; submissions: number; submitting: boolean; resul
 type CachedRead = { tool: string; args: unknown; text: string; images?: { ref: string; sha256: string }[] };
 const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
+	contributor: false, // another session owns recording; this one appends its records beside it (a sub-agent, say)
 	backend: undefined as Backend | undefined,
 	recordWarning: false, indexWarning: false,
 	words: new Map<string, string>(), // registered action word -> source
@@ -297,7 +298,7 @@ function clip(text: string, maxBytes: number) {
 }
 
 function canRecord() {
-	return RECORD && state.writable && !state.dream;
+	return RECORD && (state.writable || state.contributor) && !state.dream;
 }
 
 function notify(ctx: ExtensionContext, message: string) {
@@ -556,7 +557,7 @@ export default function (pi: ExtensionAPI) {
 	 * Never blocks: skipped while one runs, when nothing new was recorded, or past SOMNI_DAYDREAM_PER_HOUR.
 	 */
 	async function maybeDaydream(ctx: ExtensionContext) {
-		if (!DAYDREAMS || day.child || !canRecord()) return;
+		if (!DAYDREAMS || day.child || !canRecord() || !state.writable) return; // the owner runs daydreams
 		const now = Date.now();
 		day.starts = day.starts.filter((start) => now - start < 3_600_000);
 		if (day.starts.length >= DAYDREAM_PER_HOUR) return;
@@ -731,7 +732,7 @@ export default function (pi: ExtensionAPI) {
 	let sentCatalog = "";
 	let sentNames = new Set<string>();
 	async function recordToolCatalog(ctx: ExtensionContext) {
-		if (!ACTIONS || !canRecord()) return;
+		if (!ACTIONS || !canRecord() || !state.writable) return; // the owner keeps the tool catalog
 		const tools = actionTargets().filter((tool) => !state.words.has(tool.name)).slice(0, 128).map((tool) => {
 			const parameters = (tool.parameters ?? {}) as Record<string, unknown>;
 			return { name: tool.name, description: clip((tool.description ?? "").replace(/\s+/g, " "), 300),
@@ -1094,7 +1095,7 @@ ${candidateGuide(candidates)}`;
 		}
 		const workspace = process.env.SOMNI_WORKSPACE ?? join(ctx.cwd, ".pi", "somni");
 		state.dream = undefined;
-		state.writable = state.recordWarning = state.indexWarning = false;
+		state.writable = state.contributor = state.recordWarning = state.indexWarning = false;
 		state.wordCalls.clear();
 		state.wordTimings.clear();
 		state.wordGuideShown = false;
@@ -1107,6 +1108,7 @@ ${candidateGuide(candidates)}`;
 			"--image-bytes", IMAGE_BYTES, "--image-max-edge", IMAGE_MAX_EDGE];
 		if (process.env.SOMNI_RUN_LABEL !== undefined) args.push(`--run-label=${process.env.SOMNI_RUN_LABEL}`);
 		if (process.env.SOMNI_TAGS !== undefined) args.push(`--tags=${process.env.SOMNI_TAGS}`);
+		args.push(`--session-label=${ctx.sessionManager.getSessionId().slice(0, 36)}`);
 		if (RECORD && !DAYDREAM_CHILD) args.push("--record");
 		if (DAYDREAM_CHILD) args.push("--daydream");
 		if (LEARNING) args.push("--learning");
@@ -1114,14 +1116,16 @@ ${candidateGuide(candidates)}`;
 		const backend = new Backend(PYTHON, args, (error) => {
 			if (state.backend !== backend) return;
 			state.backend = undefined;
-			state.writable = false;
+			state.writable = state.contributor = false;
 			state.dream = undefined;
 			notify(ctx, `Somni backend stopped. ${error.message}`);
 		});
 		try {
-			const { writable, action_sync: synced } = await backend.ready as { writable: boolean; action_sync?: any };
+			const { writable, contributor, action_sync: synced } =
+				await backend.ready as { writable: boolean; contributor?: boolean; action_sync?: any };
 			state.backend = backend;
 			state.writable = writable;
+			state.contributor = Boolean(contributor);
 			lastCtx = ctx;
 			if (synced?.error) notify(ctx, `Somni could not record your action word edits. ${synced.error}`);
 			else if (synced) {
@@ -1136,7 +1140,7 @@ ${candidateGuide(candidates)}`;
 				day.timer = setInterval(() => { if (lastCtx && !state.dream) void maybeDaydream(lastCtx); }, DAYDREAM_MINUTES * 60_000);
 				day.timer.unref?.();
 			}
-			if (RECORD && !writable) {
+			if (RECORD && !writable && !state.contributor) {
 				notify(ctx, "Somni opened without recording because another Pi session is recording in this Somni workspace.");
 			}
 		} catch (error) {
@@ -1151,7 +1155,7 @@ ${candidateGuide(candidates)}`;
 		day.child?.kill("SIGTERM");
 		const backend = state.backend;
 		state.backend = undefined;
-		state.writable = false;
+		state.writable = state.contributor = false;
 		state.dream = undefined;
 		await backend?.close();
 	});

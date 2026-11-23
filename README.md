@@ -97,7 +97,8 @@ To measure it, we use the public STATE-Bench benchmark of multi-step service tas
   through Pi's guards, but an earlier call's effects stay in place when a later call fails or is blocked.
   Set `SOMNI_ACTION_TOOLS` to keep words away from command tools the agent has.
 - Keep the store (`.pi/somni` by default) out of version control. `somni doctor` warns when Git doesn't ignore it.
-- One Pi session records into a store at a time; see [store ownership](docs/long-sessions.md#one-recording-session-per-store).
+- One Pi session owns a store; others in the same directory, such as sub-agents, add their records beside it. See
+  [store ownership](docs/long-sessions.md#one-owner-per-store-and-sub-agents).
 
 ## Background and credits
 

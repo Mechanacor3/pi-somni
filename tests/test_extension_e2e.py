@@ -477,21 +477,28 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertLessEqual(len(excerpt.encode("utf-8")), 80)
         self.assertIn("hidden tail", memory.load().transcript[-1]["text"])
 
-    def test_second_pi_session_cannot_write_or_close_the_first(self):
+    def test_a_second_pi_session_contributes_records_but_cannot_change_the_store(self):
         self.pi.prompt("What is the fee to cancel economy fare 300?")
         store = self.work / ".pi" / "somni"
         before = SomniMemory(store, "pi").load().state["transcript_count"]
-        other = PiSession("extensions/somni.ts", self.work, self.upstream.port)
+        other = PiSession("extensions/somni.ts", self.work, self.upstream.port)  # a sub-agent in the same directory
         try:
             other.prompt("Remember that for later.")
             warnings = [e.get("message", "") for e in other.events if e.get("method") == "notify"]
-            self.assertTrue(any("another Pi session is recording" in msg for msg in warnings), warnings)
-            self.assertTrue(next(e for e in other.tool_ends() if e["toolName"] == "somni_note")["isError"])
+            self.assertFalse(any("opened without recording" in msg for msg in warnings), warnings)
+            note = next(e for e in other.tool_ends() if e["toolName"] == "somni_note")
+            self.assertTrue(note["isError"])  # claims, phases and dreams stay with the owner
+            self.assertIn("owns recording", text_of(note["result"]["content"]))
         finally:
             other.close()
-        self.assertEqual(SomniMemory(store, "pi").load().state["transcript_count"], before)
-        self.pi.prompt("Anything else I should know?")
-        self.assertGreater(SomniMemory(store, "pi").load().state["transcript_count"], before)
+        memory = SomniMemory(store, "pi").load()
+        added = memory.transcript[before:]
+        self.assertTrue(added, "the second session's work was not recorded")
+        self.assertTrue(all(any(t.startswith("contributor:") for t in r.get("tags", [])) for r in added))
+        self.assertIn("USER: Remember that for later.", [r["text"] for r in added])
+        self.assertEqual(memory.state["phase"], "open")  # its exit didn't close the owner's session
+        self.pi.prompt("Anything else?")  # and the owner still records
+        self.assertGreater(SomniMemory(store, "pi").load().state["transcript_count"], memory.state["transcript_count"])
 
     def test_recall_after_restart(self):
         self.pi.prompt("What is the fee to cancel economy fare 300?")

@@ -74,10 +74,15 @@ Somni warns on recording errors, including a full store. To archive a full store
 move the directory named by `SOMNI_WORKSPACE` (by default `.pi/somni`) to a private location. The next Pi session
 creates a clean store.
 
-## One recording session per store
+## One owner per store, and sub-agents
 
-One Pi process owns recording in a workspace at a time. A second Pi can use existing memory while the first owns the
-store. Close the second session and reopen it after the first exits to take over recording.
+One Pi process owns recording in a workspace at a time: it opens and closes the session, and only it writes notes,
+runs dreams and daydreams, and records the tool catalog. Any other Pi that records in the same store, such as a
+sub-agent your session starts, or a second terminal, is a **contributor**: it appends its prompts, tool results and
+replies to the same transcript, tagged `contributor:<its session ID>`, so dreams see what sub-agents found and can
+tell whose work a record is. Contributors can read memory but can't change claims. Their records are skipped, with a
+warning, while the owner runs an offline dream. Action-word mining keeps each session's calls in their own order.
+Close a contributor and reopen it after the owner exits to take over ownership.
 
 Pi starts one local Python child for the session and exchanges requests over private pipes. The child holds an OS lock
 on `.somni-session.lock`. The file stays in the workspace; leave it in place so concurrent sessions lock the same file.
