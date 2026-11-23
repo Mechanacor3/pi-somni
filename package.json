@@ -1,6 +1,6 @@
 {
   "name": "pi-somni",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Somni: layered memory with offline dreaming for the Pi coding agent. Every claim cites the transcript.",
   "keywords": ["pi-package", "pi", "memory", "agent-memory", "dreaming"],
   "license": "MIT",
