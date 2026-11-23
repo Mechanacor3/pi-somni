@@ -113,7 +113,10 @@ const envNumber = (name: string, fallback: number, min: number, max: number) => 
 const DAYDREAM_TURNS = Math.floor(envNumber("SOMNI_DAYDREAM_EVERY_TURNS", 0, 0, 10_000));
 const DAYDREAM_MINUTES = envNumber("SOMNI_DAYDREAM_EVERY_MINUTES", 0, 0, 1440);
 const DAYDREAM_PER_HOUR = Math.floor(envNumber("SOMNI_DAYDREAM_PER_HOUR", 4, 1, 60));
-const DAYDREAM_TIMEOUT_MS = envNumber("SOMNI_DAYDREAM_TIMEOUT_SECONDS", 600, 10, 7200) * 1000;
+const DAYDREAM_TIMEOUT_MS = envNumber("SOMNI_DAYDREAM_TIMEOUT_SECONDS", 300, 10, 7200) * 1000;
+// A daydream's record listing stays small: newest first into this many bytes, tool results as one-line stubs.
+const DAYDREAM_PROMPT_BYTES = Math.floor(envNumber("SOMNI_DAYDREAM_PROMPT_BYTES", 16384, 2048, 131072));
+const STUB_CHARS = 240;
 const DAYDREAMS = !DAYDREAM_CHILD && (DAYDREAM_TURNS > 0 || DAYDREAM_MINUTES > 0);
 const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what just happened in the latest records. Add or " +
 	"correct claims, and define, revise or retire action words, from what the newest records show. Keep the pass small; " +
@@ -121,7 +124,8 @@ const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what just ha
 const AUTH_ERROR = /\b(401|403)\b|unauthori[sz]ed|authenticat|token expired|credential|not logged in|api key/i;
 const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try"]);
 // Dream budgets. Every Somni tool result in a dream ends with what is left of them.
-const DREAM_MAX_READS = Math.floor(envNumber("SOMNI_DREAM_MAX_READS", 16, 1, 64));
+const DREAM_MAX_READS = Math.floor(Math.min(envNumber("SOMNI_DREAM_MAX_READS", 16, 1, 64),
+	DAYDREAM_CHILD ? envNumber("SOMNI_DAYDREAM_MAX_READS", 6, 1, 64) : 64));
 const DREAM_MAX_IMAGES = Math.floor(envNumber("SOMNI_DREAM_MAX_IMAGES", 16, 0, 64));
 const DREAM_MAX_SUBMISSIONS = Math.floor(envNumber("SOMNI_DREAM_MAX_SUBMISSIONS", 3, 1, 10));
 const LENIENT_IMAGE_EVIDENCE = process.env.SOMNI_LENIENT_IMAGE_EVIDENCE === "1";
@@ -325,6 +329,30 @@ function describeRecord(record: TranscriptRecord, chars = record.text.length) {
 	const excerpt = record.text.length > chars ? `${record.text.slice(0, chars)} [excerpt truncated]` : record.text;
 	const status = record.tool_ok === undefined ? "" : record.tool_ok ? " [tool ok]" : " [tool error]";
 	return `[${record.id}] (${record.source})${status}${contextLabel(record)} ${excerpt}${images}${omitted}`;
+}
+
+/**
+ * A daydream's record listing: the newest records that fit in DAYDREAM_PROMPT_BYTES. A tool result shows its call
+ * and the start of its output; `somni_search "t000123"` reads the rest. Prompts and replies are shown as usual.
+ */
+function daydreamListing(records: TranscriptRecord[]) {
+	const lines: string[] = [];
+	let used = 0;
+	let omitted = 0;
+	for (let i = records.length - 1; i >= 0; i--) {
+		const record = records[i];
+		const stub = record.source === "tool_result" && record.text.length > STUB_CHARS;
+		const line = stub ? `${describeRecord(record, STUB_CHARS)} (somni_search "${record.id}" reads it)` : describeRecord(record);
+		const size = Buffer.byteLength(line, "utf8") + 1;
+		if (lines.length && used + size > DAYDREAM_PROMPT_BYTES) {
+			omitted = i + 1;
+			break;
+		}
+		lines.push(line);
+		used += size;
+	}
+	const note = omitted ? `[${omitted} older record(s) left out to keep this daydream small; somni_search finds them]\n` : "";
+	return note + lines.reverse().join("\n");
 }
 
 function summary(result: DreamResult) {
@@ -761,12 +789,14 @@ ${candidateGuide(candidates)}`;
 	pi.registerTool({
 		name: "somni_search",
 		label: "Somni search",
-		description: "Search your transcript text, run labels, and tags for an exact phrase. Use it to find evidence IDs and image digests.",
+		description: "Search your transcript text, run labels, and tags for an exact phrase. Use it to find evidence IDs and " +
+			"image digests. A record ID such as t000123 returns that record.",
 		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ description: `1-${MAX_SEARCH_LIMIT}` })) }),
 		async execute(_id: string, params: { query: string; limit?: number }) {
 			const limit = clampLimit(params.limit, 10, MAX_SEARCH_LIMIT);
 			const out = await getBackend().request<TranscriptRecord[]>("search", { query: params.query.slice(0, 256), limit: limit.value });
-			return { content: asText(limit.note + (out.map((r) => describeRecord(r, 600)).join("\n") || "no matches")), details: out };
+			const chars = /^t\d{6}$/.test(params.query.trim()) ? DREAM_RECORD_BYTES : 600;
+			return { content: asText(limit.note + (out.map((r) => describeRecord(r, chars)).join("\n") || "no matches")), details: out };
 		},
 	});
 	pi.registerTool({
@@ -898,7 +928,7 @@ ${candidateGuide(candidates)}`;
 				learningGuide + actionsGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +
 					`use somni_recall to see what they produced and somni_search if you need one of them.\n\n` : "") +
-				recent.records.map((r) => describeRecord(r)).join("\n");
+				(DAYDREAM_CHILD ? daydreamListing(recent.records) : recent.records.map((r) => describeRecord(r)).join("\n"));
 			const content: (TextContent | ImageContent)[] = asText(prompt);
 			for (const { ref, sha256, image } of recent.attachments) {
 				content.push(...asText(`Screenshot for [${ref}] image_sha256=${sha256}`), image);

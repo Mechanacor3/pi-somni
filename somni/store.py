@@ -1684,6 +1684,10 @@ class SomniMemory:
     def search(self, query, limit=20):
         if not isinstance(query, str) or not query.strip() or len(query) > 256 or not 1 <= limit <= 50:
             raise MemoryError("invalid search query or limit")
+        if EVIDENCE_ID.fullmatch(query.strip()):
+            record = self._records_by_id.get(query.strip())
+            if record is not None:
+                return [record]
         needle = query.casefold()
         return [record for record in self.transcript
                 if any(needle in value.casefold() for value in (record["text"], record.get("run_label", ""), *record.get("tags", [])))][:limit]

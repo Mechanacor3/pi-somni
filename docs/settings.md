@@ -64,7 +64,9 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `daydreams.per_hour` | `SOMNI_DAYDREAM_PER_HOUR` | `4` | At most this many daydreams start per hour (1–60) |
 | `daydreams.model` | `SOMNI_DAYDREAM_MODEL` | the session's model | Model for daydreams, as `provider/id` |
 | `daydreams.thinking` | `SOMNI_DAYDREAM_THINKING` | Pi's default | Thinking level for daydreams |
-| `daydreams.timeout_seconds` | `SOMNI_DAYDREAM_TIMEOUT_SECONDS` | `600` | Stop a daydream that runs longer (10–7200) |
+| `daydreams.timeout_seconds` | `SOMNI_DAYDREAM_TIMEOUT_SECONDS` | `300` | Stop a daydream that runs longer (10–7200) |
+| `daydreams.prompt_bytes` | `SOMNI_DAYDREAM_PROMPT_BYTES` | `16384` | Size of the record listing in a daydream's prompt, newest first. Tool results appear as one-line stubs the daydream can read in full with `somni_search "t000123"` (2048–131072) |
+| `daydreams.max_reads` | `SOMNI_DAYDREAM_MAX_READS` | `6` | Somni evidence reads per daydream (at most `dreams.max_reads`) (1–64) |
 | `daydreams.focus` | `SOMNI_DAYDREAM_FOCUS` | claims and words from the newest records | Focus text passed to the daydream's `/somni-dream` |
 | `daydreams.command` | `SOMNI_DAYDREAM_COMMAND` | the running Pi | Command used to start the daydream's Pi |
 | | `SOMNI_CONFIG` | unset | Config file to read instead of the user and project files; `none` reads none |

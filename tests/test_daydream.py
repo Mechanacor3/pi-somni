@@ -99,6 +99,12 @@ class DaydreamTest(unittest.TestCase):
         memory.dream({"schema": 1, "operations": [add("t000002", '"echo":2')]}, snapshot=41)
         self.assertEqual(len(_recent(memory, False, set(), head=41)["records"]), DAYDREAM_OVERLAP)
 
+    def test_search_by_record_id_returns_that_record(self):
+        memory = SomniMemory(self.ws, "s").load()
+        self.assertEqual([r["id"] for r in memory.search("t000002")], ["t000002"])
+        self.assertEqual(memory.search("t000099"), [])  # unknown IDs fall back to a text search
+        self.assertEqual([r["id"] for r in memory.search('"echo":3')], ["t000003"])
+
     def test_daydream_backend_runs_beside_the_recording_owner(self):
         self.m.set_phase("closed")
         owner = Backend(self.ws, "--record")
