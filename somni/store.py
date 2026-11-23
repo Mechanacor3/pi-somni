@@ -1048,9 +1048,10 @@ class SomniMemory:
             if (not isinstance(gist, str) or not gist.strip() or not gist.isprintable()
                     or len(gist.encode("utf-8")) > MAX_GIST_BYTES):
                 raise MemoryError(f"claim gist must be one printable line of up to {MAX_GIST_BYTES} UTF-8 bytes")
-        if (not isinstance(claim["status"], str) or claim["status"] not in STATUSES
-                or type(claim["salience"]) is not int or not 1 <= claim["salience"] <= 5):
-            raise MemoryError("claim status or salience is invalid")
+        if not isinstance(claim["status"], str) or claim["status"] not in STATUSES:
+            raise MemoryError(f"claim status must be one of {', '.join(sorted(STATUSES))}; got {claim['status']!r}")
+        if type(claim["salience"]) is not int or not 1 <= claim["salience"] <= 5:
+            raise MemoryError(f"claim salience must be an integer from 1 to 5; got {claim['salience']!r}")
         cls._validate_evidence(claim["evidence"], records, claim["status"])
         context = {key: claim[key] for key in ("run_labels", "tags") if key in claim}
         if context != cls._claim_context(claim["evidence"], records):

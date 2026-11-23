@@ -96,6 +96,15 @@ class DreamRobustness(unittest.TestCase):
         out = self.request("dream", {"proposal_json": json.dumps({"schema": 1, "operations": fixed})}, viewed)
         self.assertEqual((out["added_count"], out["rejected_count"]), (1, 0))
 
+    def test_a_bad_claim_status_or_salience_names_the_field_and_its_allowed_values(self):
+        cases = {"claim status must be one of uncertain, verified; got 'confirmed'": {"status": "confirmed"},
+                 "claim salience must be an integer from 1 to 5; got '4'": {"salience": "4"},
+                 "claim salience must be an integer from 1 to 5; got 9": {"salience": 9}}
+        for reason, change in cases.items():
+            operation = {**self.claim([{"ref": self.plain, "quote": "no image"}]), "salience": 3, **change}
+            with self.subTest(reason), self.assertRaisesRegex(SomniError, reason):
+                self.m.dream({"schema": 1, "operations": [operation]})
+
     def test_malformed_proposals_say_what_shape_is_expected(self):
         with self.assertRaisesRegex(SomniError, r"not valid JSON .*nothing committed"):
             self.request("dream", {"proposal_json": '{"schema": 1, "operations": ['}, set())

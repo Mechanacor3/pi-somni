@@ -98,12 +98,16 @@ class ActionWordTest(unittest.TestCase):
     def test_syntax_policy(self):
         body = '    """Doc."""\n    x = rpc.get_booking(booking_id=b)\n'
         bad = {
-            "a word file holds one def": "import os\n" + CANCEL,
-            "only import a word file may have": "from os import path\n" + CANCEL,
+            "a word file holds one def": "x = 1\n" + CANCEL,
+            "only import a word file may have is `from rpc import replay` at the top$": "from os import path\n" + CANCEL,
             "defines exactly one word": CANCEL + "\ndef helper(x: int):\n    \"\"\"x\"\"\"\n    return rpc.get_booking(booking_id=x)\n",
             "need `from rpc import replay`": CANCEL + '\ndef test_a():\n    with replay("t000001"):\n        cancel_if_refundable(booking_id="BK-1")\n',
             "with dir\\(\\)/help\\(\\)": 'def w(b: str):\n' + body + '    return len(rpc.mcp)\n',
-            "Import is not allowed": 'def w(b: str):\n' + body + '    import os\n',
+            "only import .* at the top$": 'def w(b: str):\n' + body + '    import os\n',
+            # Date math needs no import; the error says so and names the line to delete.
+            "date, datetime, timedelta, floor, ceil are already available .* delete line 1$":
+                "from datetime import datetime, timedelta\n" + CANCEL,
+            "already available .* not math.floor.* delete line 4$": 'def w(b: str):\n' + body + '    import math\n',
             "docstring": "def w(b: str):\n    return rpc.get_booking(booking_id=b)\n",
             "annotate": 'def w(b):\n' + body,
             "not available": 'def w(b: str):\n' + body + '    return open("/etc/passwd")\n',

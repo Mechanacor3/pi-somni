@@ -126,6 +126,13 @@ def parse(source):
     except SyntaxError as exc:
         raise ActionError(f"syntax error: {exc.msg} (line {exc.lineno})") from None
     body = list(tree.body)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and not (
+                node is body[0] and isinstance(node, ast.ImportFrom) and node.module == "rpc"):
+            hint = (f"; {', '.join(chel.NAMES)} are already available without an import (write floor(x), not math.floor(x)), "
+                    f"so delete line {node.lineno}"
+                    if node_module(node) in ("datetime", "math") else "")
+            raise ActionError(f"the only import a word file may have is `from rpc import replay` at the top{hint}")
     imports = bool(body) and isinstance(body[0], ast.ImportFrom)
     if imports:
         node = body.pop(0)
@@ -206,6 +213,12 @@ def parse(source):
             "uses": sorted(uses), "calls": calls, "runtime": runtime,
             "selftests": [{"name": t["name"], "replays": t["replays"]} for t in selftests],
             "tests_runtime": "\n\n".join(t["runtime"] for t in selftests)}
+
+
+def node_module(node):
+    """The top-level module an import statement names."""
+    name = node.module if isinstance(node, ast.ImportFrom) else node.names[0].name
+    return (name or "").split(".")[0]
 
 
 def _check_selftest(test, word):
