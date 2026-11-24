@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from somni import config as C  # noqa: E402
 from somni import dream as dm  # noqa: E402
 from somni import store as S  # noqa: E402
 from somni.store import SomniError, SomniMemory, _recent  # noqa: E402
@@ -281,6 +282,65 @@ class TimeTest(unittest.TestCase):
         with self.m._locked():  # the next seal picks a fresh file name
             self.m._load_locked()
             self.assertNotEqual(self.m._next_segment_file("transcript.jsonl"), segment["file"])
+
+    def test_an_unusable_forgetting_value_keeps_every_record(self):
+        # Forgetting can't be undone: "off" or a typo must not fall back to the 30-day default.
+        self.old_day()
+        with patch.object(S, "FORGET_KEEP_RECORDS", 0):
+            for value in ("off", "never", "false", "30 days", "nan", "-1"):
+                with patch.dict(os.environ, {"SOMNI_FORGET_AFTER_DAYS": value}):
+                    self.night(DAY90)
+                    memory = self.reload()
+                    self.assertEqual(memory.forgotten_counts()["records"], 0, value)
+                    self.assertEqual(memory.status()["forgetting"]["after_days"], 0)
+                    self.assertIn("keeps every record", memory.status()["forgetting"]["problem"])
+            with patch.dict(os.environ, {"SOMNI_FORGET_AFTER_DAYS": ""}):
+                self.assertEqual(self.reload().status()["forgetting"], {"after_days": 30})
+
+    def test_a_bad_forgetting_value_in_a_config_file_means_keep_everything(self):
+        conf = self.ws / "somni.conf"
+        for text in ("memory:\n  forget_after_days: off\n", "memory:\n  forget_after_days: [30]\n"):
+            conf.write_text(text)
+            out = C.resolve(self.ws, {"SOMNI_CONFIG": str(conf)})
+            self.assertEqual(out["settings"]["memory.forget_after_days"]["value"], 0)
+            self.assertEqual(out["env"]["SOMNI_FORGET_AFTER_DAYS"], "0")
+            [error] = out["errors"]
+            self.assertIn("Somni uses 0, keeping every record", error["message"])
+        out = C.resolve(self.ws, {"SOMNI_CONFIG": "none", "SOMNI_FORGET_AFTER_DAYS": "off"})
+        self.assertEqual(out["settings"]["memory.forget_after_days"]["value"], 0)
+        self.assertIn("Somni uses 0, keeping every record", out["warnings"][0]["message"])
+
+    def test_the_night_pass_lists_each_stub_so_an_edited_stub_is_caught(self):
+        refs = self.old_day()
+        with patch.object(S, "FORGET_KEEP_RECORDS", 0):
+            self.night(DAY40)
+        memory = self.reload()
+        listed = memory.dreams[-1]["forgot"]
+        self.assertEqual(sorted(listed, key=int), [str(n) for n in range(1, len(refs) + 1)])
+        self.assertEqual(listed["2"], S.sha(memory.transcript[1]))
+        path = self.ws / "somni-v1/transcript.jsonl"
+        lines = path.read_text().splitlines()
+        record = json.loads(lines[1])
+        record["text"] += " … fabricated evidence"
+        lines[1] = S.canonical(record)
+        path.write_text("\n".join(lines) + "\n")
+        with self.assertRaisesRegex(SomniError, "t000002 does not match the night pass that forgot it"):
+            self.reload()
+
+    def test_one_night_forgets_at_most_a_bounded_number_of_records(self):
+        self.old_day()
+        with patch.object(S, "FORGET_KEEP_RECORDS", 0), patch.object(S, "FORGET_PER_PASS", 2):
+            self.night(DAY40)
+            self.assertEqual([r["id"] for r in self.reload().transcript if "forgotten" in r], ["t000001", "t000002"])
+            self.night(DAY40)
+            self.assertEqual(self.reload().forgotten_counts()["records"], 4)
+
+    def test_decay_zero_ranks_by_uses_alone(self):
+        self.assertEqual(S._activation([1, 1000], 0.0), S._activation([0.1, 5], 0.0))
+        self.blue_then_red()
+        memory = self.reload()
+        with at(DAY90), patch.dict(os.environ, {"SOMNI_MEMORY_DECAY": "0"}):
+            self.assertEqual(memory.strength(memory.claims["n000001"])["level"], "fresh")
 
     def test_a_tampered_stub_fails_verification(self):
         self.old_day()

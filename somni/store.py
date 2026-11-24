@@ -168,6 +168,7 @@ def token_estimate(value):
 DEFAULT_FORGET_DAYS = 30  # SOMNI_FORGET_AFTER_DAYS: reviewed records older than this keep only a stub
 FORGET_KEEP_RECORDS = 120  # the newest records are never forgotten: the next dream's window (SOMNI_DREAM_RECORDS)
 FORGET_GIST_CHARS = 160
+FORGET_PER_PASS = 2000  # records one night may forget; the pass lists each stub's hash, so this bounds its size
 FORGOTTEN_PREFIX = "[forgotten "
 DEFAULT_DECAY = 0.5  # SOMNI_MEMORY_DECAY: ACT-R's base-level decay d (Anderson & Schooler, 1991)
 FADING_BELOW = -0.5  # activation thresholds for the fuzzy strength labels
@@ -206,7 +207,22 @@ def _env_number(name, default, low, high):
         value = float(os.environ.get(name, "") or default)
     except ValueError:
         return default
-    return min(max(value, low), high)
+    return min(max(value, low), high) if math.isfinite(value) else default
+
+
+def _forget_setting():
+    """(days, problem) from SOMNI_FORGET_AFTER_DAYS. Forgetting can't be undone, so a value that isn't a number of
+    days keeps every record (0) instead of falling back to the default, and says why."""
+    text = os.environ.get("SOMNI_FORGET_AFTER_DAYS")
+    if text is None or not text.strip():
+        return DEFAULT_FORGET_DAYS, None
+    try:
+        days = float(text)
+    except ValueError:
+        days = math.nan
+    if not math.isfinite(days) or days < 0:
+        return 0, f"SOMNI_FORGET_AFTER_DAYS={text!r} is not a number of days; Somni keeps every record"
+    return min(days, 36500), None
 
 
 def _ref_number(ref):
@@ -706,6 +722,7 @@ class SomniMemory:
         self._check_chain(transcript, "transcript", state["transcript_count"], state["transcript_head"])
         self._check_chain(notes, "notes", state["note_events"], state["notes_head"])
         self._check_chain(dreams, "dreams", state["dream_count"], state["dreams_head"])
+        self._check_forgotten(transcript, dreams)
         wiki_path = self.store / "wiki.jsonl"
         wiki = _read_log(wiki_path) if os.path.lexists(wiki_path) else []
         self._check_chain(wiki, "wiki", state.get("wiki_events", 0), state.get("wiki_head", ZERO_HASH))
@@ -842,12 +859,12 @@ class SomniMemory:
         return quotes
 
     def _forgettable(self, after_days, now):
-        last_night = next((dream for dream in reversed(self.dreams) if not dream.get("live")), None)
-        if last_night is None or after_days <= 0:
+        """Records tonight's pass may forget, oldest first. Called before the pass commits: it counts as the night."""
+        if after_days <= 0:
             return []
         keep = int(_env_number("SOMNI_DREAM_RECORDS", FORGET_KEEP_RECORDS, 1, FORGET_KEEP_RECORDS))
         keep = min(keep, FORGET_KEEP_RECORDS)
-        end = min(last_night["transcript_count"], len(self.transcript) - keep)
+        end = len(self.transcript) - keep
         cutoff = now - _dt.timedelta(days=after_days)
         protected = self._forget_protected()
         out = []
@@ -855,6 +872,8 @@ class SomniMemory:
             moment = _parse_time(record.get("at"))
             if "forgotten" not in record and record["id"] not in protected and moment is not None and moment <= cutoff:
                 out.append(record)
+                if len(out) == FORGET_PER_PASS:
+                    break
         return out
 
     @staticmethod
@@ -871,27 +890,36 @@ class SomniMemory:
         return {**record, "text": text, "forgotten": {"sha256": sha(record), "at": _stamp(now),
                                                      "bytes": len(record["text"].encode("utf-8"))}}
 
-    def _forget_locked(self, after_days=None):
-        """Replace the text of old, reviewed records with stubs. Returns how many records were forgotten.
+    def _plan_forgetting(self):
+        """{seq: stub} for tonight's night pass, which lists each stub's hash before any record is rewritten.
 
-        Called with the lock held, after a night dream commits. A record is forgotten when a night dream has run since
-        it was recorded, it is older than ``after_days`` (SOMNI_FORGET_AFTER_DAYS, default 30, 0 keeps everything),
-        it is outside the newest FORGET_KEEP_RECORDS, and no action word's tests replay it. The stub keeps the start
-        of the text and every quote a claim cites from it; the chain keeps the original record's hash."""
-        if after_days is None:
-            after_days = _env_number("SOMNI_FORGET_AFTER_DAYS", DEFAULT_FORGET_DAYS, 0, 36500)
+        A record is forgotten when it is older than SOMNI_FORGET_AFTER_DAYS (default 30; 0, or a value that isn't a
+        number of days, keeps everything), it is outside the newest SOMNI_DREAM_RECORDS (the next dream's window), and
+        no action word's tests replay it. The stub keeps the start of the text and every quote a claim cites from it;
+        the chain keeps the original record's hash. At most FORGET_PER_PASS records go per night."""
+        after_days, _ = _forget_setting()
         now = _now()
-        candidates = self._forgettable(after_days, now)
-        if not candidates:
-            return 0
         quotes = self._cited_quotes()
-        replaced = {}
-        for record in candidates:
+        planned = {}
+        for record in self._forgettable(after_days, now):
             stub = self._stub(record, quotes.get(record["id"], ()), now)
             if stub is not None:
-                replaced[record["seq"]] = stub
-        if not replaced:
-            return 0
+                planned[record["seq"]] = stub
+        return planned
+
+    @staticmethod
+    def _check_forgotten(transcript, dreams):
+        """Every stub must be one a committed night pass listed, so editing a stub's text is caught like any edit."""
+        listed = {}
+        for dream in dreams:
+            for seq, digest in (dream.get("forgot") or {}).items():
+                listed.setdefault(seq, set()).add(digest)
+        for record in transcript:
+            if "forgotten" in record and sha(record) not in listed.get(str(record["seq"]), ()):
+                raise MemoryError(f"forgotten record {record['id']} does not match the night pass that forgot it")
+
+    def _write_forgotten(self, replaced):
+        """Rewrite the transcript with tonight's stubs. Called with the lock held, after the pass that lists them."""
         name = "transcript.jsonl"
         folder = self.store / SEGMENT_DIR
         segments, written, retired, offset = [], [], [], 0
@@ -1610,12 +1638,15 @@ class SomniMemory:
             if not prepared and operations:
                 listed = "; ".join(f"op {r['index']} ({_op_name(operations[r['index']])}): {r['reason']}" for r in rejected)
                 raise MemoryError(f"nothing committed: all {len(operations)} operation(s) were rejected. {listed[:1500]}")
+            # Sleep prunes: a night pass forgets old raw detail. It lists each stub's hash, then the stubs are written.
+            night = snapshot is None and (actions or {}).get("author", "dream") == "dream"
+            forget = self._plan_forgetting() if night else {}
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected,
                                author=(actions or {}).get("author", "dream"), snapshot=snapshot, usage=usage,
-                               downgrades=downgrades)
+                               downgrades=downgrades, forgot={str(seq): sha(stub) for seq, stub in forget.items()})
             self._load_locked(force=True)
-            if snapshot is None and (actions or {}).get("author", "dream") == "dream":
-                self._forget_locked()  # sleep prunes: once a night dream has run, old raw detail can fade
+            if forget:
+                self._write_forgotten(forget)
             if self.dreams[-1].get("actions"):
                 self.write_action_files(self.dreams[-1]["actions"])
             if self.pages or os.path.isdir(self.store / VAULT_DIR):
@@ -1834,7 +1865,7 @@ class SomniMemory:
         return next_claim
 
     def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None, usage=None,
-                      downgrades=()):
+                      downgrades=(), forgot=None):
         words = [body for op, body in prepared if op == "action"]
         prepared = [(op, body) for op, body in prepared if op != "action"]
         wiki_events = []
@@ -1879,6 +1910,8 @@ class SomniMemory:
             dream["live"] = True  # a daydream: committed while recording continued past its snapshot
         if downgrades:
             dream["image_downgrades"] = list(downgrades)
+        if forgot:
+            dream["forgot"] = forgot  # {seq: sha256 of the stub} for the records this night forgets
         if usage:
             dream["usage"] = usage  # what the dreaming model reported spending, up to this submission
         if wiki_events:
@@ -1931,7 +1964,7 @@ class SomniMemory:
         if not uses:
             return {"activation": 0.0, "level": "fresh"}
         now = now or _now()
-        decay = _env_number("SOMNI_MEMORY_DECAY", DEFAULT_DECAY, 0.1, 1.0)
+        decay = _env_number("SOMNI_MEMORY_DECAY", DEFAULT_DECAY, 0.0, 1.0)  # 0: by number of uses, no clock
         activation = _activation([(now - moment).total_seconds() / 86400 for moment in uses], decay, claim["salience"])
         return {"activation": round(activation, 3), "level": _strength_level(activation), "last_used": _stamp(max(uses)),
                 "first_seen": _stamp(min(uses))}
@@ -2612,6 +2645,7 @@ class SomniMemory:
             "limits": {key: self._limit(key) for key in LIMIT_KEYS},
             "dream_failures": self.dream_failures(),
             "forgotten": self.forgotten_counts(),
+            "forgetting": {"after_days": (forget := _forget_setting())[0], **({"problem": forget[1]} if forget[1] else {})},
             "claims_by_strength": dict(Counter(self.strength(claim)["level"] for claim in self.claims.values()
                                                if claim["state"] == "active")),
             "past_claims": sum(claim["state"] == "past" for claim in self.claims.values()),

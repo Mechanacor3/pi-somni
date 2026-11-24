@@ -54,7 +54,9 @@ Each `age_j` is the age in days (at least an hour) of one use of the claim:
 - a dream writing or promoting it;
 - a later record that names it by ID, such as the agent recalling `n000004` and acting on it.
 
-`d` is `memory.decay` (`SOMNI_MEMORY_DECAY`, default 0.5).
+`d` is `memory.decay` (`SOMNI_MEMORY_DECAY`, default 0.5). `0` ignores time and ranks claims by how often they were
+used, for a store whose clock isn't meaningful, such as a benchmark paused for weeks. `SOMNI_NOW` can also set a
+virtual clock per run.
 
 | Label | Activation | A salience-3 claim written the day its one record was seen, and not used since |
 |---|---|---|
@@ -77,7 +79,9 @@ relying" into the claim itself, which had the same effect. `status --json` count
 ## Forgetting old records
 
 After each night dream (`/somni-dream`, not a daydream or deep sleep), Somni forgets transcript records older than
-`memory.forget_after_days` (`SOMNI_FORGET_AFTER_DAYS`, default 30; `0` keeps everything). A forgotten record keeps:
+`memory.forget_after_days` (`SOMNI_FORGET_AFTER_DAYS`, default 30; `0` keeps everything). Forgetting can't be undone,
+so a value that isn't a number of days, such as `off`, keeps everything too, and `status --json` and `somni doctor`
+say why. One night forgets at most 2,000 records. A forgotten record keeps:
 
 - a stub of its text: `[forgotten 2026-12-24] ` and its first 160 characters, so `somni_search` can still find it;
 - every quote a claim or retraction ever cited from it, so verified claims still check against their evidence;
@@ -90,8 +94,10 @@ These records are never forgotten:
 - any record an action word's tests replay;
 - any record whose stub wouldn't be shorter than the original.
 
-The original text is gone. A forgotten record's stub is no longer checked against the original; its place in the
-chain still is. `status --json` reports `forgotten` (records and bytes dropped).
+The original text is gone. The night pass that forgets records lists the hash of each stub in its own entry in the
+hash-chained dream log, before any record is rewritten, and loading the store checks every stub against that list.
+An edited stub is caught like any other edit. What can't be checked any more is that a stub's opening matches the
+original text: only the original's hash is kept. `status --json` reports `forgotten` (records and bytes dropped).
 
 A record a dream never got to is forgotten too, once it is old enough. In a long session, more than a dream's window
 can pass between dreams, so dream often enough, or raise `memory.forget_after_days`, if old raw detail matters for

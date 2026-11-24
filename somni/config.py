@@ -47,6 +47,8 @@ class Setting:
     high: float | None = None
     choices: tuple = ()
     default_text: str = ""  # how the default is described when it isn't a plain value
+    invalid: object = None  # what an unusable value means, when falling back to the default would be unsafe
+    invalid_text: str = ""
 
 
 SETTINGS = (
@@ -88,10 +90,11 @@ SETTINGS = (
     Setting("memory.forget_after_days", "SOMNI_FORGET_AFTER_DAYS", "number", 30,
             "After a night dream, transcript records older than this keep only a stub: the start of their text, the "
             "quotes claims cite, and their place in the hash chain. See [Memory over time](memory-over-time.md). "
-            "`0` keeps every record in full", 0, 36500),
+            "`0` keeps every record in full, and so does a value that isn't a number of days", 0, 36500,
+            invalid=0, invalid_text="0, keeping every record (forgetting can't be undone)"),
     Setting("memory.decay", "SOMNI_MEMORY_DECAY", "number", 0.5,
-            "How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation",
-            0.1, 1.0),
+            "How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation. "
+            "`0` ranks claims by how often they were used, ignoring time", 0, 1.0),
     Setting("wiki.link_style", "SOMNI_LINK_STYLE", "enum", "markdown",
             "Vault links: `markdown` (relative `[Title](path.md)`) or `wikilink` (Obsidian `[[slug|Title]]`)",
             choices=("markdown", "wikilink")),
@@ -525,8 +528,11 @@ def resolve(cwd=None, env=None):
             try:
                 checked, warning = check_value(setting, value)
             except ConfigError as exc:
-                errors.append({"file": str(path), "line": line, "message": str(exc)})
-                continue
+                if setting.invalid is None:
+                    errors.append({"file": str(path), "line": line, "message": str(exc)})
+                    continue
+                errors.append({"file": str(path), "line": line, "message": f"{exc}; Somni uses {setting.invalid_text}"})
+                checked, warning = setting.invalid, None
             if warning:
                 warnings.append({"file": str(path), "line": line, "message": warning})
             layer[key] = (checked, f"{path}" + (f":{line}" if line else ""))
@@ -570,9 +576,9 @@ def _from_env(setting, text, cwd, warnings):
         try:
             number = float(text)
         except ValueError:
-            warnings.append({"file": None, "line": None,
-                             "message": f"{setting.env}={text!r} is not a number; Somni uses {setting.default}"})
-            return setting.default
+            used = setting.default if setting.invalid is None else setting.invalid_text
+            warnings.append({"file": None, "line": None, "message": f"{setting.env}={text!r} is not a number; Somni uses {used}"})
+            return setting.default if setting.invalid is None else setting.invalid
         if kind == "int" and number != int(number):
             warnings.append({"file": None, "line": None,
                              "message": f"{setting.env}={text!r} is not a whole number; Somni uses {setting.default}"})
