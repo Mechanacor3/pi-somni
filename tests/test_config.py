@@ -125,7 +125,7 @@ class Resolution(unittest.TestCase):
                            "daydreams:\n  thinking: off\n")
         out = self.resolve(SOMNI_ACTOINS="1")
         messages = [(e.get("line"), e["message"]) for e in out["errors"]]
-        self.assertIn((4, "learning is a section, not a setting; did you mean learning.chel: true?"), messages)
+        self.assertIn(4, [line for line, message in messages if message.startswith("learning is not a Somni setting")])
         self.assertIn((2, "actions.enable is not a Somni setting; did you mean actions.enabled?"), messages)
         self.assertIn((3, 'wiki is a section, not a setting; did you mean wiki.link_style: "wikilink"?'), messages)
         self.assertIn((5, "SOMNI_INJECT_BYTES is not a Somni setting; did you mean index.bytes?"), messages)

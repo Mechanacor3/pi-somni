@@ -2,7 +2,7 @@
 
 Set `SOMNI_ACTIONS=1` (or `actions.enabled: true` in [somni.conf](settings.md)) to let dreams turn a recurring
 sequence of tool calls into an **action word**: one Python function that the agent then calls as a single tool. A word
-extends Chel's verbs, using the same syntax policy, builtins, and sandboxed worker, with one capability: `rpc`.
+runs in a sandboxed Python worker with a restricted syntax and builtins, and one capability: `rpc`.
 
 ```python
 def cancel_if_refundable(booking_id: str):
@@ -27,7 +27,7 @@ tool, because each call in a word is a separate round trip.
   arguments or one dict and returns the tool's result as parsed JSON, or as text if the result is not JSON.
 - **Shape.** A word is one `def`, optionally followed by `test_*` self-tests in the same file. Its docstring is the
   tool description. Each parameter is annotated with `str`, `int`, `float`, `bool`, `list`, or `dict`. Imports (other
-  than `from rpc import replay`), `while`, `try`, lambdas, classes, and I/O are rejected, as they are for Chel verbs.
+  than `from rpc import replay`), `while`, `try`, lambdas, classes, and I/O are rejected.
   `date`, `datetime`, `timedelta`, `floor` and `ceil` are predefined, with no import.
 - **Self-tests in the file.** After `from rpc import replay` (the one allowed import), up to eight `def test_*():`
   functions can call the word inside `with replay("t000012", "t000013"):` and `assert` on its results. Under replay,

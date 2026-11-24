@@ -153,33 +153,21 @@ class SomniPiEndToEnd(unittest.TestCase):
                 finally:
                     self.pi.close()
 
-    def test_dream_checks_chel_rule_and_blocks_live_tools(self):
-        self.pi.close()
-        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port,
-                            env={"SOMNI_CHEL_LEARNING": "1"})
-        plans = {cabin: [[("lookup_fee", {"cabin": cabin, "price": 300})]] for cabin in ("economy", "business")}
+    def test_a_dream_cannot_use_live_tools(self):
+        plans = {"economy": [[("lookup_fee", {"cabin": "economy", "price": 300})]]}
         self.upstream.script = plan_script(plans)
-        for cabin in ("economy", "business", "economy"):
-            self.pi.prompt(cabin)
+        self.pi.prompt("economy")
         memory = SomniMemory(self.work / ".pi" / "somni", "pi").load()
-        refs = [r["id"] for r in memory.transcript if r.get("tool_ok")]
-        self.assertEqual(len(refs), 3)
-        rule = {"id": "economy_fee", "text": "The economy cancellation fee is 50 for a fare of 300.",
-                "when": {"action.kind": "lookup_fee", "obs.arg_cabin": "economy", "obs.arg_price": 300},
-                "then": {"fee": {"set": 50}}}
-        op = {"op": "ledger_propose", "proposal": {"op": "add", "rule": rule}, "tests": {"yes": refs[0], "no": refs[1]}}
+        ref = next(r["id"] for r in memory.transcript if r.get("tool_ok"))
+        claim = {"op": "add", "text": "The economy cancellation fee is 50 for a fare of 300.", "status": "verified",
+                 "salience": 3, "evidence": [{"ref": ref, "quote": '"fee":50'}]}
         plans["Dream pass."] = [[("write", {"path": "dream-marker", "content": "unexpected"})],
-                                [("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [op]})})]]
+                                [("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [claim]})})]]
         self.pi.prompt("/somni-dream cancellation fees")
         self.pi.read(lambda r: r.get("type") == "agent_settled")
         self.assertTrue(next(e for e in self.pi.tool_ends() if e["toolName"] == "write")["isError"])
         self.assertFalse((self.work / "dream-marker").exists())
-        self.assertEqual(memory.load().learning_ledger().rules_view()["economy_fee"]["support"], 2)
-        plans["Recall the economy"] = [[("somni_recall", {"query": "economy fee"})]]
-        self.pi.prompt("Recall the economy cancellation fee")
-        self.assertIn("- rule economy_fee", json.dumps(self.upstream.requests[-1]["messages"]))
-        recall = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_recall")
-        self.assertIn("Rule economy_fee", text_of(recall["result"]["content"]))
+        self.assertEqual([c["text"] for c in memory.load().claims.values()], [claim["text"]])
 
     def test_action_word_is_dreamed_registered_run_through_pi_and_human_edited(self):
         self.pi.close()

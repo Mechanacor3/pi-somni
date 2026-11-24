@@ -55,7 +55,6 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `dreams.lenient_image_evidence` | `SOMNI_LENIENT_IMAGE_EVIDENCE` | off | Keep a citation's `{ref}` when only its image is wrong, downgrading the claim to uncertain if needed |
 | `wiki.link_style` | `SOMNI_LINK_STYLE` | `markdown` | Vault links: `markdown` (relative `[Title](path.md)`) or `wikilink` (Obsidian `[[slug\|Title]]`) |
 | `wiki.page_guide` | `SOMNI_PAGE_GUIDE` | practical playbook guidance | Replaces the default wiki-writing guidance |
-| `learning.chel` | `SOMNI_CHEL_LEARNING` | off | Chel rule and verb proposals in dreams, and rule retrieval in sessions |
 | `actions.enabled` | `SOMNI_ACTIONS` | off | [Action words](action-words.md): dreamed Python functions that call session tools, registered as Pi tools |
 | `actions.tools` | `SOMNI_ACTION_TOOLS` | all non-Somni tools | The tools action words may call |
 | `actions.max_calls` | `SOMNI_ACTION_MAX_CALLS` | `16` | Tool calls per action word run (1–64) |

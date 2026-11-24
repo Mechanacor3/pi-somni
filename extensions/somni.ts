@@ -99,7 +99,6 @@ const SUBJECT = process.env.SOMNI_SUBJECT ?? "pi";
 const RECORD = process.env.SOMNI_RECORD !== "0" && process.env.SOMNI_DAYDREAM !== "1";
 const configuredBytes = Number(process.env.SOMNI_INJECT_BYTES ?? 4096);
 const INJECT_BYTES = Number.isInteger(configuredBytes) ? Math.min(Math.max(configuredBytes, 256), 8192) : 4096;
-const LEARNING = process.env.SOMNI_CHEL_LEARNING === "1";
 const ACTIONS = process.env.SOMNI_ACTIONS === "1";
 const ACTION_ALLOW = process.env.SOMNI_ACTION_TOOLS?.split(",").map((name) => name.trim()).filter(Boolean);
 const MAX_ACTION_DEPTH = 4;
@@ -165,7 +164,7 @@ type TranscriptRecord = RecordContext & {
 type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[];
 	reviewed_through?: string };
 type DreamResult = {
-	id: string; learning_count?: number; action_count?: number; added_count: number; merged_count: number; rejected_count: number;
+	id: string; action_count?: number; added_count: number; merged_count: number; rejected_count: number;
 	rejected?: { index: number; reason: string }[];
 };
 type ActionWord = { name: string; description: string; params: Record<string, string>; uses: string[]; source: string };
@@ -428,9 +427,8 @@ function dreamStepPrompt(focus: string, recent: Recent) {
 }
 
 function summary(result: DreamResult) {
-	const learning = result.learning_count ? ` ${result.learning_count} ledger revision(s) accepted.` : "";
 	const actions = result.action_count ? ` ${result.action_count} action word change(s).` : "";
-	return `Somni dream ${result.id}: ${result.added_count} added, ${result.rejected_count} rejected, ${result.merged_count} merged.${learning}${actions}`;
+	return `Somni dream ${result.id}: ${result.added_count} added, ${result.rejected_count} rejected, ${result.merged_count} merged.${actions}`;
 }
 
 const PARAM_TYPES: Record<string, () => any> = {
@@ -994,18 +992,6 @@ ${candidateGuide(candidates)}`;
 				record_limit: DREAM_RECORDS, record_bytes: DREAM_RECORD_BYTES,
 			});
 			if (FORK_OF) return asText(dreamStepPrompt(args?.trim() || DAYDREAM_FOCUS, recent));
-			let learningGuide = "";
-			if (LEARNING) {
-				const ledger = await getBackend().request("ledger");
-				learningGuide = "You may submit op=ledger_propose with proposal in Chel format. For add or revise, include " +
-					'tests: {yes:"tXXXXXX",no:"tYYYYYY"}. The yes transition must support the prediction. The no transition ' +
-					"must be the same action kind and fall outside when on observed inputs, or flip a predicted boolean from true to false. Rules need two supporting " +
-					"transitions and zero counterexamples across history. Rule = {id,text,when,then}. Use obs.arg_FIELD " +
-					"and action.kind in when, and result fields with {set:value}, {copy:ref} or {expr:expression} in then. " +
-					"Proposal ops: add (rule), revise (target,rule), retract (target,reason), define_verb " +
-					"(verb:{name,params,doc,source,examples:[{args,result}]}). Verbs are pure Python with 2–32 worked examples on distinct inputs. Boolean verbs need true and false results. " +
-					"Current ledger: " + clip(JSON.stringify(ledger), 4096) + ". ";
-			}
 			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list"),
 				await getBackend().request<any>("action_catalog", { live: liveTools() }),
 				await getBackend().request<Candidate[]>("action_candidates"),
@@ -1025,7 +1011,7 @@ ${candidateGuide(candidates)}`;
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
 				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
-				learningGuide + actionsGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
+				actionsGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +
 					`use somni_recall to see what they produced and somni_search if you need one of them.\n\n` : "") +
 				(DAYDREAM_CHILD ? daydreamListing(recent.records) : recent.records.map((r) => describeRecord(r)).join("\n"));
@@ -1125,7 +1111,6 @@ ${candidateGuide(candidates)}`;
 		args.push(`--session-label=${ctx.sessionManager.getSessionId().slice(0, 36)}`);
 		if (RECORD && !DAYDREAM_CHILD) args.push("--record");
 		if (DAYDREAM_CHILD) args.push("--daydream");
-		if (LEARNING) args.push("--learning");
 		if (ACTIONS) args.push("--actions");
 		const backend = new Backend(PYTHON, args, (error) => {
 			if (state.backend !== backend) return;
@@ -1213,7 +1198,7 @@ ${candidateGuide(candidates)}`;
 		const notice = day.notice ? `${day.notice}${lessons}\n\n` : "";
 		day.notice = "";
 		day.lessons = "";
-		if (!/^-(?: n\d{6} | rule | page `| word `)/m.test(index)) {
+		if (!/^-(?: n\d{6} | page `| word `)/m.test(index)) {
 			return notice ? { message: { customType: "somni-index", content: notice.trim(), display: false } } : undefined;
 		}
 		let guide = "";

@@ -1,4 +1,4 @@
-# Dreams, the wiki, and Chel learning
+# Dreams and the wiki
 
 ## Dreams
 
@@ -79,52 +79,6 @@ to half the available space, with an excerpt from the best matching page. A long
 section. Claim lines include evidence IDs and use a short gist when one is available. The index skips entries that
 exceed the remaining space and is capped at 8 KiB. Use `store.py ... inject --query 'your prompt'` to preview it; Pi
 uses up to the first 64 KiB of the prompt for ranking.
-
-## Chel rule learning
-
-Set `SOMNI_CHEL_LEARNING=1` for the task and dream sessions to learn executable predictions. Somni uses the rule ledger
-and pure-Python verb runner from
-[pi-chel at ba2dee4](https://github.com/Mechanacor3/pi-chel/tree/ba2dee4186e2b4c019d8fd5d7eb25f8d39f414e9/chel). The
-package includes both modules under the MIT license.
-
-A **transition** comes from a successful tool call whose complete arguments and JSON object result fit in the
-transcript. Its `obs` contains the arguments as `arg_*` fields, `action.kind` names the tool, and `next_obs` contains
-the observed result fields. Older records without a recorded tool status stay available as ordinary evidence.
-
-During `/somni-dream`, a `ledger_propose` operation contains a Chel `proposal`. An `add` or `revise` also includes two
-transcript references in `tests`. For example, a dream could submit this operation when the cited evidence exists:
-
-```json
-{
-  "op": "ledger_propose",
-  "proposal": {
-    "op": "add",
-    "rule": {
-      "id": "confirmed_request",
-      "text": "Confirmed requests commit the change.",
-      "when": {"action.kind": "apply", "obs.arg_confirm": true},
-      "then": {"committed": {"set": true}}
-    }
-  },
-  "tests": {"yes": "t000004", "no": "t000010"}
-}
-```
-
-The yes case must match the rule and support every prediction. The no case must cite a different transition of the
-same action kind. It must fall outside the rule's conditions on observed inputs, or demonstrate a correctly predicted
-Boolean changing from true to false. Chel then replays the rule over all eligible transitions and requires at least two
-supporting transitions and zero counterexamples. A later contradiction falsifies the rule and removes it from recall and
-the injected index.
-
-The ledger also accepts Chel's `retract` and `define_verb` proposals. A **verb** is a pure function used by a rule.
-Chel checks its syntax and runs its worked examples in an isolated Python process with CPU, address-space, file-size,
-and process limits. Somni requires distinct worked inputs and both outcomes for Boolean verbs. Chel tests
-redefinitions against active rules that use the verb. Running a verb gives it no Pi tool capabilities.
-
-Accepted proposals and their test references are committed in the Somni dream chain. Use
-`python3 somni/store.py --workspace W --subject-id S ledger` to replay the ledger and inspect rule states, support
-counts, and verb names. The CLI accepts `--learning` on `dream` and `inject` to apply proposals and preview matching
-rules. Replay can run recorded verbs in Chel's worker.
 
 ## Internals
 

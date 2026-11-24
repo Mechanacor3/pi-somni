@@ -76,8 +76,6 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
   checked Python function that the agent calls as a single tool.
 - **[Daydreams](docs/long-sessions.md#daydreams-experimental)** (experimental). Dreams that run beside a long session,
   so it can use what it learned after Pi compacts its context.
-- **[Chel rule learning](docs/dreams.md#chel-rule-learning)** (experimental). Executable predictions learned from tool
-  calls and checked against every recorded transition.
 - **[Headless runs](docs/headless.md).** Scripts and harnesses: one-shot dreams, run labels and tags, the store CLI.
 
 **Does it help?** The real test is your own work: fewer repeat questions and fewer repeated mistakes.

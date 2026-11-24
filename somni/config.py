@@ -90,8 +90,6 @@ SETTINGS = (
             choices=("markdown", "wikilink")),
     Setting("wiki.page_guide", "SOMNI_PAGE_GUIDE", "text", "", "Replaces the default wiki-writing guidance",
             default_text="practical playbook guidance"),
-    Setting("learning.chel", "SOMNI_CHEL_LEARNING", "bool", False,
-            "Chel rule and verb proposals in dreams, and rule retrieval in sessions"),
     Setting("actions.enabled", "SOMNI_ACTIONS", "bool", False,
             "[Action words](action-words.md): dreamed Python functions that call session tools, "
             "registered as Pi tools"),

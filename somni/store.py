@@ -1323,7 +1323,7 @@ class SomniMemory:
             self.claims[replaces]["superseded_by"] = claim_id
         return claim_id
 
-    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, learning=False, actions=None,
+    def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, actions=None,
               snapshot=None, usage=None, lenient_images=False):
         """Apply one offline consolidation pass.
 
@@ -1361,8 +1361,6 @@ class SomniMemory:
             if snapshot is not None:
                 if type(snapshot) is not int or not 0 < snapshot <= self.state["transcript_count"]:
                     raise MemoryError(f"snapshot must be a transcript count in 1..{self.state['transcript_count']}")
-                if learning:
-                    raise MemoryError("learning-ledger passes need a closed session; daydreams cannot run them")
             if self.state["dream_count"] >= self._limit("max_dream_passes"):
                 raise MemoryError("dream pass limit reached; seal the bounded attempt")
             records = self._records_by_id
@@ -1372,7 +1370,7 @@ class SomniMemory:
                 self._records_by_id.horizon = self.transcript[snapshot - 1]["id"]
             self._image_downgrades = [] if lenient_images else None
             try:
-                prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, learning, actions)
+                prepared, next_claim, rejected = self._prepare_dream(operations, partial, viewed_images, actions)
                 downgrades = self._image_downgrades or []
             finally:
                 self._records_by_id = records
@@ -1390,14 +1388,13 @@ class SomniMemory:
                 self.write_vault()
             return self.dreams[-1]
 
-    def _prepare_dream(self, operations, partial, viewed_images, learning, actions):
+    def _prepare_dream(self, operations, partial, viewed_images, actions):
         # Removing a broken wiki operation can expose another broken link or an
         # earlier page version. Rebuild the simulation before checking again.
         link_rejections = {}
         while True:
             simulated = {key: dict(value) for key, value in self.claims.items()}
             words = None
-            ledger = None
             pages = self.pages.copy()
             page_changes = {}
             prepared = []
@@ -1415,17 +1412,6 @@ class SomniMemory:
                         if words is None:
                             words = self.action_words()
                         prepared.append(("action", self._prepare_action(operation, words, actions)))
-                        continue
-                    if isinstance(operation, dict) and operation.get("op") == "ledger_propose":
-                        if not learning:
-                            raise MemoryError("Chel learning is disabled")
-                        if ledger is None:
-                            ledger = deepcopy(self.learning_ledger())
-                        try:
-                            revision = ledger.check_proposal(operation)
-                        except (ValueError, TypeError, KeyError, OverflowError) as exc:
-                            raise MemoryError(str(exc)) from exc
-                        prepared.append(("ledger_propose", revision))
                         continue
                     if self._image_downgrades is not None:
                         operation = self._lenient_image_evidence(operation, viewed_images, index)
@@ -1612,9 +1598,8 @@ class SomniMemory:
 
     def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None, usage=None,
                       downgrades=()):
-        learning = [body for op, body in prepared if op == "ledger_propose"]
         words = [body for op, body in prepared if op == "action"]
-        prepared = [(op, body) for op, body in prepared if op not in {"ledger_propose", "action"}]
+        prepared = [(op, body) for op, body in prepared if op != "action"]
         wiki_events = []
         wiki_seq, wiki_head = self.state.get("wiki_events", 0), self.state.get("wiki_head", ZERO_HASH)
         for op, body in prepared:
@@ -1658,9 +1643,6 @@ class SomniMemory:
             dream["image_downgrades"] = list(downgrades)
         if usage:
             dream["usage"] = usage  # what the dreaming model reported spending, up to this submission
-        if learning:
-            dream["learning"] = learning
-            dream["operation_count"] += len(learning)
         if wiki_events:
             dream["page_operations"] = len(wiki_events)
             dream["operation_count"] += page_ops
@@ -2144,28 +2126,6 @@ class SomniMemory:
         return self.dream({"schema": SCHEMA, "operations": operations[:32]}, partial=True,
                           actions={"author": "human", "reserved": reserved, "allow": allow})
 
-    def learning_ledger(self):
-        # Isolated CLI invocations omit the package root from sys.path.
-        root = str(pathlib.Path(__file__).resolve().parent.parent)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        from somni.learning import DreamLedger
-        # Only reuse a replay if both chains still extend its verified inputs.
-        cache = getattr(self, "_learning_cache", None)
-        if cache:
-            dream_head, record_head, ledger = cache
-            count = ledger.record_count
-            prefix_head = (self.transcript[count]["prev_sha256"] if count < len(self.transcript)
-                           else self.state["transcript_head"])
-            if dream_head == self.state["dreams_head"] and count <= len(self.transcript) and record_head == prefix_head:
-                ledger.ingest(self.transcript[count:])
-            else:
-                cache = None
-        if not cache:
-            ledger = DreamLedger.from_memory(self)
-        self._learning_cache = (self.state["dreams_head"], self.state["transcript_head"], ledger)
-        return ledger
-
     def _index_words(self, names, query, budget):
         A = _action_module()
         python = {kind: name for name, kind in A.ANNOTATIONS.items()}
@@ -2222,7 +2182,7 @@ class SomniMemory:
             budget -= size
         return lines
 
-    def inject(self, max_bytes=DEFAULT_INJECTION_BYTES, *, query="", learning=False, words=None):
+    def inject(self, max_bytes=DEFAULT_INJECTION_BYTES, *, query="", words=None):
         """The bounded index injected before each agent turn.  ``words`` names the action
         words registered as tools in this session; up to five are listed, ranked by the query."""
         _validate_index_request(max_bytes, query)
@@ -2233,15 +2193,6 @@ class SomniMemory:
             word_lines = self._index_words(words, query, min(remaining // 4, 1536))
             lines += word_lines
             remaining -= sum(len(line.encode("utf-8")) for line in word_lines)
-        if learning and query.strip():
-            rule_budget = remaining // 3
-            for rule in self.learning_ledger().recall(query, top_k=5):
-                line = f"- rule {rule['id']} ({rule['support']} supporting transitions): {rule['text']}\n"
-                size = len(line.encode("utf-8"))
-                if size <= rule_budget:
-                    lines.append(line)
-                    remaining -= size
-                    rule_budget -= size
         page_budget = remaining // 2
         stale = self.stale_pages()
         pages = [page for slug, page in sorted(self.pages.items()) if slug not in stale]
@@ -2462,7 +2413,6 @@ def _dream_summary(dream):
     # Legacy passes didn't record which note events belonged to them.
     default = 0 if dream["operation_count"] == dream.get("page_operations", 0) else None
     return {"id": f"d{dream['seq']:06d}", "added_count": dream.get("added_count", default),
-            **({"learning_count": len(dream["learning"])} if dream.get("learning") else {}),
             **({"action_count": len(dream["actions"])} if dream.get("actions") else {}),
             **({"broken_dependents": broken} if (broken := {k: v for e in dream.get("actions", ())
                                                            for k, v in e.get("broken_dependents", {}).items()}) else {}),
@@ -2528,7 +2478,7 @@ def _action_module():
 
 
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
-                    resize=None, viewed=None, learning=False, actions=False, daydream=None, contributor=False):
+                    resize=None, viewed=None, actions=False, daydream=None, contributor=False):
     if daydream is not None and method in {"phase", "record", "note", "wiki", "action_tools"}:
         raise MemoryError("a daydream may only read memory and submit its pass")
     # A contributor (a second Pi on the store, such as a sub-agent) may append records; the owner keeps the rest.
@@ -2549,7 +2499,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
                             clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"),
                             calls=args.get("calls"), via_word=args.get("via_word"),
                             word_stamp=_word_stamp(memory, args) if actions and args.get("word") is True else None)
-        return ref if index_bytes is None else memory.inject(index_bytes, query=query, learning=learning,
+        return ref if index_bytes is None else memory.inject(index_bytes, query=query,
                                                             words=_index_word_names(args) if actions else None)
     elif method == "note":
         if len(canonical(args).encode("utf-8")) > MAX_INPUT_BYTES:
@@ -2568,12 +2518,12 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         except ValueError as exc:
             raise MemoryError(f"proposal_json is not valid JSON ({exc}); nothing committed") from None
         dream = memory.dream(parsed, partial=True, allow_empty=True, viewed_images=viewed,
-                             learning=learning, actions=options, snapshot=daydream, usage=args.get("usage"),
+                             actions=options, snapshot=daydream, usage=args.get("usage"),
                              lenient_images=args.get("lenient_images") is True)
         memory.clear_dream_cache()
         return {**dream, **_dream_summary(dream)}
     elif method == "inject":
-        return memory.load().inject(args["index_bytes"], query=args.get("query", ""), learning=learning,
+        return memory.load().inject(args["index_bytes"], query=args.get("query", ""),
                                     words=_index_word_names(args) if actions else None)
     elif method == "search":
         return memory.load().search(args["query"], args["limit"])
@@ -2584,11 +2534,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
     elif method == "recall":
         memory.load()
         query, limit = args["query"], args["limit"]
-        hits = memory.recall_pages(query, limit) + memory.recall(query, limit)
-        if learning:
-            rules = memory.learning_ledger().recall(query, top_k=limit)
-            return [{**rule, "kind": "rule"} for rule in rules] + hits
-        return hits
+        return memory.recall_pages(query, limit) + memory.recall(query, limit)
     elif method == "action_list" and actions:
         return [{key: word[key] for key in ("name", "description", "params", "uses", "source")}
                 for word in memory.load().action_words().values()]
@@ -2630,8 +2576,6 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         return A.step(A.shared_runtime(words), words[args["name"]], args["params"], args["history"],
                       max_calls=args.get("max_calls", A.MAX_CALLS),
                       catalog=A.namespace(memory._read_action_tools(), words))
-    elif method == "ledger" and learning:
-        return memory.load().learning_ledger().description()
     elif method == "recent":
         return _recent(memory.load(), args.get("include_images", False), viewed,
                        record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
@@ -2719,7 +2663,7 @@ def _dream_actions(args):
     return {"author": "dream", "allow": allow, "reserved": reserved}
 
 
-def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=False, actions=False, daydream=False,
+def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=False, daydream=False,
            session_label=None):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
@@ -2751,7 +2695,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
                 request_id = request["id"]
                 reply(request_id, result=_handle_request(memory, request["method"], request["args"], writable=True,
                                                          context=context, image_bytes=image_bytes, resize=resize,
-                                                         viewed=viewed, learning=False, actions=actions, daydream=head))
+                                                         viewed=viewed, actions=actions, daydream=head))
             except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                 reply(request_id, error=str(exc))
         return
@@ -2788,7 +2732,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, learning=Fal
                     request = json.loads(line)
                     request_id = request["id"]
                     result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
-                                             image_bytes=image_bytes, resize=resize, viewed=viewed, learning=learning,
+                                             image_bytes=image_bytes, resize=resize, viewed=viewed,
                                              actions=actions, contributor=contributor)
                     reply(request_id, result=result)
                 except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
@@ -2837,7 +2781,6 @@ def parser():
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
     serve.add_argument("--actions", action="store_true")
     serve.add_argument("--daydream", action="store_true", help="read-only except for one live dream pass; no lease")
-    serve.add_argument("--learning", action="store_true")
     serve.add_argument("--record", action="store_true")
     serve.add_argument("--run-label")
     serve.add_argument("--tags", default="[]")
@@ -2848,12 +2791,9 @@ def parser():
     record.add_argument("--inject-max-bytes", type=int, help="emit the updated index instead of the record ID")
     note = commands.add_parser("note"); note.add_argument("--input", required=True, help="claim JSON relative to workspace, or - for stdin")
     dream = commands.add_parser("dream"); dream.add_argument("--input", required=True, help="proposal JSON relative to workspace, or - for stdin")
-    dream.add_argument("--learning", action="store_true", help="allow Chel rule and verb proposals")
     search = commands.add_parser("search"); search.add_argument("query"); search.add_argument("--limit", type=int, default=20)
     inject = commands.add_parser("inject"); inject.add_argument("--max-bytes", type=int, default=DEFAULT_INJECTION_BYTES)
-    inject.add_argument("--learning", action="store_true", help="include matching active Chel rules")
     inject.add_argument("--query", default="", help="rank the index for a prompt")
-    commands.add_parser("ledger", help="inspect the replayed Chel rules and verbs")
     commands.add_parser("report"); commands.add_parser("metrics")
     commands.add_parser("status").add_argument("--json", action="store_true", help="emit the machine-readable status")
     return ap
@@ -2869,7 +2809,7 @@ def main():
         memory = SomniMemory(args.workspace, args.subject_id)
         if args.command == "serve":
             _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
-                   image_bytes=args.image_bytes, image_max_edge=args.image_max_edge, learning=args.learning,
+                   image_bytes=args.image_bytes, image_max_edge=args.image_max_edge,
                    actions=args.actions, daydream=args.daydream, session_label=args.session_label)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
@@ -2891,13 +2831,11 @@ def main():
             print(memory.add_note(claim.get("text"), claim.get("status"), claim.get("evidence"), claim.get("salience", 3),
                                   claim.get("links", []), gist=claim.get("gist")))
         elif args.command == "dream":
-            print(canonical(memory.dream(_input_json(memory, args.input), learning=args.learning)))
+            print(canonical(memory.dream(_input_json(memory, args.input))))
         elif args.command == "search":
             print(json.dumps(memory.load().search(args.query, args.limit), ensure_ascii=False, indent=2, sort_keys=True))
         elif args.command == "inject":
-            sys.stdout.write(memory.load().inject(args.max_bytes, query=args.query, learning=args.learning))
-        elif args.command == "ledger":
-            print(canonical(memory.load().learning_ledger().description()))
+            sys.stdout.write(memory.load().inject(args.max_bytes, query=args.query))
         elif args.command == "report":
             sys.stdout.write(memory.load().report())
         elif args.command == "metrics":
