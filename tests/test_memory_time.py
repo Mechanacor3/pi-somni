@@ -149,7 +149,8 @@ class TimeTest(unittest.TestCase):
             self.assertNotIn("Dates say", memory.inject(query="pens"))  # nothing dated to explain
         with at(DAY40):
             self.assertIn("Pens are blue. (as of 2026-01-01)\n", memory.inject(query="pens"))
-            self.assertIn("fading, last used 2026-01-01", dm.render_claims(memory))  # dreams see the level
+            self.assertIn("as of 2026-01-01) Pens are blue.", dm.render_claims(memory))
+        self.assertIn("Age is not doubt", dm.TIME_GUIDE)
         # Using the claim (a later record names it) is retrieval practice: it is fresh again.
         self.record("2026-03-31T09:00:00Z", "Checked n000001 against the closet.", source="agent_output")
         memory = self.reload()

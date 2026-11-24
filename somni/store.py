@@ -1951,17 +1951,16 @@ class SomniMemory:
             current = old
         return versions
 
-    def describe_time(self, claim, now=None, *, index=False):
-        """A short clause about a claim's age and strength: empty for a fresh claim with no history.
+    def describe_time(self, claim, now=None):
+        """A short clause about a claim's age and history: empty for a fresh claim with no history.
 
-        For the index (``index=True``) a faded claim gets a neutral "as of <date>", and "faint" only once it is faint:
-        in a benchmark, labelling every week-old claim "fading" sent the agent to the files instead of using it."""
+        A faded claim gets a neutral "as of <date>", and "faint" only once it is faint. In a benchmark, labelling every
+        week-old claim "fading" sent the agent to the files instead of using it, and made dreams write "verify before
+        relying" into claims."""
         parts = []
         strength = self.strength(claim, now)
         if strength["level"] != "fresh":
-            last = strength["last_used"][:10]
-            parts.append((f"as of {last}" + ("; faint" if strength["level"] == "faint" else "")) if index
-                         else f"{strength['level']}, last used {last}")
+            parts.append(f"as of {strength['last_used'][:10]}" + ("; faint" if strength["level"] == "faint" else ""))
         history = self.history(claim)
         if history:
             since = history[0]["until"]
@@ -2521,7 +2520,7 @@ class SomniMemory:
         header = "# Subject memory index\nClaims are interpretations. Use evidence IDs to inspect the transcript.\n"
         active = [claim for claim in self.claims.values() if claim["state"] == "active"]
         now = _now()
-        timing = {claim["id"]: self.describe_time(claim, now, index=True) for claim in active}
+        timing = {claim["id"]: self.describe_time(claim, now) for claim in active}
         if any(timing.values()):
             header += ("Dates say when a memory was last seen or used, or since when it holds. It is still the latest "
                        "you know unless something newer says otherwise: answer with it and give its date.\n")

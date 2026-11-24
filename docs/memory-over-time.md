@@ -66,11 +66,13 @@ Repetition and use keep a claim fresh much longer. A faint claim is still verifi
 measures how recently memory was used, not whether it's true. The index ranks relevant claims a little lower as they
 fade and gives a faded claim its date (`as of 2026-10-02`, and `; faint` once it is faint). A header line explains
 that a dated memory is still the latest information unless something newer contradicts it, and that the answer
-should give its date. Dream prompts show the level itself (`fading, last used 2026-10-02`).
+should give its date. Dream prompts date claims the same way, and the dream is told that age is not doubt: an
+old claim that nothing has contradicted stays the best information, so a claim shouldn't say "verify before relying".
 
 The index once said "fading" outright. In a benchmark where the only source for a fact was what the user had said
 five weeks earlier, that label sent the agent to search the files instead of answering. The files had nothing on it,
-so it answered from an unrelated note. `status --json` counts active claims by strength (`claims_by_strength`) and past claims (`past_claims`).
+so it answered from an unrelated note. The same labels in the dream's prompt led it to write "time-sensitive; verify before
+relying" into the claim itself, which had the same effect. `status --json` counts active claims by strength (`claims_by_strength`) and past claims (`past_claims`).
 
 ## Forgetting old records
 

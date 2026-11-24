@@ -175,7 +175,9 @@ const TIME_GUIDE = "Records are dated (the --- day --- lines). When a record dis
 	"If the world changed, the claim was true until then: use update ({\"op\":\"update\",\"claim_id\":...} with the " +
 	"newer evidence), which keeps the old claim as history. If the claim was wrong all along, use correct or retract. " +
 	"Never leave two active claims that disagree; when both were true at different times, update the older one and say " +
-	"since when in the text. ";
+	"since when in the text. Age is not doubt: never write 'verify before relying', 'may be stale' or 'check the files " +
+	"first' into a claim that nothing has contradicted. Date it instead ('as of 2026-01-12'); it stays the best " +
+	"information until a newer record changes it. ";
 
 /** Lines for `records` with a `--- YYYY-MM-DD ---` header wherever the day changes. */
 function withDays(records: TranscriptRecord[], render: (record: TranscriptRecord) => string) {
@@ -191,14 +193,13 @@ function withDays(records: TranscriptRecord[], render: (record: TranscriptRecord
 
 /**
  * One line about a claim's age and history, or "" for a fresh claim with none. The agent sees "as of <date>", and
- * "faint" only for a faint claim: labelling week-old claims "fading" made agents distrust memory they had no other
- * source for. Dreams (`labels`) see the strength level itself.
+ * "faint" only for a faint claim. Labelling week-old claims "fading" made agents distrust memory they had no other
+ * source for, and made dreams write "verify before relying" into claims.
  */
-function timeClause(strength?: Strength, history?: PastVersion[], labels = false) {
+function timeClause(strength?: Strength, history?: PastVersion[]) {
 	const parts: string[] = [];
 	if (strength && strength.level !== "fresh") {
-		const last = strength.last_used?.slice(0, 10);
-		parts.push(labels ? `${strength.level}, last used ${last}` : `as of ${last}${strength.level === "faint" ? "; faint" : ""}`);
+		parts.push(`as of ${strength.last_used?.slice(0, 10)}${strength.level === "faint" ? "; faint" : ""}`);
 	}
 	if (history?.length) {
 		const [last] = history;
@@ -210,7 +211,7 @@ function timeClause(strength?: Strength, history?: PastVersion[], labels = false
 function relatedClaims(claims: RelatedClaim[] = []) {
 	if (!claims.length) return "";
 	return "Current claims these records may confirm, update or contradict:\n" + claims.map((c) => {
-		const when = timeClause(c.strength, c.history, true);
+		const when = timeClause(c.strength, c.history);
 		const seen = c.strength.first_seen ? `, first seen ${c.strength.first_seen.slice(0, 10)}` : "";
 		return `- ${c.id} [${c.status}${seen}; evidence ${c.refs.join(",")}${when ? `; ${when}` : ""}] ${c.text}`;
 	}).join("\n") + "\n\n";

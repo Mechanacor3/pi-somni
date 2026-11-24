@@ -80,7 +80,10 @@ def render_pages(memory, body_chars=400):
 TIME_GUIDE = ("Records are dated (day headers in the listing). When a record disagrees with a claim, decide what "
               "happened. If the world changed, the claim was true until then: use update, which keeps it as history. "
               "If the claim was wrong all along, use correct or retract. Never leave two active claims that disagree; "
-              "when both were true at different times, update the older one and say since when in the text.")
+              "when both were true at different times, update the older one and say since when in the text. Age is "
+              "not doubt: never write 'verify before relying', 'may be stale' or 'check the files first' into a claim "
+              "that nothing has contradicted. Date it instead ('as of 2026-01-12'); it stays the best information "
+              "until a newer record changes it.")
 
 
 def render_records(records, max_chars=2_400):
