@@ -76,6 +76,10 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
   checked Python function that the agent calls as a single tool.
 - **[Daydreams](docs/long-sessions.md#daydreams-experimental)** (experimental). Dreams that run beside a long session,
   so it can use what it learned after Pi compacts its context.
+- **[Deep sleep](docs/action-words.md#deep-sleep-building-words-with-real-tools)** (experimental). `/somni-deepsleep`
+  builds and rehearses one action word (also called a habit, trick or reflex), trying it with real tools you allow.
+- **[Sleep and memory](docs/sleep-and-memory.md).** How Somni's recording, daydreams, dreams and deep sleep relate to
+  human sleep, and where the analogy breaks.
 - **[Headless runs](docs/headless.md).** Scripts and harnesses: one-shot dreams, run labels and tags, the store CLI.
 
 **Does it help?** The real test is your own work: fewer repeat questions and fewer repeated mistakes.
