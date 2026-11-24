@@ -399,6 +399,9 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(dream["messages"][0], first["messages"][0])
         self.assertEqual([t["function"]["name"] for t in dream.get("tools", [])],
                          [t["function"]["name"] for t in first.get("tools", [])])
+        # It keeps its session's prompt cache key, so the provider looks in the cache that holds its prefix.
+        self.assertTrue(first.get("prompt_cache_key"), sorted(first))
+        self.assertEqual(dream.get("prompt_cache_key"), first["prompt_cache_key"])
         # It routes like its session too: a session header carries the parent's ID, not the fork's own.
         route = [k for k in self.upstream.headers[0] if k in ("x-session-id", "x-session-affinity", "session_id")]
         self.assertNotEqual(dream_headers_id := self.upstream.headers[0].get("x-session-id"), None)

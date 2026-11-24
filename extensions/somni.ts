@@ -1220,10 +1220,10 @@ ${candidateGuide(candidates)}`;
 			}
 		});
 		pi.on("before_provider_request", (event) => {
+			// Set in place and return nothing: another extension that rebuilds the payload from its own copy
+			// (one that wraps tools, say) then still sends this key.
 			const payload = event.payload as { prompt_cache_key?: string };
-			if (payload && typeof payload === "object" && "prompt_cache_key" in payload && payload.prompt_cache_key) {
-				return { ...payload, prompt_cache_key: FORK_OF.slice(0, 64) };
-			}
+			if (payload && typeof payload === "object" && payload.prompt_cache_key) payload.prompt_cache_key = FORK_OF.slice(0, 64);
 			return undefined;
 		});
 	}

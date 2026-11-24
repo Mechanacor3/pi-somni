@@ -121,7 +121,9 @@ class PiSession:
         self.name = f"pi-plugin-e2e-{secrets.token_hex(4)}"
         models = {"providers": {"fake": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
                                          "apiKey": "not-a-real-key", "models": [{"id": "m", "name": "fake",
-                                                                                 "input": ["text", "image"]}]}}}
+                                                                                 "input": ["text", "image"],
+                                                                                 # send prompt_cache_key, as OpenAI does
+                                                                                 "compat": {"promptCacheKeyMode": "enabled"}}]}}}
         self.events, self.seq = [], 0
         self.buffer = bytearray()
         # sessions: a directory to save sessions in (a forked daydream needs a session file); default ephemeral.
