@@ -8,10 +8,10 @@ and none of its design depends on the neuroscience being right.
 ## The human night, briefly
 
 Sleep runs in cycles of roughly 90 minutes. Each cycle moves through light non-REM sleep (N1, N2), deep slow-wave sleep
-(N3), and rapid-eye-movement (REM) sleep. Slow-wave sleep dominates the first half of the night and REM the second. The
-main account of what sleep does for memory is *active systems consolidation* (Diekelmann & Born, 2010; Rasch & Born,
+(N3), and rapid-eye-movement (REM) sleep. Slow-wave sleep dominates the first half of the night and REM the second. A
+leading account of what sleep does for memory is *active systems consolidation* (Diekelmann & Born, 2010; Rasch & Born,
 2013). The hippocampus records the day's episodes quickly. During non-REM sleep it replays them, timed with cortical
-slow oscillations and sleep spindles, and that replay gradually strengthens a slower, more general copy in the
+slow oscillations and sleep spindles, and that replay gradually strengthens a slower, more general representation in the
 neocortex. The two-system idea goes back to McClelland, McNaughton & O'Reilly (1995): one system learns fast and keeps
 detail, the other learns slowly and keeps structure.
 
