@@ -91,6 +91,7 @@ class TimeTest(unittest.TestCase):
         with at(DAY1):
             index = memory.inject(query="what colour are the pens?")
             self.assertIn("since 2026-01-02; before that: Pens are blue.", index)
+            self.assertIn("Dates say when a memory was last seen or used, or since when it holds.", index)
             self.assertNotIn("- n000001", index)  # history, not a current claim
             hits = memory.recall("pens colour blue red", 5)
         self.assertEqual([h["id"] for h in hits], ["n000002", "n000001"])  # past claims rank below current ones
@@ -141,7 +142,14 @@ class TimeTest(unittest.TestCase):
         with at(DAY90):
             faint = memory.strength(claim)
             self.assertEqual(faint["level"], "faint")
-            self.assertIn("faint, last used 2026-01-01", memory.inject(query="pens"))
+            index = memory.inject(query="pens")
+            self.assertIn("Pens are blue. (as of 2026-01-01; faint)", index)
+            self.assertIn("It is still the latest you know unless something newer says otherwise", index)
+        with at(DAY0):
+            self.assertNotIn("Dates say", memory.inject(query="pens"))  # nothing dated to explain
+        with at(DAY40):
+            self.assertIn("Pens are blue. (as of 2026-01-01)\n", memory.inject(query="pens"))
+            self.assertIn("fading, last used 2026-01-01", dm.render_claims(memory))  # dreams see the level
         # Using the claim (a later record names it) is retrieval practice: it is fresh again.
         self.record("2026-03-31T09:00:00Z", "Checked n000001 against the closet.", source="agent_output")
         memory = self.reload()
@@ -225,6 +233,14 @@ class TimeTest(unittest.TestCase):
         memory = self.reload()
         self.assertEqual(memory.forgotten_counts()["records"], 6)
         self.assertNotIn("forgotten", memory.transcript[-1])
+
+    def test_the_dream_window_sets_how_many_newest_records_are_kept(self):
+        refs = self.old_day()
+        self.record(DAY0, *[f"more old detail {i} " + "w " * 120 for i in range(4)])
+        with patch.dict(os.environ, {"SOMNI_DREAM_RECORDS": "3"}):
+            self.night(DAY40)
+        memory = self.reload()
+        self.assertEqual([r["id"] for r in memory.transcript if "forgotten" in r], refs + ["t000007"])
 
     def test_records_an_action_word_replays_are_never_forgotten(self):
         with at(DAY0):

@@ -64,8 +64,13 @@ Each `age_j` is the age in days (at least an hour) of one use of the claim:
 
 Repetition and use keep a claim fresh much longer. A faint claim is still verified if it was verified: strength
 measures how recently memory was used, not whether it's true. The index ranks relevant claims a little lower as they
-fade and shows the label on fading and faint ones (`faint, last used 2026-10-02`), so the agent knows to check before
-relying on them. `status --json` counts active claims by strength (`claims_by_strength`) and past claims (`past_claims`).
+fade and gives a faded claim its date (`as of 2026-10-02`, and `; faint` once it is faint). A header line explains
+that a dated memory is still the latest information unless something newer contradicts it, and that the answer
+should give its date. Dream prompts show the level itself (`fading, last used 2026-10-02`).
+
+The index once said "fading" outright. In a benchmark where the only source for a fact was what the user had said
+five weeks earlier, that label sent the agent to search the files instead of answering. The files had nothing on it,
+so it answered from an unrelated note. `status --json` counts active claims by strength (`claims_by_strength`) and past claims (`past_claims`).
 
 ## Forgetting old records
 
@@ -79,7 +84,7 @@ After each night dream (`/somni-dream`, not a daydream or deep sleep), Somni for
 
 These records are never forgotten:
 
-- the newest 120 records, which make up the next dream's window;
+- the newest `dreams.records` records (120 by default), which make up the next dream's window;
 - any record an action word's tests replay;
 - any record whose stub wouldn't be shorter than the original.
 

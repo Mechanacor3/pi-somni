@@ -166,7 +166,7 @@ def token_estimate(value):
 # --- Time, strength and forgetting (see docs/memory-over-time.md) ---
 
 DEFAULT_FORGET_DAYS = 30  # SOMNI_FORGET_AFTER_DAYS: reviewed records older than this keep only a stub
-FORGET_KEEP_RECORDS = 120  # the newest records are never forgotten: the next dream's window
+FORGET_KEEP_RECORDS = 120  # the newest records are never forgotten: the next dream's window (SOMNI_DREAM_RECORDS)
 FORGET_GIST_CHARS = 160
 FORGOTTEN_PREFIX = "[forgotten "
 DEFAULT_DECAY = 0.5  # SOMNI_MEMORY_DECAY: ACT-R's base-level decay d (Anderson & Schooler, 1991)
@@ -845,7 +845,9 @@ class SomniMemory:
         last_night = next((dream for dream in reversed(self.dreams) if not dream.get("live")), None)
         if last_night is None or after_days <= 0:
             return []
-        end = min(last_night["transcript_count"], len(self.transcript) - FORGET_KEEP_RECORDS)
+        keep = int(_env_number("SOMNI_DREAM_RECORDS", FORGET_KEEP_RECORDS, 1, FORGET_KEEP_RECORDS))
+        keep = min(keep, FORGET_KEEP_RECORDS)
+        end = min(last_night["transcript_count"], len(self.transcript) - keep)
         cutoff = now - _dt.timedelta(days=after_days)
         protected = self._forget_protected()
         out = []
@@ -1949,12 +1951,17 @@ class SomniMemory:
             current = old
         return versions
 
-    def describe_time(self, claim, now=None):
-        """A short clause about a claim's age and strength for the index: empty for a fresh claim with no history."""
+    def describe_time(self, claim, now=None, *, index=False):
+        """A short clause about a claim's age and strength: empty for a fresh claim with no history.
+
+        For the index (``index=True``) a faded claim gets a neutral "as of <date>", and "faint" only once it is faint:
+        in a benchmark, labelling every week-old claim "fading" sent the agent to the files instead of using it."""
         parts = []
         strength = self.strength(claim, now)
         if strength["level"] != "fresh":
-            parts.append(f"{strength['level']}, last used {strength['last_used'][:10]}")
+            last = strength["last_used"][:10]
+            parts.append((f"as of {last}" + ("; faint" if strength["level"] == "faint" else "")) if index
+                         else f"{strength['level']}, last used {last}")
         history = self.history(claim)
         if history:
             since = history[0]["until"]
@@ -2512,6 +2519,12 @@ class SomniMemory:
         words registered as tools in this session; up to five are listed, ranked by the query."""
         _validate_index_request(max_bytes, query)
         header = "# Subject memory index\nClaims are interpretations. Use evidence IDs to inspect the transcript.\n"
+        active = [claim for claim in self.claims.values() if claim["state"] == "active"]
+        now = _now()
+        timing = {claim["id"]: self.describe_time(claim, now, index=True) for claim in active}
+        if any(timing.values()):
+            header += ("Dates say when a memory was last seen or used, or since when it holds. It is still the latest "
+                       "you know unless something newer says otherwise: answer with it and give its date.\n")
         lines = [header]
         remaining = max_bytes - len(header.encode("utf-8"))
         if words:
@@ -2521,7 +2534,6 @@ class SomniMemory:
         page_budget = remaining // 2
         stale = self.stale_pages()
         pages = [page for slug, page in sorted(self.pages.items()) if slug not in stale]
-        active = [claim for claim in self.claims.values() if claim["state"] == "active"]
         page_ranks = {}
         if query.strip():
             claim_ranks, page_ranks = self._index_ranks(active, pages, query)
@@ -2555,9 +2567,8 @@ class SomniMemory:
             labels = ", ".join(_claim_labels(claim))
             context = f" (context: {labels[:160]})" if labels else ""
             text = claim.get("gist", claim["text"])
-            timing = self.describe_time(claim)
-            timing = f" ({timing})" if timing else ""
-            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {text}{timing}{context}\n"
+            when = f" ({timing[claim['id']]})" if timing[claim["id"]] else ""
+            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {text}{when}{context}\n"
             size = len(line.encode("utf-8"))
             if size > remaining:
                 omitted += 1

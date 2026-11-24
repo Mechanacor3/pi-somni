@@ -189,10 +189,17 @@ function withDays(records: TranscriptRecord[], render: (record: TranscriptRecord
 	return lines;
 }
 
-/** One line about a claim's age, strength and history, or "" for a fresh claim with none. */
-function timeClause(strength?: Strength, history?: PastVersion[]) {
+/**
+ * One line about a claim's age and history, or "" for a fresh claim with none. The agent sees "as of <date>", and
+ * "faint" only for a faint claim: labelling week-old claims "fading" made agents distrust memory they had no other
+ * source for. Dreams (`labels`) see the strength level itself.
+ */
+function timeClause(strength?: Strength, history?: PastVersion[], labels = false) {
 	const parts: string[] = [];
-	if (strength && strength.level !== "fresh") parts.push(`${strength.level}, last used ${strength.last_used?.slice(0, 10)}`);
+	if (strength && strength.level !== "fresh") {
+		const last = strength.last_used?.slice(0, 10);
+		parts.push(labels ? `${strength.level}, last used ${last}` : `as of ${last}${strength.level === "faint" ? "; faint" : ""}`);
+	}
 	if (history?.length) {
 		const [last] = history;
 		parts.push(`since ${last.until?.slice(0, 10) ?? last.until_ref}; before that (${last.id}): ${clip(last.text, 120)}`);
@@ -203,7 +210,7 @@ function timeClause(strength?: Strength, history?: PastVersion[]) {
 function relatedClaims(claims: RelatedClaim[] = []) {
 	if (!claims.length) return "";
 	return "Current claims these records may confirm, update or contradict:\n" + claims.map((c) => {
-		const when = timeClause(c.strength, c.history);
+		const when = timeClause(c.strength, c.history, true);
 		const seen = c.strength.first_seen ? `, first seen ${c.strength.first_seen.slice(0, 10)}` : "";
 		return `- ${c.id} [${c.status}${seen}; evidence ${c.refs.join(",")}${when ? `; ${when}` : ""}] ${c.text}`;
 	}).join("\n") + "\n\n";
