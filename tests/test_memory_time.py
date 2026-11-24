@@ -264,6 +264,24 @@ class TimeTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in memory.transcript if "forgotten" in r], ["t000004"])
         self.assertIn("cancel_if_refundable", memory.action_words())
 
+    def test_a_word_defined_the_night_its_records_would_be_forgotten_keeps_them(self):
+        with at(DAY0):
+            self.m.set_phase("open")
+            note = "n" * 400
+            for name, args, result in [("get_booking", {"booking_id": "BK-1"}, {"booking_id": "BK-1", "refundable": True}),
+                                       ("cancel_booking", {"booking_id": "BK-1", "reason": "customer request"},
+                                        {"status": "cancelled"}),
+                                       ("get_booking", {"booking_id": "BK-2"}, {"booking_id": "BK-2", "refundable": False})]:
+                self.m.record("tool_result", f"TOOL {name}({json.dumps(args)}) -> {json.dumps({**result, 'note': note})}",
+                              tool_ok=True)
+            self.m.record("tool_result", "unrelated " * 60)
+            self.m.set_phase("closed")
+        with patch.object(S, "FORGET_KEEP_RECORDS", 0), at(DAY90):
+            self.m.dream({"schema": 1, "operations": [{"op": "define_action", "source": CANCEL, "tests": TESTS}]},
+                         actions=ON)
+        memory = self.reload()
+        self.assertEqual([r["id"] for r in memory.transcript if "forgotten" in r], ["t000004"])
+
     def test_forgetting_rewrites_sealed_segments(self):
         refs = self.old_day()
         self.m.load()
@@ -326,6 +344,32 @@ class TimeTest(unittest.TestCase):
         path.write_text("\n".join(lines) + "\n")
         with self.assertRaisesRegex(SomniError, "t000002 does not match the night pass that forgot it"):
             self.reload()
+
+    def test_a_quote_cited_the_night_its_record_is_forgotten_is_kept(self):
+        # A dream can read any record (somni_search), so tonight's claims may quote a record forgotten tonight.
+        refs = self.old_day()
+        self.record(DAY40, "today 1", "today 2", "today 3")
+        with patch.object(S, "FORGET_KEEP_RECORDS", 2), at(DAY40):
+            self.dream({"op": "add", "text": "Log line 4 exists.", "status": "verified", "salience": 3,
+                        "evidence": [{"ref": refs[4], "quote": "Day-zero log line 4"}]})
+        memory = self.reload()
+        self.assertEqual(memory.forgotten_counts()["records"], 6)
+        self.assertIn("Day-zero log line 4", memory._records_by_id[refs[4]]["text"])
+        self.assertEqual(memory.claims["n000004"]["state"], "active")
+
+    def test_stubs_that_would_lose_a_quote_or_break_the_store_are_not_written(self):
+        self.old_day()
+        with patch.object(S, "FORGET_KEEP_RECORDS", 0), at(DAY40):
+            planned = self.m.load()._plan_forgetting()
+        bad = {**planned[2], "text": "[forgotten 2026-02-10] nothing quoted"}
+        with self.m._locked():
+            self.m._load_locked()
+            # t000002's stub would lose its quote, so it is skipped. t000003's stub isn't listed by any night pass, so
+            # the store wouldn't load with it: the original record goes back and nothing is forgotten.
+            self.assertEqual(self.m._write_forgotten({2: bad, 3: planned[3]}), 0)
+        memory = self.reload()
+        self.assertEqual(memory.forgotten_counts()["records"], 0)
+        self.assertEqual(len(memory.transcript), 6)
 
     def test_one_night_forgets_at_most_a_bounded_number_of_records(self):
         self.old_day()

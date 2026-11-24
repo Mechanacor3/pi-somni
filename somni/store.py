@@ -840,25 +840,27 @@ class SomniMemory:
 
     # --- Forgetting: reviewed, old transcript records keep a stub (gist and cited quotes) and their chain hash. ---
 
-    def _forget_protected(self):
-        """Records that keep their full text: those an action word's tests or self-tests replay."""
-        refs = set()
-        for dream in self.dreams:
-            for event in dream.get("actions", ()):
-                refs.update(re.findall(r"t[0-9]{6}", canonical(event)))
-        return refs
+    def _forget_protected(self, tonight=()):
+        """Records that keep their full text: those an action word's tests or self-tests replay, including words
+        tonight's pass defines (``tonight``: its prepared operations)."""
+        events = [event for dream in self.dreams for event in dream.get("actions", ())]
+        events += [body for op, body in tonight if op == "action"]
+        return {ref for event in events for ref in re.findall(r"t[0-9]{6}", canonical(event))}
 
-    def _cited_quotes(self):
-        """{record id: quotes any claim or retraction ever cited}: a stub keeps them, so replay still checks them."""
+    def _cited_quotes(self, tonight=()):
+        """{record id: quotes any claim or retraction cites}, including tonight's prepared operations, which a dream
+        may cite from any record it read: a stub keeps them all, so replaying the notes still checks them."""
         quotes = {}
-        for event in self.note_log:
-            evidence = (event.get("claim") or {}).get("evidence", []) if event.get("op") == "add" else event.get("evidence", [])
-            for item in evidence or []:
+        evidence = [((e.get("claim") or {}).get("evidence") if e.get("op") == "add" else e.get("evidence")) or []
+                    for e in self.note_log]
+        evidence += [body.get("evidence") or [] for op, body in tonight if op in ("add", "retract")]
+        for items in evidence:
+            for item in items:
                 if item.get("quote"):
                     quotes.setdefault(item["ref"], set()).add(item["quote"])
         return quotes
 
-    def _forgettable(self, after_days, now):
+    def _forgettable(self, after_days, now, tonight=()):
         """Records tonight's pass may forget, oldest first. Called before the pass commits: it counts as the night."""
         if after_days <= 0:
             return []
@@ -866,7 +868,7 @@ class SomniMemory:
         keep = min(keep, FORGET_KEEP_RECORDS)
         end = len(self.transcript) - keep
         cutoff = now - _dt.timedelta(days=after_days)
-        protected = self._forget_protected()
+        protected = self._forget_protected(tonight)
         out = []
         for record in self.transcript[:max(0, end)]:
             moment = _parse_time(record.get("at"))
@@ -890,7 +892,7 @@ class SomniMemory:
         return {**record, "text": text, "forgotten": {"sha256": sha(record), "at": _stamp(now),
                                                      "bytes": len(record["text"].encode("utf-8"))}}
 
-    def _plan_forgetting(self):
+    def _plan_forgetting(self, tonight=()):
         """{seq: stub} for tonight's night pass, which lists each stub's hash before any record is rewritten.
 
         A record is forgotten when it is older than SOMNI_FORGET_AFTER_DAYS (default 30; 0, or a value that isn't a
@@ -899,9 +901,9 @@ class SomniMemory:
         the chain keeps the original record's hash. At most FORGET_PER_PASS records go per night."""
         after_days, _ = _forget_setting()
         now = _now()
-        quotes = self._cited_quotes()
+        quotes = self._cited_quotes(tonight)
         planned = {}
-        for record in self._forgettable(after_days, now):
+        for record in self._forgettable(after_days, now, tonight):
             stub = self._stub(record, quotes.get(record["id"], ()), now)
             if stub is not None:
                 planned[record["seq"]] = stub
@@ -919,7 +921,26 @@ class SomniMemory:
                 raise MemoryError(f"forgotten record {record['id']} does not match the night pass that forgot it")
 
     def _write_forgotten(self, replaced):
-        """Rewrite the transcript with tonight's stubs. Called with the lock held, after the pass that lists them."""
+        """Rewrite the transcript with tonight's stubs. Called with the lock held, after the pass that lists them.
+
+        A last check first: a stub is written only if it still holds every quote now cited from its record and no
+        word's tests replay it. A stub the pass listed but that isn't written leaves the record whole."""
+        quotes, protected = self._cited_quotes(), self._forget_protected()
+        replaced = {seq: stub for seq, stub in replaced.items()
+                    if stub["id"] not in protected and all(q in stub["text"] for q in quotes.get(stub["id"], ()))}
+        if not replaced:
+            return 0
+        originals = {seq: self.transcript[seq - 1] for seq in replaced}
+        try:
+            self._rewrite_transcript(replaced)
+        except (MemoryError, OSError):
+            # Never leave a store that won't load: put the original records back. They match the chain as they did.
+            self._rewrite_transcript(originals)
+            return 0
+        return len(replaced)
+
+    def _rewrite_transcript(self, replaced):
+        """Replace records ({seq: record}) in the live log and sealed segments, then reload and verify the store."""
         name = "transcript.jsonl"
         folder = self.store / SEGMENT_DIR
         segments, written, retired, offset = [], [], [], 0
@@ -949,7 +970,6 @@ class SomniMemory:
             _sync_directory(folder)
         self.__dict__.pop("_segment_cache", None)
         self._load_locked(force=True)
-        return len(replaced)
 
     def forgotten_counts(self):
         forgotten = [record for record in self.transcript if "forgotten" in record]
@@ -1640,7 +1660,7 @@ class SomniMemory:
                 raise MemoryError(f"nothing committed: all {len(operations)} operation(s) were rejected. {listed[:1500]}")
             # Sleep prunes: a night pass forgets old raw detail. It lists each stub's hash, then the stubs are written.
             night = snapshot is None and (actions or {}).get("author", "dream") == "dream"
-            forget = self._plan_forgetting() if night else {}
+            forget = self._plan_forgetting(prepared) if night else {}
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected,
                                author=(actions or {}).get("author", "dream"), snapshot=snapshot, usage=usage,
                                downgrades=downgrades, forgot={str(seq): sha(stub) for seq, stub in forget.items()})
