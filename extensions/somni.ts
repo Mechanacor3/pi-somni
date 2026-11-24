@@ -54,6 +54,9 @@ const CONFIG = (() => {
 	const problems: string[] = [];
 	const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
 	const user = join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "somni", "somni.conf");
+	// No file to read: SOMNI_CONFIG=none, or a daydream worker, which inherits its session's resolved settings.
+	// Skipping the spawn matters under memory pressure, where a Python start can take seconds.
+	if (process.env.SOMNI_CONFIG === "none" || process.env.SOMNI_DAYDREAM === "1") return { applied, problems };
 	if (process.env.SOMNI_CONFIG === undefined && !existsSync(user) && !existsSync(join(process.cwd(), ".pi", "somni.conf"))) {
 		return { applied, problems };
 	}
@@ -611,7 +614,12 @@ export default function (pi: ExtensionAPI) {
 					const notice = livePassNotice(pass);
 					if (!notice) return done();
 					day.notice = notice;
-					day.lessons = await passLessons(pass);
+					const lessons = await passLessons(pass);
+					// A turn may have started meanwhile and shown the notice; then its lessons arrive too late for it.
+					if (day.notice === notice) day.lessons = lessons;
+					done();
+					notify(ctx, notice);
+					return;
 				} else if (AUTH_ERROR.test(stderr)) {
 					day.notice = "Somni daydream skipped: auth. The daydream's Pi could not authenticate with its provider. " +
 						clip(stderr.trim().split("\n").slice(-2).join(" "), 240);
