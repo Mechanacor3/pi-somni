@@ -583,7 +583,10 @@ export default function (pi: ExtensionAPI) {
 		const fork = DAYDREAM_FORK && !day.forkBroken && sessionFile && existsSync(sessionFile) && !process.env.SOMNI_DAYDREAM_MODEL;
 		const forkDir = fork ? join(state.workspace, "somni-v1", "forks", `${process.pid}-${now}`) : undefined;
 		if (forkDir) mkdirSync(forkDir, { recursive: true });
+		// The fork keeps its session's ID (in its own session folder, so nothing collides): providers route requests and
+		// look up cached prefixes by it, through headers an extension can't always reach.
 		const args = fork ? [...forkArgs(process.argv.slice(2)), "--mode", "json", "--fork", sessionFile, "--session-dir", forkDir!,
+			"--session-id", ctx.sessionManager.getSessionId(),
 			...(process.env.SOMNI_DAYDREAM_THINKING ? ["--thinking", process.env.SOMNI_DAYDREAM_THINKING] : []),
 			"-p", `/somni-dream ${DAYDREAM_FOCUS}`] : ["--mode", "json", "--no-session", "--no-approve", "--no-extensions", "--no-builtin-tools", "--no-mcp",
 			"--no-skills", "--no-prompt-templates", "--no-context-files", "-e", fileURLToPath(import.meta.url),
