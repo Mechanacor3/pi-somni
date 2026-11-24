@@ -1,5 +1,8 @@
 # Action words (experimental)
 
+*Also called habits, tricks or reflexes: the names are interchangeable, just for fun. None is better or more
+proven than another; the same kind of word does every job below.*
+
 Set `SOMNI_ACTIONS=1` (or `actions.enabled: true` in [somni.conf](settings.md)) to let dreams turn a recurring
 sequence of tool calls into an **action word**: one Python function that the agent then calls as a single tool. A word
 runs in a sandboxed Python worker with a restricted syntax and builtins, and one capability: `rpc`.
@@ -61,18 +64,19 @@ runs is rejected. So is an uncited retirement of a word whose failures are all s
 be fixed. An uncited retirement resting on current failures records them. A word with no failures can be retired as
 redundant, and a human deleting the file needs no evidence.
 
-## Practice: building words with real tools
+## Deep sleep: building words with real tools
 
-`/somni-practice [focus]` is a separate sleep cycle, run after `/somni-dream`, that builds or improves one word. It
+`/somni-deepsleep [focus]` is a separate sleep cycle, run after `/somni-dream`, that builds or improves one word. It
 picks one target: a recurring sequence, a procedure a claim describes, or a task that failed because its calls couldn't
 follow each other fast enough (an expired token or window). A word can do what step-by-step calls can't: it runs its
-calls back to back, with no model turn between them.
+calls back to back, with no model turn between them. See [Sleep and memory](sleep-and-memory.md) for how this maps
+onto human sleep.
 
-Unlike other dreams, practice may call the tools listed in `actions.practice_tools` (`SOMNI_PRACTICE_TOOLS`) for real,
+Unlike other dreams, deep sleep may call the tools listed in `deepsleep.tools` (`SOMNI_DEEPSLEEP_TOOLS`) for real,
 and it keeps recording. `somni_action_try` with `"live": true` and `params` runs a draft word against those tools and
 returns the records its calls made; the word's `define_action` test then cites them, so a word can be built from a
 procedure that never succeeded step by step. The pass commits as a live pass, while the session records on. With no
-practice tools, practice builds only from recorded calls, as a dream does.
+deep-sleep tools, it builds only from recorded calls, as a dream does.
 
 ## How dreams find candidates
 

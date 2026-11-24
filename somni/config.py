@@ -95,9 +95,9 @@ SETTINGS = (
             "registered as Pi tools"),
     Setting("actions.tools", "SOMNI_ACTION_TOOLS", "list", None, "The tools action words may call",
             default_text="all non-Somni tools"),
-    Setting("actions.practice_tools", "SOMNI_PRACTICE_TOOLS", "list", [],
-            "Tools `/somni-practice` may call for real, directly or from a draft word, to try a procedure before "
-            "defining it. Every call is recorded. Empty: practice builds from recorded calls only"),
+    Setting("deepsleep.tools", "SOMNI_DEEPSLEEP_TOOLS", "list", [],
+            "Tools `/somni-deepsleep` may call for real, directly or from a draft word, to try a procedure before "
+            "defining it. Every call is recorded. Empty: deep sleep builds from recorded calls only"),
     Setting("actions.max_calls", "SOMNI_ACTION_MAX_CALLS", "int", 16, "Tool calls per action word run", 1, 64),
     Setting("daydreams.every_turns", "SOMNI_DAYDREAM_EVERY_TURNS", "int", 0,
             "Start a daydream (see [Daydreams](long-sessions.md#daydreams-experimental)) after this many model turns. `0` is off", 0, 10000),

@@ -170,31 +170,31 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertFalse((self.work / "dream-marker").exists())
         self.assertEqual([c["text"] for c in memory.load().claims.values()], [claim["text"]])
 
-    def test_practice_tries_a_draft_live_and_defines_it_from_the_try(self):
+    def test_deep_sleep_tries_a_draft_live_and_defines_it_from_the_try(self):
         self.pi.close()
-        env = {"SOMNI_ACTIONS": "1", "SOMNI_PRACTICE_TOOLS": "lookup_fee"}
+        env = {"SOMNI_ACTIONS": "1", "SOMNI_DEEPSLEEP_TOOLS": "lookup_fee"}
         self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
         source = ('def quote_both(price: float):\n    """Quote economy and business cancellation fees for one fare."""\n'
                   '    economy = rpc.lookup_fee(cabin="economy", price=price)\n'
                   '    business = rpc.lookup_fee(cabin="business", price=price)\n'
                   '    return [economy["fee"], business["fee"]]')
 
-        def define(body):  # the second practice turn cites the records the live try reported
+        def define(body):  # the second deep-sleep turn cites the records the live try reported
             tried = text_of(body["messages"][-1].get("content"))
             refs = re.findall(r"^\[(t\d{6})\]", tried, re.M)
             op = {"op": "define_action", "source": source, "tests": [{"params": {"price": 300}, "refs": refs}]}
             return [("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [op]})})]
         self.upstream.script = plan_script({
             "What is the fee": [[("lookup_fee", {"cabin": "economy", "price": 300})]],
-            "Practice (deep sleep).": [[("somni_action_try", {"source": source, "live": True, "params": {"price": 300}})],
+            "Deep sleep.": [[("somni_action_try", {"source": source, "live": True, "params": {"price": 300}})],
                                        define],
         })
         self.pi.prompt("What is the fee to cancel economy fare 300?")
         store = self.work / ".pi" / "somni"
-        self.pi.prompt("/somni-practice")
+        self.pi.prompt("/somni-deepsleep")
         self.pi.read(lambda r: r.get("type") == "agent_settled")
         prompt = next(text_of(m.get("content")) for m in self.upstream.requests[-2]["messages"]
-                      if text_of(m.get("content")).startswith("Practice (deep sleep)."))
+                      if text_of(m.get("content")).startswith("Deep sleep."))
         self.assertIn("You may call these tools for real, directly or from a draft: lookup_fee.", prompt)
         tried = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_action_try")
         self.assertIn("The live try returned: [50,24]", text_of(tried["result"]["content"]))
