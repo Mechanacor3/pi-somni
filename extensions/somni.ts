@@ -1210,7 +1210,15 @@ ${candidateGuide(candidates)}`;
 	});
 
 	// A forked daydream keeps its session's prompt cache key, so its requests can reuse the session's cached prefix.
+	// Providers also route by a session header (x-session-id, x-session-affinity); a fork's own ID would send its
+	// requests away from the cache that holds the session's prefix, so the fork sends its session's ID there too.
 	if (FORK_OF) {
+		pi.on("before_provider_headers", (event) => {
+			const headers = event.headers as Record<string, string | null>;
+			for (const name of Object.keys(headers)) {
+				if (/^(x-session-id|x-session-affinity|session[-_]id)$/i.test(name) && headers[name]) headers[name] = FORK_OF;
+			}
+		});
 		pi.on("before_provider_request", (event) => {
 			const payload = event.payload as { prompt_cache_key?: string };
 			if (payload && typeof payload === "object" && "prompt_cache_key" in payload && payload.prompt_cache_key) {

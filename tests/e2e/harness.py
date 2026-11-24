@@ -41,7 +41,7 @@ def text_of(content):
 
 class FakeUpstream:
     def __init__(self, script):
-        self.script, self.requests, self.lock = script, [], threading.Lock()
+        self.script, self.requests, self.headers, self.lock = script, [], [], threading.Lock()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -55,6 +55,7 @@ class FakeUpstream:
                 with outer.lock:
                     index = len(outer.requests)
                     outer.requests.append(body)
+                    outer.headers.append({k.lower(): v for k, v in self.headers.items()})
                 try:
                     reply = outer.script(body, index)
                 except Exception as exc:  # surface script bugs in the transcript
@@ -116,7 +117,7 @@ def plan_script(plans):
 
 class PiSession:
     def __init__(self, extension, workspace, port, env=None, *, mode="rpc", prompt=None, package=None, extra_args=(),
-                 sessions=None):
+                 sessions=None, fixture_first=False):
         self.name = f"pi-plugin-e2e-{secrets.token_hex(4)}"
         models = {"providers": {"fake": {"baseUrl": f"http://127.0.0.1:{port}/v1", "api": "openai-completions",
                                          "apiKey": "not-a-real-key", "models": [{"id": "m", "name": "fake",
@@ -139,8 +140,10 @@ class PiSession:
                 "HOME": str(workspace), "PATH": os.environ["PATH"],
                 "PI_CODING_AGENT_DIR": str(profile), **(env or {}),
             }
-            args = [shutil.which(BINARY), *cli, "--extension", str((package or PACKAGE or REPO) / extension),
-                    "--extension", str(E2E / "fixture.ts"), *trailing]
+            exts = [str((package or PACKAGE or REPO) / extension), str(E2E / "fixture.ts")]
+            if fixture_first:  # the fixture's hooks run before Somni's
+                exts.reverse()
+            args = [shutil.which(BINARY), *cli, "--extension", exts[0], "--extension", exts[1], *trailing]
             self.proc = subprocess.Popen(args, cwd=workspace, env=local_env, stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return

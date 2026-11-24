@@ -3,6 +3,12 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
+	// FIXTURE_SESSION_HEADER=1 routes like a provider that sends the session ID as a header (OpenAI, for one).
+	if (process.env.FIXTURE_SESSION_HEADER === "1") {
+		pi.on("before_provider_headers", (event, ctx) => {
+			event.headers["x-session-id"] = ctx.sessionManager.getSessionId();
+		});
+	}
 	// FIXTURE_LATE_TOOL=1 registers late_tool only once the first turn starts, as MCP tools do in one-shot runs.
 	let late = false;
 	pi.on("before_agent_start", () => {

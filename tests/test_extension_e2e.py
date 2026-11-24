@@ -378,8 +378,10 @@ class SomniPiEndToEnd(unittest.TestCase):
             "Dream step.": [[("somni_dream", {"proposal_json": json.dumps(proposal)})]],
         })
         sessions = self.work / "sessions"
-        env = {"SOMNI_DAYDREAM_EVERY_TURNS": "1", "SOMNI_DAYDREAM_FORK": "1", "SOMNI_DAYDREAM_COMMAND": shutil.which(BINARY)}
-        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env, sessions=sessions)
+        env = {"SOMNI_DAYDREAM_EVERY_TURNS": "1", "SOMNI_DAYDREAM_FORK": "1", "SOMNI_DAYDREAM_COMMAND": shutil.which(BINARY),
+               "FIXTURE_SESSION_HEADER": "1"}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env, sessions=sessions,
+                            fixture_first=True)
         self.pi.prompt("What is the fee to cancel economy fare 300?")
         store = self.work / ".pi" / "somni"
         deadline = time.monotonic() + 90
@@ -397,6 +399,12 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(dream["messages"][0], first["messages"][0])
         self.assertEqual([t["function"]["name"] for t in dream.get("tools", [])],
                          [t["function"]["name"] for t in first.get("tools", [])])
+        # It routes like its session too: a session header carries the parent's ID, not the fork's own.
+        route = [k for k in self.upstream.headers[0] if k in ("x-session-id", "x-session-affinity", "session_id")]
+        self.assertNotEqual(dream_headers_id := self.upstream.headers[0].get("x-session-id"), None)
+        dream_headers = self.upstream.headers[self.upstream.requests.index(dream)]
+        self.assertTrue(route, f"no session header to check: {sorted(self.upstream.headers[0])}")
+        self.assertEqual([dream_headers.get(k) for k in route], [self.upstream.headers[0][k] for k in route])
         # The step lists only record IDs to cite: the fork has their text in its conversation.
         step = text_of(dream["messages"][-1].get("content"))
         self.assertIn("[t000002] (tool_result)", step)
