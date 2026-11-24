@@ -53,6 +53,8 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `dreams.max_submissions` | `SOMNI_DREAM_MAX_SUBMISSIONS` | `3` | `somni_dream` attempts per dream (1–10) |
 | `dreams.cache_minutes` | `SOMNI_DREAM_CACHE_MINUTES` | `60` | How long an interrupted dream's evidence reads are offered to a retry on the same records. `0` disables (0–10080) |
 | `dreams.lenient_image_evidence` | `SOMNI_LENIENT_IMAGE_EVIDENCE` | off | Keep a citation's `{ref}` when only its image is wrong, downgrading the claim to uncertain if needed |
+| `memory.forget_after_days` | `SOMNI_FORGET_AFTER_DAYS` | `30` | After a night dream, transcript records older than this keep only a stub: the start of their text, the quotes claims cite, and their place in the hash chain. See [Memory over time](memory-over-time.md). `0` keeps every record in full (0–36500) |
+| `memory.decay` | `SOMNI_MEMORY_DECAY` | `0.5` | How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation (0.1–1) |
 | `wiki.link_style` | `SOMNI_LINK_STYLE` | `markdown` | Vault links: `markdown` (relative `[Title](path.md)`) or `wikilink` (Obsidian `[[slug\|Title]]`) |
 | `wiki.page_guide` | `SOMNI_PAGE_GUIDE` | practical playbook guidance | Replaces the default wiki-writing guidance |
 | `actions.enabled` | `SOMNI_ACTIONS` | off | [Action words](action-words.md): dreamed Python functions that call session tools, registered as Pi tools |
@@ -76,6 +78,7 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | | `SOMNI_DAYDREAM` | unset | Set by Somni in a daydream worker |
 | | `SOMNI_DAYDREAM_FORK_OF` | unset | Set by Somni in a forked daydream worker: the parent session's ID |
 | | `SOMNI_STORE` | unset | Path to an alternative `store.py` (development) |
+| | `SOMNI_NOW` | unset | Fixed current time (ISO 8601), for tests and benchmarks that simulate days |
 
 `SOMNI_RUN_LABEL`, `SOMNI_TAGS`, `SOMNI_CONFIG`, `SOMNI_DAYDREAM`, `SOMNI_DAYDREAM_FORK_OF` and `SOMNI_STORE` are environment-only: they are set
 per run or by Somni itself.

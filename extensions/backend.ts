@@ -2,6 +2,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 
 type Reply = { id: number; result?: unknown; error?: string };
+
+/** The settings the store itself reads. The backend gets these and nothing else from Pi's environment. */
+const STORE_ENV = ["SOMNI_LINK_STYLE", "SOMNI_NOW", "SOMNI_FORGET_AFTER_DAYS", "SOMNI_MEMORY_DECAY"];
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void };
 
 export class Backend {
@@ -15,7 +18,8 @@ export class Backend {
 	private failure?: Error;
 
 	constructor(python: string, args: string[], onExit: (error: Error) => void) {
-		this.child = spawn(python, args, { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LC_ALL: "C.UTF-8" } });
+		const settings = Object.fromEntries(STORE_ENV.flatMap((name) => process.env[name] === undefined ? [] : [[name, process.env[name]]]));
+		this.child = spawn(python, args, { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LC_ALL: "C.UTF-8", ...settings } });
 		this.ready = this.expect<{ writable: boolean }>(0, 30_000);
 		this.child.stdin.on("error", (error) => this.fail(error));
 		this.child.stderr.setEncoding("utf8").on("data", (chunk: string) => {

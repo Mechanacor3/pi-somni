@@ -85,6 +85,13 @@ SETTINGS = (
             0, 10080),
     Setting("dreams.lenient_image_evidence", "SOMNI_LENIENT_IMAGE_EVIDENCE", "bool", False,
             "Keep a citation's `{ref}` when only its image is wrong, downgrading the claim to uncertain if needed"),
+    Setting("memory.forget_after_days", "SOMNI_FORGET_AFTER_DAYS", "number", 30,
+            "After a night dream, transcript records older than this keep only a stub: the start of their text, the "
+            "quotes claims cite, and their place in the hash chain. See [Memory over time](memory-over-time.md). "
+            "`0` keeps every record in full", 0, 36500),
+    Setting("memory.decay", "SOMNI_MEMORY_DECAY", "number", 0.5,
+            "How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation",
+            0.1, 1.0),
     Setting("wiki.link_style", "SOMNI_LINK_STYLE", "enum", "markdown",
             "Vault links: `markdown` (relative `[Title](path.md)`) or `wikilink` (Obsidian `[[slug|Title]]`)",
             choices=("markdown", "wikilink")),
@@ -135,6 +142,7 @@ ENV_ONLY = {
     "SOMNI_DAYDREAM": "Set by Somni in a daydream worker",
     "SOMNI_DAYDREAM_FORK_OF": "Set by Somni in a forked daydream worker: the parent session's ID",
     "SOMNI_STORE": "Path to an alternative `store.py` (development)",
+    "SOMNI_NOW": "Fixed current time (ISO 8601), for tests and benchmarks that simulate days",
 }
 TRUE_WORDS, FALSE_WORDS = {"true", "yes", "on", "1"}, {"false", "no", "off", "0"}
 

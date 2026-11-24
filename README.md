@@ -72,6 +72,9 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
   `/somni-doctor` reports problems with their file and line.
 - **[Dreams and the wiki](docs/dreams.md).** Budgets, gists, image evidence, merges, failed and interrupted dreams,
   and how the index is ranked.
+- **[Memory over time](docs/memory-over-time.md).** Dated records; a fact that changed is kept as history (`update`)
+  rather than treated as a mistake; claims fade from fresh to faint unless they are used; and after a month, old raw
+  transcript keeps only a stub with its cited quotes.
 - **[Action words](docs/action-words.md)** (experimental). Dreams turn a recurring sequence of tool calls into one
   checked Python function that the agent calls as a single tool.
 - **[Daydreams](docs/long-sessions.md#daydreams-experimental)** (experimental). Dreams that run beside a long session,

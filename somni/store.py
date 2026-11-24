@@ -163,6 +163,80 @@ def token_estimate(value):
     return (size + 3) // 4
 
 
+# --- Time, strength and forgetting (see docs/memory-over-time.md) ---
+
+DEFAULT_FORGET_DAYS = 30  # SOMNI_FORGET_AFTER_DAYS: reviewed records older than this keep only a stub
+FORGET_KEEP_RECORDS = 120  # the newest records are never forgotten: the next dream's window
+FORGET_GIST_CHARS = 160
+FORGOTTEN_PREFIX = "[forgotten "
+DEFAULT_DECAY = 0.5  # SOMNI_MEMORY_DECAY: ACT-R's base-level decay d (Anderson & Schooler, 1991)
+FADING_BELOW = -0.5  # activation thresholds for the fuzzy strength labels
+FAINT_BELOW = -1.5
+CLAIM_MENTION = re.compile(r"(?<![A-Za-z0-9])n[0-9]{6}(?![0-9])")
+
+
+def _parse_time(text):
+    """An ISO 8601 time as an aware UTC datetime, or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        moment = _dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment.replace(tzinfo=_dt.timezone.utc) if moment.tzinfo is None else moment.astimezone(_dt.timezone.utc)
+
+
+def _now():
+    """The current time. SOMNI_NOW fixes it, for tests and for benchmarks that simulate days."""
+    value = os.environ.get("SOMNI_NOW", "")
+    if value.strip():
+        moment = _parse_time(value)
+        if moment is None:
+            raise SomniError("SOMNI_NOW must be an ISO 8601 time such as 2026-11-24T09:00:00Z")
+        return moment
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _stamp(moment):
+    return moment.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _env_number(name, default, low, high):
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return min(max(value, low), high)
+
+
+def _ref_number(ref):
+    return int(ref[1:])
+
+
+def _record_hash(record):
+    """A record's link in its chain. A forgotten record keeps the hash of the record it replaced."""
+    forgotten = record.get("forgotten")
+    if forgotten is None:
+        return sha(record)
+    if (not isinstance(forgotten, dict) or not SHA256.fullmatch(str(forgotten.get("sha256")))
+            or not str(record.get("text", "")).startswith(FORGOTTEN_PREFIX)):
+        raise SomniError(f"invalid forgotten record {record.get('id')!r}")
+    return forgotten["sha256"]
+
+
+def _activation(ages_days, decay, salience=3):
+    """ACT-R base-level activation: ln(sum of t^-d) over the ages of a memory's uses, plus a salience term.
+
+    Each use (an observation, a dream writing the claim, a later mention of it) adds to the sum and fades as a
+    power of its age. A claim used often and lately is strong; one seen once, long ago, is faint."""
+    total = sum(max(age, 1 / 24) ** -decay for age in ages_days)
+    return math.log(total) + 0.25 * (salience - 3) if total > 0 else FAINT_BELOW - 1
+
+
+def _strength_level(activation):
+    return "fresh" if activation >= FADING_BELOW else "fading" if activation >= FAINT_BELOW else "faint"
+
+
 MIN_DIGEST_PREFIX = 6
 DEFAULT_DREAM_IMAGES = 16
 MAX_DREAM_IMAGES = 64
@@ -382,6 +456,21 @@ def _atomic_json(path, value, *, create=False):
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _sync_directory(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _write_bytes_durable(path, data):
+    _no_symlink(path)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -662,7 +751,7 @@ class SomniMemory:
                 if sha(data) != segment["sha256"]:
                     raise MemoryError(f"sealed segment {segment['file']} does not match its recorded hash")
                 part = _read_log(path)
-                if len(part) != segment["count"] or (part and sha(part[-1]) != segment["head"]):
+                if len(part) != segment["count"] or (part and _record_hash(part[-1]) != segment["head"]):
                     raise MemoryError(f"sealed segment {segment['file']} does not match state")
                 cache[segment["file"]] = (key, part)
             records.extend(cache[segment["file"]][1])
@@ -697,7 +786,7 @@ class SomniMemory:
         folder.mkdir(mode=0o700, exist_ok=True)
         segments = self._segments(name)
         count_key, head_key = LOG_STATE[name]
-        file = f"{name.split('.')[0]}-{len(segments) + 1:06d}.jsonl"
+        file = self._next_segment_file(name)
         fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=folder)
         try:
             with os.fdopen(fd, "wb") as handle:
@@ -723,6 +812,119 @@ class SomniMemory:
         finally:
             os.close(fd)
         self._accept_local_write(snapshot, ("state.json", name))
+
+    def _next_segment_file(self, name, taken=()):
+        prefix = name.split(".")[0]
+        folder = self.store / SEGMENT_DIR
+        names = [*(segment["file"] for segment in self._segments(name)), *taken,
+                 *(os.listdir(folder) if folder.is_dir() else [])]
+        numbers = [int(match[1]) for file in names if (match := re.fullmatch(rf"{prefix}-([0-9]{{6}})\.jsonl", file))]
+        return f"{prefix}-{max(numbers, default=0) + 1:06d}.jsonl"
+
+    # --- Forgetting: reviewed, old transcript records keep a stub (gist and cited quotes) and their chain hash. ---
+
+    def _forget_protected(self):
+        """Records that keep their full text: those an action word's tests or self-tests replay."""
+        refs = set()
+        for dream in self.dreams:
+            for event in dream.get("actions", ()):
+                refs.update(re.findall(r"t[0-9]{6}", canonical(event)))
+        return refs
+
+    def _cited_quotes(self):
+        """{record id: quotes any claim or retraction ever cited}: a stub keeps them, so replay still checks them."""
+        quotes = {}
+        for event in self.note_log:
+            evidence = (event.get("claim") or {}).get("evidence", []) if event.get("op") == "add" else event.get("evidence", [])
+            for item in evidence or []:
+                if item.get("quote"):
+                    quotes.setdefault(item["ref"], set()).add(item["quote"])
+        return quotes
+
+    def _forgettable(self, after_days, now):
+        last_night = next((dream for dream in reversed(self.dreams) if not dream.get("live")), None)
+        if last_night is None or after_days <= 0:
+            return []
+        end = min(last_night["transcript_count"], len(self.transcript) - FORGET_KEEP_RECORDS)
+        cutoff = now - _dt.timedelta(days=after_days)
+        protected = self._forget_protected()
+        out = []
+        for record in self.transcript[:max(0, end)]:
+            moment = _parse_time(record.get("at"))
+            if "forgotten" not in record and record["id"] not in protected and moment is not None and moment <= cutoff:
+                out.append(record)
+        return out
+
+    @staticmethod
+    def _stub(record, quotes, now):
+        gist = " ".join(record["text"].split())
+        if len(gist) > FORGET_GIST_CHARS:
+            gist = gist[:FORGET_GIST_CHARS].rstrip() + " …"
+        text = f"{FORGOTTEN_PREFIX}{_stamp(now)[:10]}] {gist}"
+        kept = [quote for quote in sorted(quotes) if quote not in text]
+        if kept:
+            text += " | quotes kept: " + " … ".join(kept)
+        if len(text.encode("utf-8")) >= len(record["text"].encode("utf-8")):
+            return None  # nothing to gain
+        return {**record, "text": text, "forgotten": {"sha256": sha(record), "at": _stamp(now),
+                                                     "bytes": len(record["text"].encode("utf-8"))}}
+
+    def _forget_locked(self, after_days=None):
+        """Replace the text of old, reviewed records with stubs. Returns how many records were forgotten.
+
+        Called with the lock held, after a night dream commits. A record is forgotten when a night dream has run since
+        it was recorded, it is older than ``after_days`` (SOMNI_FORGET_AFTER_DAYS, default 30, 0 keeps everything),
+        it is outside the newest FORGET_KEEP_RECORDS, and no action word's tests replay it. The stub keeps the start
+        of the text and every quote a claim cites from it; the chain keeps the original record's hash."""
+        if after_days is None:
+            after_days = _env_number("SOMNI_FORGET_AFTER_DAYS", DEFAULT_FORGET_DAYS, 0, 36500)
+        now = _now()
+        candidates = self._forgettable(after_days, now)
+        if not candidates:
+            return 0
+        quotes = self._cited_quotes()
+        replaced = {}
+        for record in candidates:
+            stub = self._stub(record, quotes.get(record["id"], ()), now)
+            if stub is not None:
+                replaced[record["seq"]] = stub
+        if not replaced:
+            return 0
+        name = "transcript.jsonl"
+        folder = self.store / SEGMENT_DIR
+        segments, written, retired, offset = [], [], [], 0
+        for segment in self._segments(name):
+            first, offset = offset, offset + segment["count"]
+            if not any(first < seq <= offset for seq in replaced):
+                segments.append(segment)
+                continue
+            data = b"".join(_encode_log_record(replaced.get(r["seq"], r)) for r in self.transcript[first:offset])
+            file = self._next_segment_file(name, written)
+            _write_bytes_durable(folder / file, data)
+            written.append(file)
+            retired.append(segment["file"])
+            segments.append({**segment, "file": file, "sha256": sha(data)})
+        self._verified = None
+        if any(seq > offset for seq in replaced):
+            # The live log holds no file hash, and every record keeps its chain hash, so replacing it is one atomic step.
+            data = b"".join(_encode_log_record(replaced.get(r["seq"], r)) for r in self.transcript[offset:])
+            _write_bytes_durable(self.store / name, data)
+        if retired:
+            state = deepcopy(self.state)
+            state["segments"][name] = segments
+            self.state = state
+            self._save_state()
+            for file in retired:
+                (folder / file).unlink(missing_ok=True)
+            _sync_directory(folder)
+        self.__dict__.pop("_segment_cache", None)
+        self._load_locked(force=True)
+        return len(replaced)
+
+    def forgotten_counts(self):
+        forgotten = [record for record in self.transcript if "forgotten" in record]
+        return {"records": len(forgotten), "bytes_dropped": sum(record["forgotten"]["bytes"]
+                                                                - len(record["text"].encode("utf-8")) for record in forgotten)}
 
     def _recover_transaction(self, journal, state):
         pending = _read_json(journal)
@@ -763,7 +965,7 @@ class SomniMemory:
         for index, record in enumerate(records, 1):
             if record.get("seq") != index or record.get("prev_sha256") != previous:
                 raise MemoryError(f"broken {label} chain at record {index}")
-            previous = sha(record)
+            previous = _record_hash(record)
         if previous != head:
             raise MemoryError(f"{label} head does not match state")
 
@@ -813,18 +1015,19 @@ class SomniMemory:
                 if not isinstance(claim, dict) or claim.get("id") != expected_id:
                     raise MemoryError("invalid or duplicate claim event")
                 cls._validate_claim(claim, transcript, claims)
-                claims[claim["id"]] = {**claim, "state": "active"}
+                claims[claim["id"]] = {**claim, "state": "active", **({"created_at": event["at"]} if "at" in event else {})}
                 replaced = claim.get("replaces")
                 if replaced:
                     if replaced not in claims or claims[replaced]["state"] != "active":
                         raise MemoryError("correction replaces a non-active claim")
-                    claims[replaced]["state"] = "superseded"
-                    claims[replaced]["superseded_by"] = claim["id"]
+                    cls._supersede(claims, claim)
             elif op == "promote":
                 claim_id, salience = event.get("claim_id"), event.get("salience")
                 if claim_id not in claims or claims[claim_id]["state"] != "active" or type(salience) is not int or not 1 <= salience <= 5:
                     raise MemoryError("promotion targets an invalid claim or salience")
                 claims[claim_id]["salience"] = salience
+                if "at" in event:  # a dream that promotes a claim has used it: a rehearsal
+                    claims[claim_id]["rehearsed_at"] = [*claims[claim_id].get("rehearsed_at", []), event["at"]]
             elif op == "retract":
                 claim_id = event.get("claim_id")
                 if (not isinstance(claim_id, str) or not CLAIM_ID.fullmatch(claim_id)
@@ -838,6 +1041,20 @@ class SomniMemory:
             else:
                 raise MemoryError("unknown note event operation")
         return claims
+
+    @staticmethod
+    def _supersede(claims, claim):
+        """Retire the claim that ``claim`` replaces. A correction says it was wrong (superseded); an update says the
+        world changed, so the old claim stays true of its time (past), until the first newer record that shows it."""
+        old = claims[claim["replaces"]]
+        old["superseded_by"] = claim["id"]
+        if claim.get("change") != "changed":
+            old["state"] = "superseded"
+            return
+        newest_old = max(_ref_number(item["ref"]) for item in old["evidence"])
+        old["state"] = "past"
+        old["until_ref"] = min((item["ref"] for item in claim["evidence"] if _ref_number(item["ref"]) > newest_old),
+                               key=_ref_number)
 
     @classmethod
     def _replay_wiki(cls, events, claims):
@@ -992,7 +1209,12 @@ class SomniMemory:
             if c.get("tags"):
                 cl.append("- tags: " + ", ".join(c["tags"]))
             if c.get("replaces"):
-                cl.append(f"- supersedes {link('claims', 'claims', c['replaces'], c['replaces'])}")
+                verb = "updates (the world changed)" if c.get("change") == "changed" else "supersedes"
+                cl.append(f"- {verb} {link('claims', 'claims', c['replaces'], c['replaces'])}")
+            if c["state"] == "past":
+                until = self.record_time(c.get("until_ref"))
+                cl.append(f"- true until {until[:10] if until else c.get('until_ref')} "
+                          f"({link('claims', 'claims', c['superseded_by'], c['superseded_by'])} is current)")
             if c.get("merged_from"):
                 parents = ", ".join(link("claims", "claims", ref, ref) for ref in c["merged_from"])
                 cl.extend([f"- merged from {parents}", f"- provenance SHA-256: `{c['provenance_sha256']}`"])
@@ -1038,7 +1260,7 @@ class SomniMemory:
         required = {"id", "text", "status", "salience", "evidence", "links"}
         merge_fields = {"merged_from", "provenance_sha256"}
         if (not isinstance(claim, dict) or not required.issubset(claim)
-                or set(claim) - (required | {"gist", "replaces", "run_labels", "tags"} | merge_fields)):
+                or set(claim) - (required | {"gist", "replaces", "change", "run_labels", "tags"} | merge_fields)):
             raise MemoryError("claim has invalid fields")
         text = claim["text"]
         if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_NOTE_BYTES:
@@ -1066,6 +1288,14 @@ class SomniMemory:
             if (not isinstance(replaced, str) or not CLAIM_ID.fullmatch(replaced)
                     or replaced not in existing or existing[replaced]["state"] != "active"):
                 raise MemoryError("replacement target is invalid or non-active")
+        if "change" in claim:
+            if claim["change"] != "changed" or "replaces" not in claim:
+                raise MemoryError('change must be "changed" and needs a replaced claim')
+            newest_old = max(_ref_number(item["ref"]) for item in existing[claim["replaces"]]["evidence"])
+            if not any(_ref_number(item["ref"]) > newest_old for item in claim["evidence"]):
+                raise MemoryError(f"an update needs evidence newer than {claim['replaces']}'s newest record "
+                                  f"(t{newest_old:06d}): the change has to show in a later record. If the old claim "
+                                  f"was wrong rather than out of date, use correct")
         if claim.keys() & merge_fields:
             parents = cls._merge_parents(claim.get("merged_from"), existing)
             if ("replaces" in claim or claim["merged_from"] != parents or claim["links"] != parents
@@ -1102,7 +1332,7 @@ class SomniMemory:
             if "provenance_sha256" in parent:
                 return parent["provenance_sha256"]
             evidence = [
-                {**ref, "record_sha256": sha(records[ref["ref"]])}
+                {**ref, "record_sha256": _record_hash(records[ref["ref"]])}
                 for ref in sorted(parent["evidence"], key=lambda ref: ref["ref"])
             ]
             return sha({
@@ -1261,9 +1491,10 @@ class SomniMemory:
                 else:
                     omitted_images += 1
             seq, head, encoded, ids, records = self.state["transcript_count"], self.state["transcript_head"], [], [], []
+            at = _stamp(_now())
             for source, text in items:
                 seq += 1
-                record = {"schema": SCHEMA, "seq": seq, "id": f"t{seq:06d}", "source": source,
+                record = {"schema": SCHEMA, "seq": seq, "id": f"t{seq:06d}", "source": source, "at": at,
                           "text": _clip_record(text, max_bytes) if clip else text, "prev_sha256": head, **context}
                 if clip and record["text"] != text:
                     record["original_text_bytes"] = len(text.encode("utf-8"))
@@ -1311,16 +1542,15 @@ class SomniMemory:
         self._validate_claim(claim, self._records_by_id, self.claims)
         self._check_cited_images(claim["evidence"])
         event = {"schema": SCHEMA, "seq": self.state["note_events"] + 1, "op": "add", "claim": claim,
-                 "prev_sha256": self.state["notes_head"]}
+                 "at": _stamp(_now()), "prev_sha256": self.state["notes_head"]}
         self._commit_logs({"notes.jsonl": [_encode_log_record(event)]}, {
             **self.state, "note_events": event["seq"], "notes_head": sha(event),
             "next_claim": self.state["next_claim"] + 1,
         })
         self.note_log.append(event)
-        self.claims[claim_id] = {**claim, "state": "active"}
+        self.claims[claim_id] = {**claim, "state": "active", "created_at": event["at"]}
         if replaces is not None:
-            self.claims[replaces]["state"] = "superseded"
-            self.claims[replaces]["superseded_by"] = claim_id
+            self._supersede(self.claims, claim)
         return claim_id
 
     def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, actions=None,
@@ -1382,6 +1612,8 @@ class SomniMemory:
                                author=(actions or {}).get("author", "dream"), snapshot=snapshot, usage=usage,
                                downgrades=downgrades)
             self._load_locked(force=True)
+            if snapshot is None and (actions or {}).get("author", "dream") == "dream":
+                self._forget_locked()  # sleep prunes: once a night dream has run, old raw detail can fade
             if self.dreams[-1].get("actions"):
                 self.write_action_files(self.dreams[-1]["actions"])
             if self.pages or os.path.isdir(self.store / VAULT_DIR):
@@ -1540,18 +1772,19 @@ class SomniMemory:
             prepared.append(("drop_page", {"slug": slug, "reason": operation["reason"]}))
             del pages[slug]
             return next_claim
-        if op in {"add", "correct", "merge"}:
+        if op in {"add", "correct", "update", "merge"}:
             _require_claim_capacity(len(simulated), self._limit("max_claims"))
             allowed = {"op", "text", "gist", "status", "salience"}
             allowed |= {"claim_ids"} if op == "merge" else {"evidence", "links"}
-            if op == "correct":
+            replacing = op in {"correct", "update"}
+            if replacing:
                 allowed.add("claim_id")
-            if set(operation) - allowed or (op == "correct" and "claim_id" not in operation):
+            if set(operation) - allowed or (replacing and "claim_id" not in operation):
                 raise MemoryError("dream claim operation has unknown fields")
-            replaces = operation.get("claim_id") if op == "correct" else None
-            if op == "correct" and (not isinstance(replaces, str) or not CLAIM_ID.fullmatch(replaces)
+            replaces = operation.get("claim_id") if replacing else None
+            if replacing and (not isinstance(replaces, str) or not CLAIM_ID.fullmatch(replaces)
                     or replaces not in simulated or simulated[replaces]["state"] != "active"):
-                raise MemoryError("correction targets an invalid or non-active claim")
+                raise MemoryError(f"{'correction' if op == 'correct' else 'update'} targets an invalid or non-active claim")
             claim_id = f"n{next_claim:06d}"
             claim = {"id": claim_id, "text": operation.get("text"), "status": operation.get("status"),
                      "salience": operation.get("salience", 3), "evidence": operation.get("evidence"),
@@ -1560,6 +1793,8 @@ class SomniMemory:
                 claim["gist"] = operation["gist"]
             if replaces is not None:
                 claim["replaces"] = replaces
+            if op == "update":
+                claim["change"] = "changed"
             if op == "merge":
                 parents = self._merge_parents(operation.get("claim_ids"), simulated)
                 claim.update(merged_from=parents, links=parents, evidence=self._merge_evidence(parents, simulated))
@@ -1576,7 +1811,7 @@ class SomniMemory:
             prepared.append(("add", claim))
             simulated[claim_id] = {**claim, "state": "active"}
             if replaces:
-                simulated[replaces]["state"] = "superseded"
+                self._supersede(simulated, claim)
             next_claim += 1
         elif op == "retract":
             if set(operation) != {"op", "claim_id", "reason", "evidence"}:
@@ -1614,16 +1849,17 @@ class SomniMemory:
         note_events = []
         note_seq = self.state["note_events"]
         notes_head = self.state["notes_head"]
+        at = _stamp(_now())
         for op, body in prepared:
             note_seq += 1
-            event = {"schema": SCHEMA, "seq": note_seq, "op": op,
+            event = {"schema": SCHEMA, "seq": note_seq, "op": op, "at": at,
                      "prev_sha256": notes_head, **({"claim": body} if op == "add" else body)}
             note_events.append(event)
             notes_head = sha(event)
         pass_number = self.state["dream_count"] + 1
         count = self.state["transcript_count"] if snapshot is None else snapshot
-        head = self.state["transcript_head"] if snapshot is None else sha(self.transcript[snapshot - 1])
-        dream = {"schema": SCHEMA, "seq": pass_number, "transcript_count": count,
+        head = self.state["transcript_head"] if snapshot is None else _record_hash(self.transcript[snapshot - 1])
+        dream = {"schema": SCHEMA, "seq": pass_number, "transcript_count": count, "at": at,
                  "transcript_head": head, "operation_count": len(prepared),
                  "proposal_sha256": sha(proposal_bytes), "input_bytes": len(proposal_bytes),
                  "input_tokens_estimate": token_estimate(proposal_bytes), "prev_sha256": self.state["dreams_head"]}
@@ -1665,6 +1901,80 @@ class SomniMemory:
             **({"wiki_events": wiki_seq, "wiki_head": wiki_head} if wiki_bytes else {}),
         })
 
+    # --- Time and strength ---
+
+    def _mentions(self):
+        """{claim id: [times a later record named it]}: an agent's use of a memory (retrieval practice)."""
+        cached = self.__dict__.get("_mention_cache")
+        if cached is None or cached[0] is not self.transcript or cached[1] > len(self.transcript):
+            cached = [self.transcript, 0, {}]
+        for record in self.transcript[cached[1]:]:
+            if "n0" in record["text"] and record.get("at"):
+                for claim_id in set(CLAIM_MENTION.findall(record["text"])):
+                    cached[2].setdefault(claim_id, []).append(record["at"])
+        cached[1] = len(self.transcript)
+        self._mention_cache = cached
+        return cached[2]
+
+    def _uses(self, claim):
+        """The times a claim was used: its evidence records, its writing and promotions, later mentions of it."""
+        records = self._records_by_id
+        times = [records[item["ref"]].get("at") for item in claim["evidence"] if item["ref"] in records]
+        times += [claim.get("created_at"), *claim.get("rehearsed_at", []), *self._mentions().get(claim["id"], [])]
+        return [moment for moment in map(_parse_time, times) if moment is not None]
+
+    def strength(self, claim, now=None):
+        """How available a claim is now: ACT-R activation, a fuzzy label and when it was last used."""
+        uses = self._uses(claim)
+        if not uses:
+            return {"activation": 0.0, "level": "fresh"}
+        now = now or _now()
+        decay = _env_number("SOMNI_MEMORY_DECAY", DEFAULT_DECAY, 0.1, 1.0)
+        activation = _activation([(now - moment).total_seconds() / 86400 for moment in uses], decay, claim["salience"])
+        return {"activation": round(activation, 3), "level": _strength_level(activation), "last_used": _stamp(max(uses)),
+                "first_seen": _stamp(min(uses))}
+
+    def record_time(self, ref):
+        record = self._records_by_id.get(ref)
+        return record.get("at") if record else None
+
+    def history(self, claim):
+        """The versions a claim updated, newest first: each was true until the record that showed the change."""
+        versions = []
+        current = claim
+        while current.get("change") == "changed" and current.get("replaces") in self.claims and len(versions) < 8:
+            old = self.claims[current["replaces"]]
+            versions.append({"id": old["id"], "text": old.get("gist", old["text"]), "until_ref": old.get("until_ref"),
+                             "until": self.record_time(old.get("until_ref"))})
+            current = old
+        return versions
+
+    def describe_time(self, claim, now=None):
+        """A short clause about a claim's age and strength for the index: empty for a fresh claim with no history."""
+        parts = []
+        strength = self.strength(claim, now)
+        if strength["level"] != "fresh":
+            parts.append(f"{strength['level']}, last used {strength['last_used'][:10]}")
+        history = self.history(claim)
+        if history:
+            since = history[0]["until"]
+            parts.append(f"since {since[:10] if since else history[0]['until_ref']}; before that: {history[0]['text'][:120]}")
+        return "; ".join(parts)
+
+    def related_claims(self, records, limit=12):
+        """Active claims that share terms with ``records``: what a dream should check those records against."""
+        active = [claim for claim in self.claims.values() if claim["state"] == "active"]
+        if not active or not records:
+            return []
+        text = " ".join(record["text"] for record in records[-60:])[:20000]
+        docs = [_terms(" ".join([claim["text"], *_claim_labels(claim)])) for claim in active]
+        now = _now()
+        hits = _bm25(docs, active, text)[:limit]
+        return [{"id": claim["id"], "text": claim["text"], "status": claim["status"],
+                 "refs": [item["ref"] for item in claim["evidence"]], "strength": self.strength(claim, now),
+                 **({"history": history} if (history := self.history(claim)) else {})}
+                for _, claim in hits]
+
     def claims_by_id(self, ids):
         """The active claims among ``ids``, in that order."""
         if not isinstance(ids, list) or len(ids) > 64 or not all(isinstance(i, str) for i in ids):
@@ -1699,21 +2009,32 @@ class SomniMemory:
         """
         if not isinstance(query, str) or not query.strip() or len(query) > 2_000 or not 1 <= limit <= 50:
             raise MemoryError("invalid recall query or limit")
-        active = [claim for claim in self.claims.values() if claim["state"] == "active"]
-        if not active:
+        # Past claims (true until the world changed) are recalled too, ranked below current ones, so a question
+        # about how things were can be answered. Corrected and retracted claims are not: they were wrong.
+        candidates = [claim for claim in self.claims.values() if claim["state"] in ("active", "past")]
+        if not candidates:
             return []
-        contexts = {claim["id"]: _claim_labels(claim) for claim in active}
-        docs = [_terms(" ".join([claim["text"], *contexts[claim["id"]]])) for claim in active]
-        scores = {claim["id"]: score for score, claim in _bm25(docs, active, query)}
+        contexts = {claim["id"]: _claim_labels(claim) for claim in candidates}
+        docs = [_terms(" ".join([claim["text"], *contexts[claim["id"]]])) for claim in candidates]
+        scores = {claim["id"]: score for score, claim in _bm25(docs, candidates, query)}
         phrase = query.strip().casefold()
         hits = []
-        for claim in active:
-            score = scores.get(claim["id"], 0) * (1 + 0.1 * claim["salience"])
+        for claim in candidates:
+            score = scores.get(claim["id"], 0) * (1 + 0.1 * claim["salience"]) * (1 if claim["state"] == "active" else 0.5)
             exact = any(phrase == label.casefold() for label in contexts[claim["id"]])
             if exact or score:
                 hits.append((exact, score, claim))
         hits.sort(key=lambda item: (-item[0], -item[1], -item[2]["salience"], item[2]["id"]))
-        return [{**claim, "score": round(score, 4)} for _, score, claim in hits[:limit]]
+        now = _now()
+        out = []
+        for _, score, claim in hits[:limit]:
+            extra = {"strength": self.strength(claim, now)}
+            if claim["state"] == "past":
+                extra["until"] = self.record_time(claim.get("until_ref"))
+            elif history := self.history(claim):
+                extra["history"] = history
+            out.append({**claim, **extra, "score": round(score, 4)})
+        return out
 
     def recall_pages(self, query, limit=3):
         """Rank wiki pages for ``query`` with BM25 over title and body (title counted twice)."""
@@ -1737,10 +2058,14 @@ class SomniMemory:
                 matches[label] = len(phrase.split())
         claim_docs = [_terms(" ".join([c["text"], *labels[c["id"]]])) for c in claims]
         claim_scores = {c["id"]: score for score, c in _bm25(claim_docs, claims, prompt)}
+        now = _now()
+        activation = {c["id"]: self.strength(c, now)["activation"] for c in claims}
+        # A relevant memory that has faded ranks a little lower: ACT-R's retrieval probability scales its score.
+        available = {key: 1 / (1 + math.exp(-(value - FAINT_BELOW) / 0.4)) for key, value in activation.items()}
         claim_ranks = {
             c["id"]: (max((matches.get(label, 0) for label in labels[c["id"]]), default=0),
-                      claim_scores.get(c["id"], 0) * (1 + 0.1 * c["salience"]),
-                      max(item["ref"] for item in c["evidence"]), c["salience"], c["id"])
+                      claim_scores.get(c["id"], 0) * (1 + 0.1 * c["salience"]) * (0.6 + 0.4 * available[c["id"]]),
+                      activation[c["id"]], max(_ref_number(item["ref"]) for item in c["evidence"]), c["salience"], c["id"])
             for c in claims
         }
         page_docs = [_terms(f"{p['title']} {p['title']} {p['slug']} {p['body']}") for p in pages]
@@ -1748,10 +2073,10 @@ class SomniMemory:
         page_ranks = {}
         for page in pages:
             cited = [claim_ranks[ref] for ref in page["claims"]]
-            salience = sum(rank[3] for rank in cited) / (len(cited) or 1)
+            salience = sum(rank[4] for rank in cited) / (len(cited) or 1)
             page_ranks[page["slug"]] = (max((rank[0] for rank in cited), default=0),
                                        page_scores.get(page["slug"], 0) * (1 + 0.1 * salience),
-                                       max((rank[2] for rank in cited), default=""), salience)
+                                       max((rank[2] for rank in cited), default=FAINT_BELOW - 1), salience)
         return claim_ranks, page_ranks
 
     def action_words(self):
@@ -1761,7 +2086,7 @@ class SomniMemory:
     def _cache_key(self, kind, head=None):
         if kind not in FAILURE_KINDS:
             raise MemoryError(f"dream kind must be one of {', '.join(FAILURE_KINDS)}")
-        transcript_head = self.state["transcript_head"] if head is None else sha(self.transcript[head - 1])
+        transcript_head = self.state["transcript_head"] if head is None else _record_hash(self.transcript[head - 1])
         # A committed pass changes dream_count, so a cache never outlives the attempt it belongs to.
         return {"kind": kind, "transcript_head": transcript_head, "dream_count": self.state["dream_count"]}
 
@@ -2203,7 +2528,9 @@ class SomniMemory:
             pages.sort(key=lambda page: page_ranks[page["slug"]], reverse=True)
             active.sort(key=lambda claim: claim_ranks[claim["id"]], reverse=True)
         else:
-            active.sort(key=lambda claim: (-claim["salience"], claim["id"]))
+            now = _now()
+            strength = {claim["id"]: self.strength(claim, now)["activation"] for claim in active}
+            active.sort(key=lambda claim: (-claim["salience"], -strength[claim["id"]], claim["id"]))
 
         included_body = False
         for page in pages:
@@ -2228,7 +2555,9 @@ class SomniMemory:
             labels = ", ".join(_claim_labels(claim))
             context = f" (context: {labels[:160]})" if labels else ""
             text = claim.get("gist", claim["text"])
-            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {text}{context}\n"
+            timing = self.describe_time(claim)
+            timing = f" ({timing})" if timing else ""
+            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {text}{timing}{context}\n"
             size = len(line.encode("utf-8"))
             if size > remaining:
                 omitted += 1
@@ -2272,6 +2601,10 @@ class SomniMemory:
             - sum(segment["count"] for segment in self._segments("transcript.jsonl")),
             "limits": {key: self._limit(key) for key in LIMIT_KEYS},
             "dream_failures": self.dream_failures(),
+            "forgotten": self.forgotten_counts(),
+            "claims_by_strength": dict(Counter(self.strength(claim)["level"] for claim in self.claims.values()
+                                               if claim["state"] == "active")),
+            "past_claims": sum(claim["state"] == "past" for claim in self.claims.values()),
             **({"word_use": use} if (use := self.word_use()) else {}),
         }
 
@@ -2430,7 +2763,7 @@ DAYDREAM_OVERLAP = 8  # records before the last pass's head that a daydream sees
 
 
 def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORDS,
-            record_bytes=DEFAULT_DREAM_RECORD_BYTES, head=None):
+            record_bytes=DEFAULT_DREAM_RECORD_BYTES, head=None, related=False):
     """The records a dream reviews: the newest `record_limit` up to the head. A daydream (`head` set) starts a few
     records before the last pass's head instead, so it doesn't resend records earlier passes already reviewed."""
     if type(record_limit) is not int or not 1 <= record_limit <= DEFAULT_DREAM_RECORDS:
@@ -2466,7 +2799,9 @@ def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORD
             if len(attachments) == MAX_RECORD_IMAGES:
                 break
     excerpts = [{**r, "text": _clip_record(r["text"], record_bytes, b" [excerpt truncated]")} for r in records]
-    return {"records": excerpts, "attachments": attachments, **({"reviewed_through": reviewed} if reviewed else {})}
+    claims = memory.related_claims(records) if related else []
+    return {"records": excerpts, "attachments": attachments, **({"reviewed_through": reviewed} if reviewed else {}),
+            **({"claims": claims} if claims else {})}
 
 
 def _action_module():
@@ -2596,7 +2931,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
     elif method == "recent":
         return _recent(memory.load(), args.get("include_images", False), viewed,
                        record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
-                       record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES), head=daydream)
+                       record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES), head=daydream,
+                       related=args.get("related") is True)
     elif method == "image":
         ref = args["ref"]
         memory.load()

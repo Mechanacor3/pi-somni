@@ -161,10 +161,53 @@ const Evidence = Type.Array(Type.Object({
 
 type RecordContext = { tags?: string[]; run_label?: string; run_labels?: string[] };
 type TranscriptRecord = RecordContext & {
-	id: string; source: string; text: string; tool_ok?: boolean; images?: { sha256: string }[]; omitted_images?: number;
+	id: string; source: string; text: string; at?: string; tool_ok?: boolean; images?: { sha256: string }[];
+	omitted_images?: number;
 };
+type Strength = { level: "fresh" | "fading" | "faint"; activation: number; last_used?: string; first_seen?: string };
+type PastVersion = { id: string; text: string; until_ref?: string; until?: string | null };
+type RelatedClaim = { id: string; text: string; status: string; refs: string[]; strength: Strength; history?: PastVersion[] };
 type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[];
-	reviewed_through?: string };
+	reviewed_through?: string; claims?: RelatedClaim[] };
+
+/** How a dream should treat a record that disagrees with a claim. Kept in step with TIME_GUIDE in somni/dream.py. */
+const TIME_GUIDE = "Records are dated (the --- day --- lines). When a record disagrees with a claim, decide what happened. " +
+	"If the world changed, the claim was true until then: use update ({\"op\":\"update\",\"claim_id\":...} with the " +
+	"newer evidence), which keeps the old claim as history. If the claim was wrong all along, use correct or retract. " +
+	"Never leave two active claims that disagree; when both were true at different times, update the older one and say " +
+	"since when in the text. ";
+
+/** Lines for `records` with a `--- YYYY-MM-DD ---` header wherever the day changes. */
+function withDays(records: TranscriptRecord[], render: (record: TranscriptRecord) => string) {
+	const lines: string[] = [];
+	let day: string | undefined;
+	for (const record of records) {
+		const today = record.at?.slice(0, 10);
+		if (today && today !== day) lines.push(`--- ${(day = today)} ---`);
+		lines.push(render(record));
+	}
+	return lines;
+}
+
+/** One line about a claim's age, strength and history, or "" for a fresh claim with none. */
+function timeClause(strength?: Strength, history?: PastVersion[]) {
+	const parts: string[] = [];
+	if (strength && strength.level !== "fresh") parts.push(`${strength.level}, last used ${strength.last_used?.slice(0, 10)}`);
+	if (history?.length) {
+		const [last] = history;
+		parts.push(`since ${last.until?.slice(0, 10) ?? last.until_ref}; before that (${last.id}): ${clip(last.text, 120)}`);
+	}
+	return parts.join("; ");
+}
+
+function relatedClaims(claims: RelatedClaim[] = []) {
+	if (!claims.length) return "";
+	return "Current claims these records may confirm, update or contradict:\n" + claims.map((c) => {
+		const when = timeClause(c.strength, c.history);
+		const seen = c.strength.first_seen ? `, first seen ${c.strength.first_seen.slice(0, 10)}` : "";
+		return `- ${c.id} [${c.status}${seen}; evidence ${c.refs.join(",")}${when ? `; ${when}` : ""}] ${c.text}`;
+	}).join("\n") + "\n\n";
+}
 type DreamResult = {
 	id: string; action_count?: number; added_count: number; merged_count: number; rejected_count: number;
 	rejected?: { index: number; reason: string }[];
@@ -388,23 +431,18 @@ function describeRecord(record: TranscriptRecord, chars = record.text.length) {
  * and the start of its output; `somni_search "t000123"` reads the rest. Prompts and replies are shown as usual.
  */
 function daydreamListing(records: TranscriptRecord[]) {
-	const lines: string[] = [];
+	const render = (record: TranscriptRecord) => record.source === "tool_result" && record.text.length > STUB_CHARS
+		? `${describeRecord(record, STUB_CHARS)} (somni_search "${record.id}" reads it)` : describeRecord(record);
 	let used = 0;
-	let omitted = 0;
-	for (let i = records.length - 1; i >= 0; i--) {
-		const record = records[i];
-		const stub = record.source === "tool_result" && record.text.length > STUB_CHARS;
-		const line = stub ? `${describeRecord(record, STUB_CHARS)} (somni_search "${record.id}" reads it)` : describeRecord(record);
-		const size = Buffer.byteLength(line, "utf8") + 1;
-		if (lines.length && used + size > DAYDREAM_PROMPT_BYTES) {
-			omitted = i + 1;
-			break;
-		}
-		lines.push(line);
+	let start = records.length;
+	while (start > 0) {
+		const size = Buffer.byteLength(render(records[start - 1]), "utf8") + 1;
+		if (start < records.length && used + size > DAYDREAM_PROMPT_BYTES) break;
 		used += size;
+		start--;
 	}
-	const note = omitted ? `[${omitted} older record(s) left out to keep this daydream small; somni_search finds them]\n` : "";
-	return note + lines.reverse().join("\n");
+	const note = start ? `[${start} older record(s) left out to keep this daydream small; somni_search finds them]\n` : "";
+	return note + withDays(records.slice(start), render).join("\n");
 }
 
 /**
@@ -414,7 +452,7 @@ function daydreamListing(records: TranscriptRecord[]) {
 function dreamStepPrompt(focus: string, recent: Recent) {
 	// The fork's conversation holds this session's records but not a contributor's (a sub-agent's): those come in full.
 	const sub = (r: TranscriptRecord) => (r.tags ?? []).some((t) => t.startsWith("contributor"));
-	const anchors = recent.records.map((r) => sub(r) ? `${describeRecord(r)} [from another session, such as a sub-agent]`
+	const anchors = withDays(recent.records, (r) => sub(r) ? `${describeRecord(r)} [from another session, such as a sub-agent]`
 		: `[${r.id}] (${r.source}) ${clip(r.text.replace(/\s+/g, " "), 100)}`);
 	return "Dream step. You are a copy of this session, forked to reflect while the session keeps working. Don't continue " +
 		"the user's task or call its tools. Earlier dream steps appear above as \"Somni daydream\" notices with what they " +
@@ -422,7 +460,8 @@ function dreamStepPrompt(focus: string, recent: Recent) {
 		"Call somni_dream once. Each lesson is one add operation with status \"uncertain\", one or two sentences of text, " +
 		'evidence [{"ref":"t000123"}] citing the records below where it shows (no quotes needed), salience 1–5 (3 for an ' +
 		"ordinary lesson, 5 only for what matters in most sessions) and an optional one-line gist. Don't repeat what an " +
-		"earlier step or the memory index already holds; correct or retract a claim the work has shown to be wrong. Use an " +
+		"earlier step or the memory index already holds; correct or retract a claim the work has shown to be wrong, and " +
+		"update one whose subject has changed since (the old claim stays as history). Use an " +
 		"empty operations array if nothing new was learned. Tonight's dream checks these lessons against the records.\n\n" +
 		(recent.reviewed_through ? `Records through ${recent.reviewed_through} were reviewed by earlier steps.\n` : "") +
 		`Records since then (ID, source and the start of each; the full text is in the conversation above, except for ` +
@@ -885,7 +924,12 @@ ${candidateGuide(candidates)}`;
 				if (h.kind === "rule") return `Rule ${h.id} (${h.support} supporting transitions): ${h.text}\n${JSON.stringify({ when: h.when, then: h.then })}`;
 				if (h.slug) return `# ${h.title} (page ${h.slug})\n${h.body}`;
 				const lineage = h.merged_from ? `; merged from ${h.merged_from.join(", ")}` : "";
-				return `${h.id} [${h.status}; ${h.evidence.length} cited${lineage}]${contextLabel(h)} ${h.text}`;
+				if (h.state === "past") {
+					const until = h.until?.slice(0, 10) ?? h.until_ref;
+					return `${h.id} [PAST: true until ${until}; now ${h.superseded_by}; ${h.status}]${contextLabel(h)} ${h.text}`;
+				}
+				const when = timeClause(h.strength, h.history);
+				return `${h.id} [${h.status}; ${h.evidence.length} cited${lineage}${when ? `; ${when}` : ""}]${contextLabel(h)} ${h.text}`;
 			});
 			return { content: asText(limit.note + (lines.join("\n\n") || "no matching memory")), details: hits };
 		},
@@ -902,7 +946,8 @@ ${candidateGuide(candidates)}`;
 			const limit = clampLimit(params.limit, 10, MAX_SEARCH_LIMIT);
 			const out = await getBackend().request<TranscriptRecord[]>("search", { query: params.query.slice(0, 256), limit: limit.value });
 			const chars = /^t\d{6}$/.test(params.query.trim()) ? DREAM_RECORD_BYTES : 600;
-			return { content: asText(limit.note + (out.map((r) => describeRecord(r, chars)).join("\n") || "no matches")), details: out };
+			const dated = (r: TranscriptRecord) => describeRecord(r, chars) + (r.at ? ` (recorded ${r.at.slice(0, 10)})` : "");
+			return { content: asText(limit.note + (out.map(dated).join("\n") || "no matches")), details: out };
 		},
 	});
 	pi.registerTool({
@@ -943,8 +988,10 @@ ${candidateGuide(candidates)}`;
 		label: "Somni dream",
 		description:
 			"Only during /somni-dream or /somni-wiki: submit one consolidation pass as JSON text " +
-			'{"schema":1,"operations":[...]} with add/correct/merge/retract/promote claim operations and page/drop_page wiki ' +
-			'operations. A merge takes {"op":"merge","claim_ids":["n000001","n000002"],"text":"combined guidance"} and inherits their evidence.' +
+			'{"schema":1,"operations":[...]} with add/correct/update/merge/retract/promote claim operations and page/drop_page wiki ' +
+			'operations. A merge takes {"op":"merge","claim_ids":["n000001","n000002"],"text":"combined guidance"} and inherits their evidence. ' +
+			"Use update (fields as correct) when the world changed since a claim was true; it keeps the old claim as history " +
+			"and needs evidence newer than the old claim's. Use correct when the claim was wrong." +
 			(ACTIONS ? " With action words enabled, define_action/revise_action/retire_action operations are also accepted." : "") +
 			" Rejected operations are listed with reasons; fix them and resubmit if attempts remain.",
 		parameters: Type.Object({ proposal_json: Type.String() }),
@@ -1042,7 +1089,7 @@ ${candidateGuide(candidates)}`;
 		handler: (args, ctx) => submitCommand(ctx, async () => {
 			const recent = await getBackend().request<Recent>("recent", {
 				include_images: ctx.model?.input.includes("image") ?? false,
-				record_limit: DREAM_RECORDS, record_bytes: DREAM_RECORD_BYTES,
+				record_limit: DREAM_RECORDS, record_bytes: DREAM_RECORD_BYTES, related: !FORK_OF && !DAYDREAM_CHILD,
 			});
 			if (FORK_OF) return asText(dreamStepPrompt(args?.trim() || DAYDREAM_FOCUS, recent));
 			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list"),
@@ -1058,16 +1105,17 @@ ${candidateGuide(candidates)}`;
 				`duplicates, and retract what they don't support (a lookup that found nothing is not a fact). Then add what ` +
 				`they missed.\n${lessons.map((c) => `- ${c.id}: ${c.text} [${c.refs.join(", ")}]`).join("\n")}\n\n` : "";
 			const prompt = dayGuide + `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
-				`(add/correct/merge/retract claims; use an empty operations array if nothing should change). ` +
+				`(add/correct/update/merge/retract claims; use an empty operations array if nothing should change). ` +
 				`For 'verified', cite an exact quote from the record or cite a screenshot you viewed as ` +
 				`{"ref":"t000001","image_sha256":"<digest>"}. Use somni_image for images not attached here. ` +
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
 				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
-				actionsGuide + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
+				actionsGuide + TIME_GUIDE + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
+				relatedClaims(recent.claims) +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +
 					`use somni_recall to see what they produced and somni_search if you need one of them.\n\n` : "") +
-				(DAYDREAM_CHILD ? daydreamListing(recent.records) : recent.records.map((r) => describeRecord(r)).join("\n"));
+				(DAYDREAM_CHILD ? daydreamListing(recent.records) : withDays(recent.records, (r) => describeRecord(r)).join("\n"));
 			const content: (TextContent | ImageContent)[] = asText(prompt);
 			for (const { ref, sha256, image } of recent.attachments) {
 				content.push(...asText(`Screenshot for [${ref}] image_sha256=${sha256}`), image);

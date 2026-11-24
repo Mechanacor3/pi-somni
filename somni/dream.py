@@ -2,7 +2,7 @@
 
 A dream pass shows a model (any ``complete(system, prompt) -> str`` callable)
 a window of transcript records plus the current active claims, asks for a JSON
-proposal of add/correct/retract operations, and submits it to
+proposal of add/correct/update/retract operations, and submits it to
 ``SomniMemory.dream(..., partial=True)``.  Every claim must cite transcript IDs;
 ``verified`` claims must quote exact excerpts, which the store checks.  Invalid
 operations are rejected individually and recorded in the pass, so the store's
@@ -34,6 +34,8 @@ OP is one of:
   {"op": "add", "text": CLAIM, "status": "verified"|"uncertain", "salience": 1-5,
    "evidence": [{"ref": "t000123", "quote": "exact excerpt"}], "links": []}
   {"op": "correct", "claim_id": "n000004", "text": ..., "status": ..., "salience": ..., "evidence": [...], "links": []}
+  {"op": "update", "claim_id": "n000004", "text": ..., "status": ..., "salience": ..., "evidence": [...], "links": []}
+     (the world changed: n000004 was true until the newer evidence; it is kept as history, not as a mistake)
   {"op": "merge", "claim_ids": ["n000004", "n000007"], "text": "Combined guidance", "status": "uncertain", "salience": 3}
   {"op": "retract", "claim_id": "n000004", "reason": "why it is wrong or redundant", "evidence": [{"ref": "t000123"}]}
   {"op": "page", "slug": "lowercase-hyphenated or folder/page", "title": "...", "body": "markdown", "claims": ["n000004", ...]}
@@ -44,7 +46,8 @@ Rules the store enforces (violations are rejected):
 - Every evidence ref must be a transcript ID shown to you, at most once per claim, 1-16 refs.
 - A quote must be copied EXACTLY (character for character) from the cited record. Keep quotes short (3-15 words).
 - "verified" needs a quote for every ref; use "uncertain" for interpretations you cannot quote directly.
-- links may only name existing claim IDs. correct/retract may only target active claims.
+- links may only name existing claim IDs. correct/update/retract may only target active claims.
+- update needs at least one evidence record newer than every record the old claim cites.
 - merge synthesizes two or more distinct active claims with related guidance. The store inherits their
   evidence and keeps their provenance. Use a page when the claims are better kept as separate ideas.
 - Pages (wiki): a page gathers what is known about ONE subject. Its body is markdown that cites claims
@@ -59,6 +62,7 @@ existing claim over adding a near-duplicate. Use salience 3 for ordinary reusabl
 cases, and 4 for recurring situations. Reserve 5 for at most two claims that matter in most future runs.
 Add, correct and merge may include a one-line gist of up to 160 UTF-8 bytes for the index. Keep the full
 guidance in text.
+""" + "\n" + "{time_guide}" + """
 Return at most {max_ops} operations. Return only the JSON object."""
 
 
@@ -73,9 +77,19 @@ def render_pages(memory, body_chars=400):
     return "\n".join(out)
 
 
+TIME_GUIDE = ("Records are dated (day headers in the listing). When a record disagrees with a claim, decide what "
+              "happened. If the world changed, the claim was true until then: use update, which keeps it as history. "
+              "If the claim was wrong all along, use correct or retract. Never leave two active claims that disagree; "
+              "when both were true at different times, update the older one and say since when in the text.")
+
+
 def render_records(records, max_chars=2_400):
     lines = []
+    day = None
     for record in records:
+        if record.get("at") and record["at"][:10] != day:
+            day = record["at"][:10]
+            lines.append(f"--- {day} ---")
         text = record["text"]
         if len(text) > max_chars:
             text = text[:max_chars] + " …[truncated]"
@@ -86,8 +100,12 @@ def render_records(records, max_chars=2_400):
 def render_claims(memory, limit=120):
     active = [c for c in memory.claims.values() if c["state"] == "active"]
     active.sort(key=lambda c: (-c["salience"], c["id"]))
+
+    def timing(claim):
+        clause = memory.describe_time(claim)
+        return f"; {clause}" if clause else ""
     lines = [f"[{c['id']}] (salience {c['salience']}, {c['status']}, evidence "
-             f"{','.join(e['ref'] for e in c['evidence'])}) {c['text']}" for c in active[:limit]]
+             f"{','.join(e['ref'] for e in c['evidence'])}{timing(c)}) {c['text']}" for c in active[:limit]]
     if len(active) > limit:
         lines.append(f"… {len(active) - limit} lower-salience claims not shown")
     return "\n".join(lines) or "(no claims yet)"
@@ -111,7 +129,7 @@ def dream_pass(memory, records, complete, *, focus=DEFAULT_FOCUS, max_ops=12, re
     """
     prompt = prompt_override or (f"Focus: {focus}.\n\n## Current claims\n{render_claims(memory)}\n\n"
                                  f"## Transcript window\n{render_records(records)}\n")
-    system = SYSTEM.replace("{max_ops}", str(max_ops))
+    system = SYSTEM.replace("{max_ops}", str(max_ops)).replace("{time_guide}", TIME_GUIDE)
     trace = {"window": [records[0]["id"], records[-1]["id"]] if records else None, "attempts": []}
     for attempt in range(retries + 1):
         try:

@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "e2e"))
@@ -546,6 +548,44 @@ class SomniPiEndToEnd(unittest.TestCase):
         recall = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_recall")
         self.assertFalse(recall.get("isError"), recall)
         self.assertIn("$50 floor", json.dumps(recall["result"]))
+
+    def test_a_changed_fact_is_dated_in_the_dream_and_recalled_as_past(self):
+        self.pi.close()
+        store = self.work / "time-memory"
+        store.mkdir()
+        memory = SomniMemory.create(store, "pi", "test", "time")
+        with patch.dict(os.environ, {"SOMNI_NOW": "2026-01-01T09:00:00Z"}):
+            memory.set_phase("open")
+            blue = memory.record("tool_result", "Inventory: pens are blue.")
+            memory.set_phase("closed")
+            memory.dream({"schema": 1, "operations": [{"op": "add", "text": "Pens are blue.", "status": "verified",
+                                                       "salience": 3, "evidence": [{"ref": blue, "quote": "pens are blue"}]}]})
+        with patch.dict(os.environ, {"SOMNI_NOW": "2026-01-05T09:00:00Z"}):
+            memory.set_phase("open")
+            red = memory.record("tool_result", "Inventory: pens are red now.")
+            memory.set_phase("closed")
+        update = {"op": "update", "claim_id": "n000001", "text": "Pens are red since the supplier changed.",
+                  "status": "verified", "salience": 3, "evidence": [{"ref": red, "quote": "pens are red now"}]}
+        self.upstream.script = plan_script({"Dream pass.": [[("somni_dream", {"proposal_json": json.dumps(
+            {"schema": 1, "operations": [update]})})]], "Recall the pens": [[("somni_recall", {"query": "pens blue red"})]]})
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={"SOMNI_WORKSPACE": store.name,
+                                                                                 "SOMNI_NOW": "2026-01-05T10:00:00Z"})
+        self.pi.prompt("/somni-dream")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        messages = [text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]]
+        prompt = next(m for m in messages if m.startswith("Dream pass."))
+        self.assertIn("--- 2026-01-01 ---\n[t000001] (tool_result) Inventory: pens are blue.", prompt)
+        self.assertIn("--- 2026-01-05 ---\n[t000002] (tool_result) Inventory: pens are red now.", prompt)
+        self.assertIn("Current claims these records may confirm, update or contradict:\n- n000001 [verified, first seen "
+                      "2026-01-01; evidence t000001] Pens are blue.", prompt)
+        self.assertIn("If the world changed, the claim was true until then: use update", prompt)
+        self.assertEqual(SomniMemory(store, "pi").load().claims["n000001"]["state"], "past")
+        self.pi.prompt("Recall the pens")
+        recall = text_of(next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_recall")["result"]["content"])
+        lines = recall.splitlines()
+        self.assertTrue(lines[0].startswith("n000002 [verified; 1 cited; since 2026-01-05; before that (n000001): Pens are blue.]"),
+                        recall)
+        self.assertIn("n000001 [PAST: true until 2026-01-05; now n000002; verified] Pens are blue.", recall)
 
     def test_wiki_pass_accepts_cycles_and_receives_custom_page_guide(self):
         self.pi.close()

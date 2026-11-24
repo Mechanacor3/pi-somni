@@ -160,6 +160,16 @@ class SchemaCoverage(unittest.TestCase):
         self.assertEqual(sorted(used - known), [], "add new variables to SETTINGS in somni/config.py")
         self.assertEqual(sorted(set(C.BY_ENV) - used), [], "SETTINGS lists a variable nothing reads")
 
+    def test_the_backend_receives_every_variable_the_store_reads(self):
+        # Pi starts the backend with a bare environment, so a setting the store reads must be passed by name.
+        store = (ROOT / "somni" / "store.py").read_text()
+        read = set(re.findall(r'os\.environ\.get\("(SOMNI_[A-Z_]+)"', store))
+        read |= set(re.findall(r'_env_number\("(SOMNI_[A-Z_]+)"', store))
+        passed = set(re.findall(r'"(SOMNI_[A-Z_]+)"', re.search(r"STORE_ENV = \[([^\]]*)\]",
+                                                              (ROOT / "extensions" / "backend.ts").read_text())[1]))
+        self.assertTrue(read)
+        self.assertEqual(sorted(read - passed), [], "add the variable to STORE_ENV in extensions/backend.ts")
+
     def test_the_settings_table_is_generated_from_the_schema(self):
         self.assertIn(C.table(), (ROOT / "docs/settings.md").read_text(), "regenerate with `bin/somni config table`")
 

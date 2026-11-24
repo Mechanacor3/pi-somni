@@ -4,9 +4,11 @@
 
 Run `/somni-dream [focus]` to consolidate recent transcript into claims. Somni closes the recording session, asks the
 model for one pass, and reopens recording when the pass settles. Invalid operations (for example, a quote that does
-not match) are rejected one by one and listed in the pass record. A pass corrects, adds, retracts, merges or promotes
-claims, and is bound to the transcript head it reviewed. History is never deleted: corrections and retractions keep
-their lineage.
+not match) are rejected one by one and listed in the pass record. A pass adds, corrects, updates, retracts, merges or
+promotes claims, and is bound to the transcript head it reviewed. A correction says a claim was wrong; an update says
+the world changed since it was true, and keeps it as history (see [Memory over time](memory-over-time.md)). Claim
+history is never deleted: corrections, updates and retractions keep their lineage. After a night dream, transcript
+records older than `memory.forget_after_days` keep only a stub.
 
 - **Gists.** Dreams can supply an optional one-line `gist` of up to 160 UTF-8 bytes when they add, correct, or merge a
   claim. `somni_note` also accepts a gist. The index uses the gist; `somni_recall` returns the full claim text. All

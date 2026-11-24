@@ -19,6 +19,10 @@ Before each user prompt you get a short index, headed "Subject memory index". It
   `somni_search` or `somni_recall`.
 - Prefer what the user says now. If they contradict a memory, follow them and note the change.
 - `uncertain` entries are interpretations. `verified` ones quote what was actually seen.
+- `fading` or `faint` means a memory hasn't been seen or used for a while. It may still be right, but things
+  change: check it before you rely on it.
+- `since 2026-11-20; before that: ...` means the fact changed. Use the current one. `somni_recall` also returns
+  past versions, marked `PAST: true until <date>`, for questions about how things were.
 
 ## Looking things up
 
@@ -52,7 +56,9 @@ How to write one:
 
 When the user says "remember this", save the note and tell them briefly what you saved. When
 they say a memory is wrong, save the correction as a note. Then suggest
-`/somni-dream correct <topic>`, so the next dream corrects or retracts the old note.
+`/somni-dream correct <topic>`, so the next dream corrects or retracts the old note. When a
+memory was right but things have changed since ("we moved to the new branch"), note the new fact;
+the next dream updates the old note and keeps it as history.
 
 ## Dreams
 
