@@ -410,7 +410,10 @@ function daydreamListing(records: TranscriptRecord[]) {
  * cite, not their text. It writes lessons as unverified claims; the night's dream checks them against the records.
  */
 function dreamStepPrompt(focus: string, recent: Recent) {
-	const anchors = recent.records.map((r) => `[${r.id}] (${r.source}) ${clip(r.text.replace(/\s+/g, " "), 100)}`);
+	// The fork's conversation holds this session's records but not a contributor's (a sub-agent's): those come in full.
+	const sub = (r: TranscriptRecord) => (r.tags ?? []).some((t) => t.startsWith("contributor"));
+	const anchors = recent.records.map((r) => sub(r) ? `${describeRecord(r)} [from another session, such as a sub-agent]`
+		: `[${r.id}] (${r.source}) ${clip(r.text.replace(/\s+/g, " "), 100)}`);
 	return "Dream step. You are a copy of this session, forked to reflect while the session keeps working. Don't continue " +
 		"the user's task or call its tools. Earlier dream steps appear above as \"Somni daydream\" notices with what they " +
 		`added. From the work since the last step, write down the lessons worth keeping: ${focus}.\n\n` +
@@ -420,7 +423,8 @@ function dreamStepPrompt(focus: string, recent: Recent) {
 		"earlier step or the memory index already holds; correct or retract a claim the work has shown to be wrong. Use an " +
 		"empty operations array if nothing new was learned. Tonight's dream checks these lessons against the records.\n\n" +
 		(recent.reviewed_through ? `Records through ${recent.reviewed_through} were reviewed by earlier steps.\n` : "") +
-		`Records since then (ID, source and the start of each; the full text is in the conversation above):\n${anchors.join("\n")}`;
+		`Records since then (ID, source and the start of each; the full text is in the conversation above, except for ` +
+		`records from another session, given in full):\n${anchors.join("\n")}`;
 }
 
 function summary(result: DreamResult) {
@@ -876,8 +880,10 @@ ${candidateGuide(candidates)}`;
 	pi.registerTool({
 		name: "somni_search",
 		label: "Somni search",
-		description: "Search your transcript text, run labels, and tags for an exact phrase. Use it to find evidence IDs and " +
-			"image digests. A record ID such as t000123 returns that record.",
+		description: "Search your transcript text, run labels, and tags for an exact phrase. The transcript keeps what this " +
+			"session, earlier sessions and sub-agents saw, so search it when something you need has moved or is gone (a " +
+			"rotated log, a moved page) or was only seen by a sub-agent. Also finds evidence IDs and image digests; a " +
+			"record ID such as t000123 returns that record.",
 		parameters: Type.Object({ query: Type.String(), limit: Type.Optional(Type.Integer({ description: `1-${MAX_SEARCH_LIMIT}` })) }),
 		async execute(_id: string, params: { query: string; limit?: number }) {
 			const limit = clampLimit(params.limit, 10, MAX_SEARCH_LIMIT);

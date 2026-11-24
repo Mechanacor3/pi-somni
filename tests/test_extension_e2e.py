@@ -602,6 +602,7 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(status["last_pass"], {
             "id": "d000001", "transcript_head": status["transcript_head"], "operation_count": 1,
             "transcript_count": status["transcript_count"], "added_count": 1, "rejected_count": 0, "merged_count": 0,
+            "added_ids": ["n000001"],
         })
 
     def test_dream_tools_show_the_budget_left_and_a_rejected_pass_can_be_resubmitted(self):
