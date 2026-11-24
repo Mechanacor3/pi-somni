@@ -100,6 +100,8 @@ const RECORD = process.env.SOMNI_RECORD !== "0" && process.env.SOMNI_DAYDREAM !=
 const configuredBytes = Number(process.env.SOMNI_INJECT_BYTES ?? 4096);
 const INJECT_BYTES = Number.isInteger(configuredBytes) ? Math.min(Math.max(configuredBytes, 256), 8192) : 4096;
 const ACTIONS = process.env.SOMNI_ACTIONS === "1";
+// Tools /somni-practice may call for real, directly or from a draft word; everything it calls is recorded.
+const PRACTICE_TOOLS = (process.env.SOMNI_PRACTICE_TOOLS ?? "").split(",").map((name) => name.trim()).filter(Boolean);
 const ACTION_ALLOW = process.env.SOMNI_ACTION_TOOLS?.split(",").map((name) => name.trim()).filter(Boolean);
 const MAX_ACTION_DEPTH = 4;
 const MAX_WORD_IMAGES = 2; // images a word passes on from its final call
@@ -182,7 +184,7 @@ function callTimeline(calls: CallTiming[]) {
 	return shown.join(", ") + (calls.length > shown.length ? `, ... ${calls.length - shown.length} more` : "");
 }
 type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; result?: unknown };
-type DreamKind = "dream" | "wiki" | "daydream";
+type DreamKind = "dream" | "wiki" | "daydream" | "practice";
 type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string;
 	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string; resumed?: number };
 type CachedRead = { tool: string; args: unknown; text: string; images?: { ref: string; sha256: string }[] };
@@ -300,7 +302,8 @@ function clip(text: string, maxBytes: number) {
 }
 
 function canRecord() {
-	return RECORD && (state.writable || state.contributor) && !state.dream;
+	// A practice run records: its live tries are real calls, and the words it defines cite them.
+	return RECORD && (state.writable || state.contributor) && (!state.dream || state.dream.kind === "practice");
 }
 
 function notify(ctx: ExtensionContext, message: string) {
@@ -514,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startDream(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
-			kind: "dream" | "wiki") {
+			kind: "dream" | "wiki" | "practice") {
 		const headless = ctx.mode === "print" || ctx.mode === "json";
 		let run: DreamRun | undefined;
 		try {
@@ -528,8 +531,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const content = await withCachedReads(loaded, run);
-			// A daydream worker leaves the phase alone: the owning session is still recording.
-			if (!DAYDREAM_CHILD) await backend.request("phase", { phase: "closed" });
+			// A daydream worker leaves the phase alone: the owning session is still recording. So does practice,
+			// which records its real tries and commits a live pass.
+			if (!DAYDREAM_CHILD && kind !== "practice") await backend.request("phase", { phase: "closed" });
 			// A triggered custom message starts the turn before waitForIdle checks Pi's state.
 			run.started = true;
 			pi.sendMessage({ customType: "somni-dream-input", content, display: false }, { triggerTurn: true });
@@ -549,7 +553,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function submitCommand(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
-			kind: "dream" | "wiki") {
+			kind: "dream" | "wiki" | "practice") {
 		const task = startDream(ctx, load, kind);
 		if (ctx.mode === "json" || ctx.mode === "print") return task;
 		// RPC clients get the handled reply first and can then wait for agent_settled.
@@ -654,6 +658,16 @@ export default function (pi: ExtensionAPI) {
 
 	async function runWord(word: ActionWord, params: Record<string, unknown>, toolCallId: string,
 			signal: AbortSignal | undefined, ctx: any) {
+		return runSteps(word.name, (history) => getBackend().request<ActionStep>("action_step",
+			{ name: word.name, params, history, max_calls: ACTION_MAX_CALLS }), toolCallId, signal, ctx,
+			(tool) => !ACTION_ALLOW || ACTION_ALLOW.includes(tool) || state.words.has(tool), "SOMNI_ACTION_TOOLS");
+	}
+
+	/** Run a word, or a practice draft, one call at a time: the backend replays it and returns its next call. */
+	async function runSteps(name: string, next: (history: { tool: string; args: Record<string, unknown>; result: unknown }[]) =>
+			Promise<ActionStep>, toolCallId: string, signal: AbortSignal | undefined, ctx: any,
+			allowed: (tool: string) => boolean, allowedBy: string) {
+		const word = { name };
 		if (toolCallId.split("/").length > MAX_ACTION_DEPTH) throw new Error(`Action words nest at most ${MAX_ACTION_DEPTH} deep.`);
 		const history: { tool: string; args: Record<string, unknown>; result: unknown }[] = [];
 		const calls: ({ args: Record<string, unknown> } & CallTiming)[] = [];
@@ -663,7 +677,7 @@ export default function (pi: ExtensionAPI) {
 		state.wordCalls.set(toolCallId, word.name);
 		try {
 			for (;;) {
-				const step = await getBackend().request<ActionStep>("action_step", { name: word.name, params, history, max_calls: ACTION_MAX_CALLS });
+				const step = await next(history);
 				if (!step.call) {
 					// Images from the word's final call show the state the word ended in, so they go to the caller;
 					// images from earlier calls may predate later actions, so they are not passed on.
@@ -673,9 +687,7 @@ export default function (pi: ExtensionAPI) {
 						details: { word: word.name, calls, ...(images.length ? { images_from: last!.tool } : {}) } };
 				}
 				const { tool, args } = step.call;
-				if (ACTION_ALLOW && !ACTION_ALLOW.includes(tool) && !state.words.has(tool)) {
-					throw new Error(`${word.name} may not call ${tool} (SOMNI_ACTION_TOOLS).`);
-				}
+				if (!allowed(tool)) throw new Error(`${word.name} may not call ${tool} (${allowedBy}).`);
 				// Resolves to { toolCall, result: { content, details }, isError, durationMs }; never rejects.
 				const begin = Date.now();
 				const outcome = await ctx.executeTool(tool, args, { signal });
@@ -946,6 +958,7 @@ ${candidateGuide(candidates)}`;
 				const out = await backend.request<DreamResult>("dream", {
 					proposal_json: params.proposal_json,
 					...(LENIENT_IMAGE_EVIDENCE ? { lenient_images: true } : {}),
+					...(run.kind === "practice" ? { live: true } : {}),
 					// A daydream worker reports what it spent up to this submission; it lands on the live pass.
 					...(DAYDREAM_CHILD ? { usage: { ...state.usage, duration_ms: Math.round(process.uptime() * 1000) } } : {}),
 					...(ACTIONS ? {
@@ -967,16 +980,22 @@ ${candidateGuide(candidates)}`;
 	if (ACTIONS) pi.registerTool({
 		name: "somni_action_try",
 		label: "Somni action try",
-		description: "Only during /somni-dream: dry-run an action word against the gate without saving it. Pass source " +
-			"(and optional tests) to see each test's returned value or the first error, or inspect (e.g. \"rpc.mcp.body\" " +
-			"or \"rpc.mcp.body.key\") to list tools and their signatures.",
+		description: "Only during /somni-dream or /somni-practice: dry-run an action word against the gate without saving " +
+			"it. Pass source (and optional tests) to see each test's returned value or the first error, or inspect (e.g. " +
+			"\"rpc.mcp.body\" or \"rpc.mcp.body.key\") to list tools and their signatures. During /somni-practice, " +
+			"live: true with params runs the draft against the real tools, call after call with no model turn between " +
+			"them, records each call, and returns their record IDs to cite as the draft's test.",
 		parameters: Type.Object({
 			source: Type.Optional(Type.String()),
 			tests: Type.Optional(Type.Array(Type.Any())),
 			inspect: Type.Optional(Type.String()),
+			live: Type.Optional(Type.Boolean()),
+			params: Type.Optional(Type.Record(Type.String(), Type.Any())),
 		}),
-		async execute(_id: string, params: { source?: string; tests?: unknown[]; inspect?: string }) {
-			if (!state.dream) throw new Error("somni_action_try is only available during /somni-dream");
+		async execute(toolCallId: string, params: { source?: string; tests?: unknown[]; inspect?: string; live?: boolean;
+				params?: Record<string, unknown> }, signal: AbortSignal | undefined, _update: unknown, ctx: any) {
+			if (!state.dream) throw new Error("somni_action_try is only available during /somni-dream or /somni-practice");
+			if (params.live) return liveTry(params.source ?? "", params.params ?? {}, toolCallId, signal, ctx);
 			if (!params.source && !params.inspect) throw new Error("pass source (a word) or inspect (an rpc path)");
 			const out = await getBackend().request<any>("action_try", {
 				...params,
@@ -986,6 +1005,37 @@ ${candidateGuide(candidates)}`;
 			return { content: asText(out.inspect ?? out), details: out };
 		},
 	});
+
+	/** A practice try: run a draft word against the real tools, recorded, and list the records its calls made. */
+	async function liveTry(source: string, params: Record<string, unknown>, toolCallId: string,
+			signal: AbortSignal | undefined, ctx: any) {
+		if (state.dream?.kind !== "practice") throw new Error("live tries are only for /somni-practice");
+		const name = /def\s+([a-z][a-z0-9_]{0,39})\s*\(/.exec(source)?.[1];
+		if (!name) throw new Error("source must define one word: def name(...)");
+		const before = (await getBackend().request<{ transcript_count: number }>("status")).transcript_count;
+		state.wordCalls.set(toolCallId, name); // so its calls are recorded, with via_word naming the draft
+		let outcome: string;
+		try {
+			const out = await runSteps(name, (history) => getBackend().request<ActionStep>("action_draft_step",
+				{ source, params, history, max_calls: ACTION_MAX_CALLS }), toolCallId, signal, ctx,
+				(tool) => PRACTICE_TOOLS.includes(tool) || state.words.has(tool), "SOMNI_PRACTICE_TOOLS");
+			outcome = `The live try returned: ${(out.content[0] as TextContent | undefined)?.text ?? "null"}`;
+		} catch (error) {
+			outcome = `The live try failed: ${(error as Error).message}`;
+		}
+		// The calls' records land as their results come back; wait briefly for the last ones.
+		let records: TranscriptRecord[] = [];
+		for (let i = 0; i < 20; i++) {
+			records = (await getBackend().request<TranscriptRecord[]>("records_since", { count: before }))
+				.filter((r) => r.source === "tool_result");
+			if (records.length >= (state.wordTimings.get(toolCallId)?.length ?? 0)) break;
+			await new Promise((done) => setTimeout(done, 100));
+		}
+		const timing = (state.wordTimings.get(toolCallId) ?? []).map((c) => `${c.tool} +${c.start_ms}ms ${c.ms}ms`).join(", ");
+		return { content: asText(`${outcome}\nTiming: ${timing || "no calls"}\nIts recorded calls (cite their IDs, in ` +
+			`order, as the refs of this word's test in define_action):\n${records.map((r) => describeRecord(r, 400)).join("\n")}`),
+			details: { records: records.map((r) => r.id) } };
+	}
 
 	pi.registerCommand("somni-dream", {
 		description: "Consolidate recent transcript into cited memory claims (offline dreaming)",
@@ -1024,6 +1074,41 @@ ${candidateGuide(candidates)}`;
 			}
 			return content;
 		}, "dream"),
+	});
+
+	pi.registerCommand("somni-practice", {
+		description: "Deep sleep: build or improve one learned procedure (action word), trying it live with the tools in " +
+			"SOMNI_PRACTICE_TOOLS. Run after /somni-dream: `/somni-practice [focus]`",
+		handler: (args, ctx) => submitCommand(ctx, async () => {
+			if (!ACTIONS) {
+				pi.sendMessage({ customType: "somni-practice", content: "Practice needs action words: set actions.enabled.",
+					display: true });
+				return undefined;
+			}
+			const recent = await getBackend().request<Recent>("recent", { include_images: false, record_limit: DREAM_RECORDS,
+				record_bytes: DREAM_RECORD_BYTES });
+			const failed = recent.records.filter((r) => r.source === "tool_result" && r.tool_ok === false).slice(-12);
+			const guide = actionGuide(await getBackend().request<ActionWord[]>("action_list"),
+				await getBackend().request<any>("action_catalog", { live: liveTools() }),
+				await getBackend().request<Candidate[]>("action_candidates"),
+				await getBackend().request<Workbench>("action_workbench"));
+			const tools = PRACTICE_TOOLS.length ? `You may call these tools for real, directly or from a draft: ` +
+				`${PRACTICE_TOOLS.join(", ")}. Every call is recorded. To try a draft, call somni_action_try with ` +
+				`{"source": "...", "live": true, "params": {...}}: it runs the draft against the real tools, call after call ` +
+				`with no model turn between them, and lists the records its calls made. When a live try succeeds, submit ` +
+				`define_action (or revise_action) whose test cites those records, in order. ` :
+				"No tools are allowed for real (SOMNI_PRACTICE_TOOLS is empty), so build only from recorded calls. ";
+			const focus = args?.trim() || "a chore the user asks for again and again, or a task that failed because its " +
+				"calls could not follow each other fast enough";
+			const prompt = `Practice (deep sleep). Build or improve ONE learned procedure, an action word: one Python ` +
+				`function that makes a sequence of tool calls in a single step. Pick the target that will save the most ` +
+				`work or do what step-by-step calls cannot: ${focus}. Use a recurring sequence below, a procedure a claim ` +
+				`describes, or a failed task below. A failure that says a token or window expired means the calls must ` +
+				`run back to back, which a word does and step-by-step calls can't. ${tools}Then call somni_dream once. If ` +
+				`nothing is worth building, submit an empty operations array.\n\n${guide}` +
+				(failed.length ? `\n\nRecent failed calls:\n${failed.map((r) => describeRecord(r, 400)).join("\n")}` : "");
+			return asText(prompt);
+		}, "practice"),
 	});
 
 	pi.registerCommand("somni-doctor", {
@@ -1234,6 +1319,7 @@ ${candidateGuide(candidates)}`;
 	pi.on("tool_call", (event) => {
 		const run = state.dream;
 		if (!run) return;
+		if (run.kind === "practice" && PRACTICE_TOOLS.includes(event.toolName) && !run.result) return; // a real try
 		if (!DREAM_TOOLS.has(event.toolName) || run.result || run.submitting) {
 			return { block: true, reason: "Offline dreams may only inspect Somni evidence and submit one pass." };
 		}

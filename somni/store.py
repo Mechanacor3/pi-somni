@@ -105,7 +105,7 @@ ACTION_TOOLS_FILE = "action-tools.json"  # tool declarations seen in recording s
 FAILURES_FILE = "dream-failures.jsonl"  # dream attempts that committed nothing; diagnostics, not evidence
 FAILURE_CAUSES = ("provider_error", "no_submission", "all_rejected", "invalid_submission", "budget_exhausted",
                   "timeout", "other")
-FAILURE_KINDS = ("dream", "wiki", "daydream")
+FAILURE_KINDS = ("dream", "wiki", "daydream", "practice")
 MAX_FAILURES_BYTES = 1 << 20  # past this the oldest half is dropped; the counts say how many were dropped
 def _somni_version():
     try:
@@ -2517,8 +2517,10 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             parsed = json.loads(proposal)
         except ValueError as exc:
             raise MemoryError(f"proposal_json is not valid JSON ({exc}); nothing committed") from None
+        # A practice run commits while its session keeps recording: a live pass bound to the current head.
+        live = memory.load().state["transcript_count"] if args.get("live") is True and writable and daydream is None else None
         dream = memory.dream(parsed, partial=True, allow_empty=True, viewed_images=viewed,
-                             actions=options, snapshot=daydream, usage=args.get("usage"),
+                             actions=options, snapshot=daydream if daydream is not None else live, usage=args.get("usage"),
                              lenient_images=args.get("lenient_images") is True)
         memory.clear_dream_cache()
         return {**dream, **_dream_summary(dream)}
@@ -2576,6 +2578,21 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         return A.step(A.shared_runtime(words), words[args["name"]], args["params"], args["history"],
                       max_calls=args.get("max_calls", A.MAX_CALLS),
                       catalog=A.namespace(memory._read_action_tools(), words))
+    elif method == "action_draft_step" and actions:
+        # Practice: step a draft word (not yet stored) against the session's real tools, as action_step does a word.
+        A = _action_module()
+        words = memory.load().action_words()
+        source = A.normalize(args.get("source"))
+        draft = {**A.parse(source), "source": source}
+        merged = {**words, draft["name"]: draft}
+        return A.step(A.shared_runtime(merged), draft, args["params"], args["history"],
+                      max_calls=args.get("max_calls", A.MAX_CALLS), catalog=A.namespace(memory._read_action_tools(), merged))
+    elif method == "records_since":
+        memory.load()
+        start = args.get("count")
+        if type(start) is not int or not 0 <= start <= memory.state["transcript_count"]:
+            raise MemoryError("count must be a transcript count")
+        return memory.transcript[start:start + 64]
     elif method == "recent":
         return _recent(memory.load(), args.get("include_images", False), viewed,
                        record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),

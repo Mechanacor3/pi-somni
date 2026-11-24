@@ -57,6 +57,7 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `wiki.page_guide` | `SOMNI_PAGE_GUIDE` | practical playbook guidance | Replaces the default wiki-writing guidance |
 | `actions.enabled` | `SOMNI_ACTIONS` | off | [Action words](action-words.md): dreamed Python functions that call session tools, registered as Pi tools |
 | `actions.tools` | `SOMNI_ACTION_TOOLS` | all non-Somni tools | The tools action words may call |
+| `actions.practice_tools` | `SOMNI_PRACTICE_TOOLS` | `` | Tools `/somni-practice` may call for real, directly or from a draft word, to try a procedure before defining it. Every call is recorded. Empty: practice builds from recorded calls only |
 | `actions.max_calls` | `SOMNI_ACTION_MAX_CALLS` | `16` | Tool calls per action word run (1–64) |
 | `daydreams.every_turns` | `SOMNI_DAYDREAM_EVERY_TURNS` | `0` | Start a daydream (see [Daydreams](long-sessions.md#daydreams-experimental)) after this many model turns. `0` is off (0–10000) |
 | `daydreams.every_minutes` | `SOMNI_DAYDREAM_EVERY_MINUTES` | `0` | Or start one on this interval. `0` is off (0–1440) |

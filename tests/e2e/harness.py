@@ -110,7 +110,8 @@ def plan_script(plans):
             if prompt.startswith(key):
                 if k >= len(plan):
                     return {"text": "done"}
-                return plan[k] if isinstance(plan[k], dict) else {"tool_calls": plan[k]}
+                turn = plan[k](body) if callable(plan[k]) else plan[k]  # a callable turn reads the request so far
+                return turn if isinstance(turn, dict) else {"tool_calls": turn}
         return {"text": "ok"}
     return script
 
