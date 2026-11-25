@@ -69,8 +69,10 @@ Return at most {max_ops} operations. Return only the JSON object."""
 SELF_GUIDE = ("Somni's own machinery is not the user's work. Don't write claims about how dreams, action words or "
               "rpc.TOOL calls work: every dream gets those instructions fresh, and in the daytime they confuse the agent "
               "about which tools it has. If the user was configuring or building Somni, keep what they decided (a "
-              "setting, a preference) and say in the claim that it is about the Somni memory tool. Never phrase rpc.* "
-              "as a way to call a tool.")
+              "setting, a preference) and say in the claim that it is about the Somni memory tool. In a claim's text, "
+              "never phrase rpc.* as a way to call a tool. This is about claims only: an action word's source still "
+              "calls tools as rpc.TOOL(...), and a word for the user's own recurring work is worth defining even if "
+              "it was first sketched while talking about Somni.")
 
 
 def render_pages(memory, body_chars=400):
