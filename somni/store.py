@@ -3361,6 +3361,9 @@ def parser():
     serve.add_argument("--image-max-edge", type=int, default=0)
     record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES - {"outcome"}), required=True); record.add_argument("--text", required=True)
     record.add_argument("--inject-max-bytes", type=int, help="emit the updated index instead of the record ID")
+    record.add_argument("--run-label", default=os.environ.get("SOMNI_RUN_LABEL") or None,
+                        help="the run this record belongs to (default: SOMNI_RUN_LABEL)")
+    record.add_argument("--tag", action="append", default=[], help="a tag for the record (repeatable)")
     outcome_arguments(commands.add_parser("outcome", help="record an outcome from outside the agent"))
     note = commands.add_parser("note"); note.add_argument("--input", required=True, help="claim JSON relative to workspace, or - for stdin")
     dream = commands.add_parser("dream"); dream.add_argument("--input", required=True, help="proposal JSON relative to workspace, or - for stdin")
@@ -3392,7 +3395,8 @@ def main():
             bound = args.inject_max_bytes
             if bound is not None:
                 _validate_index_request(bound)
-            record = memory.record(args.source, args.text)
+            record = memory.record(args.source, args.text,
+                                   context={"run_label": args.run_label, "tags": args.tag or None})
             if bound is None:
                 print(record)
             else:

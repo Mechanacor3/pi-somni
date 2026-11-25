@@ -38,6 +38,7 @@ launching Pi to pause automatic recording while retaining memory retrieval.
 
 The store also has a CLI: `python3 somni/store.py --workspace W --subject-id S
 {init,session-open,session-close,record,outcome,note,dream,search,inject,report,metrics,status}`.
+`record --run-label L` (default `SOMNI_RUN_LABEL`) labels a harness's own records, so outcomes pair with them.
 `outcome` records a verdict, test output or review from outside the agent, with or without an open session; see
 [Outcomes](outcomes.md).
 Use `inject --query 'your prompt'` to preview a prompt-ranked index. Pi uses up to the

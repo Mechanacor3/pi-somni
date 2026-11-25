@@ -143,6 +143,21 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(missing.returncode, 2)
         self.assertIn("no store", missing.stderr)
 
+    def test_the_store_cli_records_a_harness_record_with_a_run_label_for_pairing(self):
+        self.m.set_phase("open")
+        base = ["store", "--workspace", str(self.ws), "--subject-id", "s", "record", "--source", "agent_output"]
+        with patch.object(sys, "argv", [*base, "--text", "AGENT: DONE", "--run-label", "t-3", "--tag", "lab"]), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(S.main(), 0)
+        with patch.dict(os.environ, {"SOMNI_RUN_LABEL": "t-4"}), patch.object(sys, "argv", [*base, "--text", "AGENT: done too"]), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(S.main(), 0)
+        self.m.set_phase("closed")
+        records = self.reload().transcript
+        self.assertEqual([(r.get("run_label"), r.get("tags")) for r in records], [("t-3", ["lab"]), ("t-4", None)])
+        ref = self.m.record_outcome("no line of four", verdict="fail", run_label="t-3")
+        self.assertEqual(self.m.outcome_report(self.m._records_by_id[ref])["ref"], "t000001")
+
     def test_forgetting_keeps_an_outcome_quote_a_claim_cites(self):
         with patch.dict(os.environ, {"SOMNI_NOW": "2026-01-01T09:00:00Z"}):
             self.session(("agent_output", "AGENT: DONE"))
