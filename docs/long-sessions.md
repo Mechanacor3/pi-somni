@@ -74,18 +74,32 @@ Somni warns on recording errors, including a full store. To archive a full store
 move the directory named by `SOMNI_WORKSPACE` (by default `.pi/somni`) to a private location. The next Pi session
 creates a clean store.
 
-## One owner per store, and sub-agents
+## Several sessions on one memory
 
-One Pi process owns recording in a workspace at a time: it opens and closes the session, and only it writes notes,
-runs dreams and daydreams, and records the tool catalog. Any other Pi that records in the same store, such as a
-sub-agent your session starts, or a second terminal, is a **contributor**: it appends its prompts, tool results and
-replies to the same transcript, tagged `contributor:<its session ID>`, so dreams see what sub-agents found and can
-tell whose work a record is. Contributors can read memory but can't change claims. Their records are skipped, with a
-warning, while the owner runs an offline dream. Action-word mining keeps each session's calls in their own order.
-Close a contributor and reopen it after the owner exits to take over ownership.
+One Pi process owns recording in a workspace at a time: it opens and closes the session, runs dreams and daydreams,
+and records the tool catalog. Every other Pi that records in the same store appends its prompts, tool results and
+replies to the same transcript, tagged so dreams can tell whose work a record is:
 
-Pi starts one local Python child for the session and exchanges requests over private pipes. The child holds an OS lock
-on `.somni-session.lock`. The file stays in the workspace; leave it in place so concurrent sessions lock the same file.
+- **Peers** are your other sessions: a second terminal, another window on the same project. Their records are tagged
+  `session:<its session ID>`. What you say in a peer counts as your own words (it can back a
+  [standing preference](everyday-use.md#preferences-that-always-apply)), and a peer can save notes.
+- **Contributors** are sessions something else started, such as a sub-agent. Their records are tagged
+  `contributor:<its session ID>`, so dreams see what sub-agents found. A contributor's "user" is the agent that started
+  it, so its prompts never count as yours, and it can't change claims.
+
+Somni tells them apart by Pi's mode: interactive Pi is a peer, and a scripted one (print, JSON or RPC mode, as
+sub-agents run) is a contributor. Set `SOMNI_SESSION_ROLE=peer` or `contributor` to choose.
+
+When the owner exits while others are still recording, it leaves the session open for them, and the next peer or
+contributor to start a turn takes ownership over. The last session out closes it. A `/somni-dream` while others are
+recording reviews the records up to that moment as a live pass and leaves recording open; the next dream picks up
+everything recorded since. Run `/somni-dream` in the session that owns recording; a peer asking for one is told so,
+unless the owner has gone, in which case it takes over and dreams. Action-word mining keeps each session's calls in
+their own order.
+
+Each recording session holds a lock file under `.somni-sessions/` for its life, so the others can tell it's still
+there; a file whose session is gone is removed. Pi starts one local Python child for the session and exchanges
+requests over private pipes. The owner's child holds an OS lock on `.somni-session.lock`. The file stays in the workspace; leave it in place so concurrent sessions lock the same file.
 If Pi is killed, the pipe closes and the child releases its lock. If the child is killed too, the kernel releases it
 directly. The next writer verifies the chain and recovers an interrupted transaction on startup. PID namespaces do not
 affect ownership on the same mounted store. New writes extend the hash chain and use a transaction journal. A

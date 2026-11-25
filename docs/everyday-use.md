@@ -155,8 +155,9 @@ store:
   path: ~/.local/share/somni
 ```
 
-Only one Pi session records into a store at a time. A second session can still read the memory,
-but it doesn't record until the first one exits.
+Several Pi sessions can use one store at once: each records into it, and what you say in any of
+them counts. One of them owns the store and runs its dreams; see
+[several sessions on one memory](long-sessions.md#several-sessions-on-one-memory).
 
 ## Privacy and pausing
 

@@ -36,7 +36,6 @@ import base64
 import binascii
 import datetime as _dt
 from collections import Counter
-from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 import fcntl
@@ -122,6 +121,7 @@ MAX_ACTION_TOOLS = 256
 MAX_ACTION_TOOL_SCHEMA_BYTES = 4096
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output", "outcome"}
+SESSIONS_DIR = ".somni-sessions"
 MAX_STANDING = 12  # active standing claims: how the user wants work done, listed first in every index
 # An outcome is evidence from outside the agent, added afterwards by a harness or a person: a grader's verdict, CI or
 # test output, a review comment, the user's "that didn't work". Only `record_outcome` writes one, never a session.
@@ -400,8 +400,8 @@ def _require_viewed_images(evidence, viewed):
 
 
 def _user_words(record):
-    """A record of the user's own words: a message in a session that owns the store, not a contributor's prompt
-    (a sub-agent's "user" is the agent that started it). Source and tags survive forgetting, so this holds on reload."""
+    """A record of the user's own words: a message in the owning session or a peer session (session:LABEL), not a
+    contributor's prompt (a sub-agent's "user" is the agent that started it). Source and tags survive forgetting, so this holds on reload."""
     return record.get("source") == "ordinary_observation" and not any(
         tag == "contributor" or tag.startswith("contributor:") for tag in record.get("tags", []))
 
@@ -2968,22 +2968,69 @@ def _terms(text):
 LayeredMemory = SomniMemory  # backwards-compatible name
 
 
-@contextmanager
-def _recording_lease(memory):
-    """The child keeps the writer lock until Pi closes its input pipe."""
-    lease = memory.workspace / ".somni-session.lock"
-    fd = os.open(lease, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise MemoryError("the Somni session lock must be a regular file")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        yield True
-    finally:
+def _lock_file(path):
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
+        raise MemoryError(f"the Somni lock {path.name} must be a regular file")
+    return fd
+
+
+class _Lease:
+    """The recording lease: the session holding it owns the store's phase, dreams, daydreams and action words. A
+    session that couldn't take it at start can take it later, once its owner has gone (``acquire``)."""
+
+    def __init__(self, memory):
+        self.fd = _lock_file(memory.workspace / ".somni-session.lock")
+        self.held = False
+
+    def acquire(self):
+        if not self.held:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.held = True
+            except BlockingIOError:
+                pass
+        return self.held
+
+    def close(self):
+        os.close(self.fd)
+
+
+class _SessionSlot:
+    """One lock file per recording session under .somni-sessions/, held for the session's life, so a session can
+    tell whether others are still recording (and the last one out closes the phase). A file nobody holds is stale."""
+
+    def __init__(self, memory, label):
+        self.folder = memory.workspace / SESSIONS_DIR
+        self.folder.mkdir(mode=0o700, exist_ok=True)
+        _no_symlink(self.folder)
+        safe = re.sub(r"[^A-Za-z0-9_-]", "", label or "")[:36]
+        self.path = self.folder / f"{os.getpid()}-{safe or 'session'}.lock"
+        self.fd = _lock_file(self.path)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+
+    def others(self):
+        count = 0
+        for path in self.folder.glob("*.lock"):
+            if path == self.path or path.is_symlink():
+                continue
+            try:
+                fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                path.unlink(missing_ok=True)  # stale: its session has gone
+            except BlockingIOError:
+                count += 1
+            finally:
+                os.close(fd)
+        return count
+
+    def close(self):
+        self.path.unlink(missing_ok=True)
+        os.close(self.fd)
 
 
 def _dream_summary(dream):
@@ -3059,12 +3106,13 @@ def _action_module():
 
 
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
-                    resize=None, viewed=None, actions=False, daydream=None, contributor=False):
+                    resize=None, viewed=None, actions=False, daydream=None, contributor=False, peer=False):
     if daydream is not None and method in {"phase", "record", "note", "wiki", "action_tools"}:
         raise MemoryError("a daydream may only read memory and submit its pass")
-    # A contributor (a second Pi on the store, such as a sub-agent) may append records; the owner keeps the rest.
+    # A second Pi on the store may append records: a contributor (such as a sub-agent) or a peer (another session of
+    # the user's, which may also save notes). The owner keeps the phase, dreams and the wiki.
     if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable \
-            and not (contributor and method == "record"):
+            and not (contributor and method == "record") and not (peer and method == "note"):
         raise MemoryError("Somni memory changes require the session that owns recording")
     if method == "phase":
         memory.set_phase(args["phase"], allow_same=True)
@@ -3266,7 +3314,7 @@ def _dream_actions(args):
 
 
 def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=False, daydream=False,
-           session_label=None):
+           session_label=None, peer=False):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
 
@@ -3301,8 +3349,11 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
             except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                 reply(request_id, error=str(exc))
         return
-    with _recording_lease(memory) as owner:
-        if owner is not False and (not os.path.lexists(memory.store) or _seeded_only(memory.store)):
+    lease = _Lease(memory)
+    slot = _SessionSlot(memory, session_label) if record else None
+    try:
+        owner = lease.acquire()
+        if owner and (not os.path.lexists(memory.store) or _seeded_only(memory.store)):
             SomniMemory.create(memory.workspace, memory.subject_id, "pi", "session")
         memory = SomniMemory(memory.workspace, memory.subject_id, scheduled_verification=True)
         synced = None
@@ -3318,30 +3369,54 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
             memory.set_phase("open", allow_same=True)
         else:
             memory.load()
-        # Another session owns recording: this one contributes its records, tagged so dreams can tell them apart.
-        contributor = bool(record and owner is False)
-        if contributor:
-            tags = [*context.get("tags", []), f"contributor:{session_label}" if session_label else "contributor"]
-            context = _record_context(context.get("run_label"), tags[-8:])
-        try:
-            reply(0, result={"writable": owner is not False, **({"contributor": True} if contributor else {}),
-                             **({"action_sync": synced} if synced else {})})
-            while line := sys.stdin.buffer.readline(MAX_BACKEND_REQUEST + 1):
-                if len(line) > MAX_BACKEND_REQUEST:
-                    raise MemoryError("Somni backend request exceeds byte limit")
-                request_id = None
-                try:
-                    request = json.loads(line)
-                    request_id = request["id"]
-                    result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
-                                             image_bytes=image_bytes, resize=resize, viewed=viewed,
-                                             actions=actions, contributor=contributor)
-                    reply(request_id, result=result)
-                except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
-                    reply(request_id, error=str(exc))
-        finally:
-            if owner and record:
+        base_context = context
+
+        def role():
+            """This session's part: owner, or (when another session owns recording) a peer or a contributor whose
+            records are tagged with its session, so dreams can tell them apart."""
+            nonlocal context
+            joined = bool(record and not owner)
+            is_peer = joined and peer
+            if joined:
+                tag = f"{'session' if peer else 'contributor'}:{session_label}" if session_label else \
+                    ("session" if peer else "contributor")
+                context = _record_context(base_context.get("run_label"), [*base_context.get("tags", []), tag][-8:])
+            else:
+                context = base_context
+            return {"writable": owner, **({"contributor": True} if joined else {}), **({"peer": True} if is_peer else {}),
+                    **({"others": slot.others()} if slot else {})}
+
+        result = role()
+        reply(0, result={**result, **({"action_sync": synced} if synced else {})})
+        while line := sys.stdin.buffer.readline(MAX_BACKEND_REQUEST + 1):
+            if len(line) > MAX_BACKEND_REQUEST:
+                raise MemoryError("Somni backend request exceeds byte limit")
+            request_id = None
+            try:
+                request = json.loads(line)
+                request_id = request["id"]
+                if request["method"] == "role":
+                    # Take over recording if its owner has gone: the phase it left open stays open for this session.
+                    if record and not owner and lease.acquire():
+                        owner = True
+                        memory.set_phase("open", allow_same=True)
+                    reply(request_id, result=role())
+                    continue
+                result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
+                                         image_bytes=image_bytes, resize=resize, viewed=viewed,
+                                         actions=actions, contributor=bool(record and not owner),
+                                         peer=bool(record and not owner and peer))
+                reply(request_id, result=result)
+            except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
+                reply(request_id, error=str(exc))
+    finally:
+        # The last session out closes the phase. While others record, the owner leaves it open for them, and one of
+        # them takes the lease over at its next turn.
+        if record and slot is not None:
+            if (owner or lease.acquire()) and slot.others() == 0:
                 memory.set_phase("closed", allow_same=True)
+            slot.close()
+        lease.close()
 
 
 def _validate_index_request(bound, query=""):
@@ -3424,6 +3499,8 @@ def parser():
     serve.add_argument("--run-label")
     serve.add_argument("--tags", default="[]")
     serve.add_argument("--session-label", help="tag for this session's records when another session owns recording")
+    serve.add_argument("--peer", action="store_true", help="when another session owns recording, record as the user's "
+                       "own session (tag session:LABEL; may save notes) rather than as a contributor such as a sub-agent")
     serve.add_argument("--image-bytes", type=int, default=DEFAULT_IMAGE_BYTES)
     serve.add_argument("--image-max-edge", type=int, default=0)
     record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES - {"outcome"}), required=True); record.add_argument("--text", required=True)
@@ -3453,7 +3530,7 @@ def main():
         if args.command == "serve":
             _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
                    image_bytes=args.image_bytes, image_max_edge=args.image_max_edge,
-                   actions=args.actions, daydream=args.daydream, session_label=args.session_label)
+                   actions=args.actions, daydream=args.daydream, session_label=args.session_label, peer=args.peer)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":

@@ -266,11 +266,13 @@ function callTimeline(calls: CallTiming[]) {
 type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; result?: unknown };
 type DreamKind = "dream" | "wiki" | "daydream" | "deepsleep";
 type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string;
-	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string; resumed?: number };
+	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string; resumed?: number;
+	live?: boolean }; // other sessions are recording: the pass is bound to the head it saw, and the phase stays open
 type CachedRead = { tool: string; args: unknown; text: string; images?: { ref: string; sha256: string }[] };
 const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
 	contributor: false, // another session owns recording; this one appends its records beside it (a sub-agent, say)
+	peer: false, // ...as another session of the user's: its records are the user's own, and it may save notes
 	backend: undefined as Backend | undefined,
 	recordWarning: false, indexWarning: false,
 	words: new Map<string, string>(), // registered action word -> source
@@ -362,9 +364,25 @@ function getBackend() {
 
 function requireWriteAccess() {
 	if (!state.writable) {
-		throw new Error("Somni memory changes require the session that owns recording.");
+		throw new Error("Another Pi session owns recording in this Somni memory. Run this there, or close that session and try again.");
 	}
 	return getBackend();
+}
+
+/** This session's part: it may take over recording once the session that owned it has closed. */
+async function refreshRole(ctx?: ExtensionContext) {
+	if (!state.backend || !(state.contributor || state.peer)) return;
+	const role = await state.backend.request<{ writable: boolean; contributor?: boolean; peer?: boolean }>("role", {});
+	if (role.writable && !state.writable && ctx) notify(ctx, "Somni: this session now owns recording; the one that did has closed.");
+	state.writable = role.writable;
+	state.contributor = Boolean(role.contributor);
+	state.peer = Boolean(role.peer);
+}
+
+/** A second session of the user's (interactive Pi) is a peer; a scripted one, such as a sub-agent, is a contributor. */
+function isPeer(ctx: ExtensionContext) {
+	const role = process.env.SOMNI_SESSION_ROLE;
+	return role ? role === "peer" : ctx.mode === "tui";
 }
 
 function utf8Prefix(text: string, maxBytes: number) {
@@ -495,9 +513,11 @@ function daydreamListing(records: TranscriptRecord[]) {
  * cite, not their text. It writes lessons as unverified claims; the night's dream checks them against the records.
  */
 function dreamStepPrompt(focus: string, recent: Recent) {
-	// The fork's conversation holds this session's records but not a contributor's (a sub-agent's): those come in full.
-	const sub = (r: TranscriptRecord) => (r.tags ?? []).some((t) => t.startsWith("contributor"));
-	const anchors = withDays(recent.records, (r) => sub(r) ? `${describeRecord(r)} [from another session, such as a sub-agent]`
+	// The fork's conversation holds this session's records but not another session's (a sub-agent's, or another of the
+	// user's own sessions): those come in full.
+	const from = (r: TranscriptRecord) => (r.tags ?? []).find((t) => t.startsWith("contributor") || t.startsWith("session"));
+	const anchors = withDays(recent.records, (r) => from(r)
+		? `${describeRecord(r)} [from ${from(r)!.startsWith("session") ? "another of the user's sessions" : "another session, such as a sub-agent"}]`
 		: `[${r.id}] (${r.source}) ${clip(r.text.replace(/\s+/g, " "), 100)}`);
 	return "Dream step. You are a copy of this session, forked to reflect while the session keeps working. Don't continue " +
 		"the user's task or call its tools. Earlier dream steps appear above as \"Somni daydream\" notices with what they " +
@@ -606,6 +626,7 @@ export default function (pi: ExtensionAPI) {
 		const headless = ctx.mode === "print" || ctx.mode === "json";
 		let run: DreamRun | undefined;
 		try {
+			await refreshRole(ctx);
 			const backend = requireWriteAccess();
 			if (state.dream || !ctx.isIdle()) throw new Error("Wait for the current Pi turn to settle first.");
 			run = { submitting: false, reads: 0, submissions: 0, kind: DAYDREAM_CHILD ? "daydream" : kind };
@@ -618,7 +639,14 @@ export default function (pi: ExtensionAPI) {
 			const content = await withCachedReads(loaded, run);
 			// A daydream worker leaves the phase alone: the owning session is still recording. So does deep sleep,
 			// which records its real tries and commits a live pass.
-			if (!DAYDREAM_CHILD && kind !== "deepsleep") await backend.request("phase", { phase: "closed" });
+			// So does a dream while other sessions of this memory are recording: it reviews the records up to now.
+			const others = !DAYDREAM_CHILD && kind !== "deepsleep" && RECORD
+				? (await backend.request<{ others?: number }>("role", {})).others ?? 0 : 0;
+			if (others) {
+				run.live = true;
+				notify(ctx, `Somni: ${others} other Pi session(s) are recording in this memory, so this ${kind} reviews ` +
+					"the records up to now and they keep recording.");
+			} else if (!DAYDREAM_CHILD && kind !== "deepsleep") await backend.request("phase", { phase: "closed" });
 			// A triggered custom message starts the turn before waitForIdle checks Pi's state.
 			run.started = true;
 			pi.sendMessage({ customType: "somni-dream-input", content, display: false }, { triggerTurn: true });
@@ -1029,7 +1057,8 @@ ${candidateGuide(candidates)}`;
 			evidence: Evidence,
 		}),
 		async execute(_id: string, params: any) {
-			const id = await requireWriteAccess().request<string>("note", { ...params, salience: params.salience ?? 3 });
+			if (!state.writable && !state.peer) requireWriteAccess();
+			const id = await getBackend().request<string>("note", { ...params, salience: params.salience ?? 3 });
 			return { content: asText(`saved ${id}`), details: { id } };
 		},
 	});
@@ -1056,7 +1085,7 @@ ${candidateGuide(candidates)}`;
 				const out = await backend.request<DreamResult>("dream", {
 					proposal_json: params.proposal_json,
 					...(LENIENT_IMAGE_EVIDENCE ? { lenient_images: true } : {}),
-					...(run.kind === "deepsleep" ? { live: true } : {}),
+					...(run.kind === "deepsleep" || run.live ? { live: true } : {}),
 					// A daydream worker reports what it spent up to this submission; it lands on the live pass.
 					...(DAYDREAM_CHILD ? { usage: { ...state.usage, duration_ms: Math.round(process.uptime() * 1000) } } : {}),
 					...(ACTIONS ? {
@@ -1283,7 +1312,7 @@ ${candidateGuide(candidates)}`;
 		}
 		const workspace = process.env.SOMNI_WORKSPACE ?? join(ctx.cwd, ".pi", "somni");
 		state.dream = undefined;
-		state.writable = state.contributor = state.recordWarning = state.indexWarning = false;
+		state.writable = state.contributor = state.peer = state.recordWarning = state.indexWarning = false;
 		state.wordCalls.clear();
 		state.wordTimings.clear();
 		state.wordGuideShown = false;
@@ -1297,22 +1326,24 @@ ${candidateGuide(candidates)}`;
 		if (process.env.SOMNI_RUN_LABEL !== undefined) args.push(`--run-label=${process.env.SOMNI_RUN_LABEL}`);
 		if (process.env.SOMNI_TAGS !== undefined) args.push(`--tags=${process.env.SOMNI_TAGS}`);
 		args.push(`--session-label=${ctx.sessionManager.getSessionId().slice(0, 36)}`);
+		if (isPeer(ctx)) args.push("--peer");
 		if (RECORD && !DAYDREAM_CHILD) args.push("--record");
 		if (DAYDREAM_CHILD) args.push("--daydream");
 		if (ACTIONS) args.push("--actions");
 		const backend = new Backend(PYTHON, args, (error) => {
 			if (state.backend !== backend) return;
 			state.backend = undefined;
-			state.writable = state.contributor = false;
+			state.writable = state.contributor = state.peer = false;
 			state.dream = undefined;
 			notify(ctx, `Somni backend stopped. ${error.message}`);
 		});
 		try {
-			const { writable, contributor, action_sync: synced } =
-				await backend.ready as { writable: boolean; contributor?: boolean; action_sync?: any };
+			const { writable, contributor, peer, action_sync: synced } =
+				await backend.ready as { writable: boolean; contributor?: boolean; peer?: boolean; action_sync?: any };
 			state.backend = backend;
 			state.writable = writable;
 			state.contributor = Boolean(contributor);
+			state.peer = Boolean(peer);
 			lastCtx = ctx;
 			if (synced?.error) notify(ctx, `Somni could not record your action word edits. ${synced.error}`);
 			else if (synced) {
@@ -1342,13 +1373,14 @@ ${candidateGuide(candidates)}`;
 		day.child?.kill("SIGTERM");
 		const backend = state.backend;
 		state.backend = undefined;
-		state.writable = state.contributor = false;
+		state.writable = state.contributor = state.peer = false;
 		state.dream = undefined;
 		await backend?.close();
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.backend || state.dream) return undefined;
+		await refreshRole(ctx).catch(() => undefined);
 		if (ACTIONS) {
 			await registerWords(ctx);
 			await recordToolCatalog(ctx); // MCP tools often register after session_start

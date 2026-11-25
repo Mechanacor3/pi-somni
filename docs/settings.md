@@ -79,6 +79,7 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | | `SOMNI_DAYDREAM_FORK_OF` | unset | Set by Somni in a forked daydream worker: the parent session's ID |
 | | `SOMNI_STORE` | unset | Path to an alternative `store.py` (development) |
 | | `SOMNI_NOW` | unset | Fixed current time (ISO 8601), for tests and benchmarks that simulate days |
+| | `SOMNI_SESSION_ROLE` | unset | `peer` or `contributor`: how this session records when another session owns the memory. Default: `peer` for interactive Pi (your own words count, it may save notes), `contributor` otherwise (sub-agents, scripts) |
 
 `SOMNI_RUN_LABEL`, `SOMNI_TAGS`, `SOMNI_CONFIG`, `SOMNI_DAYDREAM`, `SOMNI_DAYDREAM_FORK_OF` and `SOMNI_STORE` are environment-only: they are set
 per run or by Somni itself.

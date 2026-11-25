@@ -550,6 +550,32 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.pi.prompt("Anything else?")  # and the owner still records
         self.assertGreater(SomniMemory(store, "pi").load().state["transcript_count"], memory.state["transcript_count"])
 
+    def test_a_peer_session_records_as_the_user_and_takes_over_when_the_owner_exits(self):
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        store = self.work / ".pi" / "somni"
+        peer = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={"SOMNI_SESSION_ROLE": "peer"})
+        ref = f"t{SomniMemory(store, 'pi').load().state['transcript_count'] + 1:06d}"  # the peer's prompt, recorded next
+        note = {**PLANS["From now on"][0][0][1], "evidence": [{"ref": ref, "quote": "I like 2-space indents"}]}
+        try:
+            with patch.dict(PLANS, {"From now on": [[("somni_note", note)]]}):
+                peer.prompt("From now on: I like 2-space indents.")
+            note = next(e for e in peer.tool_ends() if e["toolName"] == "somni_note")
+            self.assertFalse(note.get("isError"), note)  # a peer may save notes, and its user's words count
+            memory = SomniMemory(store, "pi").load()
+            self.assertTrue(memory.claims["n000001"]["standing"])
+            said = next(r for r in memory.transcript if r["text"].startswith("USER: From now on"))
+            self.assertTrue(any(t.startswith("session:") for t in said["tags"]), said)
+            self.pi.close()  # the owner leaves; the peer is still recording
+            self.assertEqual(SomniMemory(store, "pi").load().state["phase"], "open")
+            peer.prompt("Anything else I should know?")
+            warnings = [e.get("message", "") for e in peer.events if e.get("method") == "notify"]
+            self.assertTrue(any("now owns recording" in msg for msg in warnings), warnings)
+            self.assertIn("How the user wants work done (standing", json.dumps(self.upstream.requests[-1]["messages"]))
+        finally:
+            peer.close()
+        self.assertEqual(SomniMemory(store, "pi").load().state["phase"], "closed")  # the last one out closes it
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port)  # tearDown closes it
+
     def test_recall_after_restart(self):
         self.pi.prompt("What is the fee to cancel economy fare 300?")
         self.pi.prompt("Remember that for later.")

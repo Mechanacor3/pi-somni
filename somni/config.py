@@ -146,6 +146,7 @@ ENV_ONLY = {
     "SOMNI_DAYDREAM_FORK_OF": "Set by Somni in a forked daydream worker: the parent session's ID",
     "SOMNI_STORE": "Path to an alternative `store.py` (development)",
     "SOMNI_NOW": "Fixed current time (ISO 8601), for tests and benchmarks that simulate days",
+    "SOMNI_SESSION_ROLE": "`peer` or `contributor`: how this session records when another session owns the memory. Default: `peer` for interactive Pi (your own words count, it may save notes), `contributor` otherwise (sub-agents, scripts)",
 }
 TRUE_WORDS, FALSE_WORDS = {"true", "yes", "on", "1"}, {"false", "no", "off", "0"}
 
