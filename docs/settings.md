@@ -41,6 +41,7 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `store.subject` | `SOMNI_SUBJECT` | `pi` | Identity bound into the store's manifest |
 | `store.record` | `SOMNI_RECORD` | on | Record sessions automatically. `false` keeps memory retrieval but records nothing (a testbed driver may record instead) |
 | `store.python` | `SOMNI_PYTHON` | `python3` | Interpreter for the backend. The config files themselves are read with `SOMNI_PYTHON` from the environment, or `python3` |
+| `personal.path` | `SOMNI_PERSONAL` | `auto` | Your personal memory, shared by every project: lessons about you (preferences, how you work) that dreams file there instead of the project's store. `auto` is `~/.somni` in interactive Pi and off in scripted runs (print, JSON or RPC mode); `none` turns it off; a path uses that store everywhere |
 | `index.bytes` | `SOMNI_INJECT_BYTES` | `4096` | Size of the memory index injected before each prompt (256–8192) |
 | `recording.tool_result_bytes` | `SOMNI_TOOL_RESULT_BYTES` | `4096` | Tool result text kept per record, in UTF-8 bytes (512–8000) |
 | `recording.digest_tools` | `SOMNI_DIGEST_TOOLS` | `stream_read` | Tools whose text output is recorded as a byte count and SHA-256 beside their arguments. An empty list disables this |

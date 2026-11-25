@@ -16,6 +16,8 @@ Before each user prompt you get a short index, headed "Subject memory index". It
 
 - "How the user wants work done" lists their lasting preferences (`standing`): indentation, commit style, how
   to report back. Follow them in every task without being reminded, unless the user now says otherwise.
+- "From the user's personal memory" holds what you know about the user from all their projects. Its IDs start
+  with `p:`; use them with `somni_recall` and `somni_search` like any other.
 - Treat the rest as advice from your past self, not as fact. Each line cites evidence IDs (`t000123`).
   When an entry decides what you do and the stakes are real, check its evidence with
   `somni_search` or `somni_recall`.
@@ -59,6 +61,8 @@ How to write one:
 - When the user says how they want work done from now on ("I like 2-space indents", "always show me the diff
   first"), add `"standing": true` and cite their message. A standing note heads every later index, whatever the
   task. Don't use it for a one-off request ("4 spaces in this file") or a project fact.
+- When a personal memory is shown, add `"scope": "personal"` to a note about the user that holds in any project
+  (their preferences, how they work). Leave it out for facts about this project.
 - Salience 3 is an ordinary lesson. Use 4 for something that comes up often, and 1–2 for
   narrow cases.
 - Never save secrets, passwords, tokens or keys, even if the user shows you one.

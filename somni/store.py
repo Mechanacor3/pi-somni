@@ -122,6 +122,9 @@ MAX_ACTION_TOOL_SCHEMA_BYTES = 4096
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output", "outcome"}
 SESSIONS_DIR = ".somni-sessions"
+PERSONAL = "p:"  # how personal claims and records are named in a project session: p:n000004, p:t000012
+PERSONAL_SUBJECT = "personal"
+_LOCAL_ID = re.compile(r"(?<![\w:])([nt]\d{6})\b")
 MAX_STANDING = 12  # active standing claims: how the user wants work done, listed first in every index
 # An outcome is evidence from outside the agent, added afterwards by a harness or a person: a grader's verdict, CI or
 # test output, a review comment, the user's "that didn't work". Only `record_outcome` writes one, never a session.
@@ -1610,6 +1613,40 @@ class SomniMemory:
             self.transcript.extend(records)
             self._records_by_id.update(zip(ids, records))
         return ids
+
+    def import_records(self, records, origin):
+        """Copy records from another store (a project) into this one (the personal store), so a personal claim can
+        quote them. A copy keeps the source, text, time, run label and tags, and names the store and record it came
+        from with that record's hash. A record imported before maps to its earlier copy. Works in any phase: the
+        personal store has no session of its own. Returns {original id: id here}."""
+        if not isinstance(origin, str) or not origin or len(origin) > 1024:
+            raise MemoryError("import origin must be a store path")
+        with self._locked():
+            self._load_locked()
+            known = {(r["imported"]["from"], r["imported"]["sha256"]): r["id"] for r in self.transcript if "imported" in r}
+            seq, head, encoded, added, mapping = self.state["transcript_count"], self.state["transcript_head"], [], [], {}
+            for original in records:
+                digest = _record_hash(original)
+                if (origin, digest) in known:
+                    mapping[original["id"]] = known[(origin, digest)]
+                    continue
+                seq += 1
+                copy = {"schema": SCHEMA, "seq": seq, "id": f"t{seq:06d}", "source": original["source"],
+                        "at": original.get("at", _stamp(_now())), "text": original["text"], "prev_sha256": head,
+                        **{key: original[key] for key in ("run_label", "tags", "outcome", "tool_ok") if key in original},
+                        "imported": {"from": origin, "ref": original["id"], "sha256": digest}}
+                head = sha(copy)
+                encoded.append(_encode_log_record(copy))
+                added.append(copy)
+                known[(origin, digest)] = mapping[original["id"]] = copy["id"]
+            if seq > self._limit("max_transcript_records"):
+                raise MemoryError("transcript record limit reached")
+            if added:
+                self._commit_logs({"transcript.jsonl": encoded},
+                                  {**self.state, "transcript_count": seq, "transcript_head": head})
+                self.transcript.extend(added)
+                self._records_by_id.update((r["id"], r) for r in added)
+        return mapping
 
     def record_outcome(self, text, *, by=None, verdict=None, run_label=None, tags=None, images=(),
                        image_bytes=DEFAULT_IMAGE_BYTES, resize=None):
@@ -3106,7 +3143,7 @@ def _action_module():
 
 
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
-                    resize=None, viewed=None, actions=False, daydream=None, contributor=False, peer=False):
+                    resize=None, viewed=None, actions=False, daydream=None, contributor=False, peer=False, personal=None):
     if daydream is not None and method in {"phase", "record", "note", "wiki", "action_tools"}:
         raise MemoryError("a daydream may only read memory and submit its pass")
     # A second Pi on the store may append records: a contributor (such as a sub-agent) or a peer (another session of
@@ -3130,11 +3167,25 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
                             clip=True, image_bytes=image_bytes, resize=resize, tool_ok=args.get("tool_ok"),
                             calls=args.get("calls"), via_word=args.get("via_word"),
                             word_stamp=_word_stamp(memory, args) if actions and args.get("word") is True else None)
-        return ref if index_bytes is None else memory.inject(index_bytes, query=query,
-                                                            words=_index_word_names(args) if actions else None)
+        return ref if index_bytes is None else _layered_index(memory, personal, index_bytes, query=query,
+                                                              words=_index_word_names(args) if actions else None)
     elif method == "note":
         if len(canonical(args).encode("utf-8")) > MAX_INPUT_BYTES:
             raise MemoryError("note input exceeds byte limit")
+        if args.get("scope") == "personal":
+            # A note about the user, for every project: a one-operation pass in the personal store.
+            op = {"op": "add", "text": args["text"], "status": args["status"], "salience": args["salience"],
+                  "evidence": args["evidence"], "scope": "personal",
+                  **({"gist": args["gist"]} if "gist" in args else {}),
+                  **({"standing": True} if args.get("standing") else {})}
+            if personal is None:
+                raise MemoryError("personal memory is off in this session; save the note without scope")
+            _, layered = _dream_layered(memory, personal, {"schema": 1, "operations": [op]}, project_pass=False)
+            if layered["rejected"] or not layered["personal"]:
+                raise MemoryError(layered["rejected"][0]["reason"] if layered["rejected"] else "personal note not saved")
+            return PERSONAL + layered["personal"]["added_ids"][0]
+        if args.get("scope") not in (None, "project"):
+            raise MemoryError('scope is "personal" or "project"')
         return memory.add_note(args["text"], args["status"], args["evidence"], args["salience"], gist=args.get("gist"),
                                standing=args.get("standing", False))
     elif method == "dream":
@@ -3151,16 +3202,28 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             raise MemoryError(f"proposal_json is not valid JSON ({exc}); nothing committed") from None
         # A deep-sleep run commits while its session keeps recording: a live pass bound to the current head.
         live = memory.load().state["transcript_count"] if args.get("live") is True and writable and daydream is None else None
-        dream = memory.dream(parsed, partial=True, allow_empty=True, viewed_images=viewed,
-                             actions=options, snapshot=daydream if daydream is not None else live, usage=args.get("usage"),
-                             lenient_images=args.get("lenient_images") is True)
+        dream, layered = _dream_layered(memory, personal if daydream is None else None, parsed, partial=True,
+                                        allow_empty=True, viewed_images=viewed, actions=options,
+                                        snapshot=daydream if daydream is not None else live, usage=args.get("usage"),
+                                        lenient_images=args.get("lenient_images") is True)
         memory.clear_dream_cache()
-        return {**dream, **_dream_summary(dream)}
+        summary = {**dream, **_dream_summary(dream)}
+        if layered:
+            mine = layered["personal"]
+            summary["rejected"] = layered["rejected"]
+            summary["rejected_count"] = len(layered["rejected"])
+            if mine:
+                summary["personal"] = {**_dream_summary(mine), "added_ids": [PERSONAL + i for i in mine.get("added_ids", [])]}
+                summary["added_count"] = (summary.get("added_count") or 0) + (mine.get("added_count") or 0)
+        return summary
     elif method == "inject":
-        return memory.load().inject(args["index_bytes"], query=args.get("query", ""),
-                                    words=_index_word_names(args) if actions else None)
+        return _layered_index(memory.load(), personal, args["index_bytes"], query=args.get("query", ""),
+                              words=_index_word_names(args) if actions else None)
     elif method == "search":
-        return memory.load().search(args["query"], args["limit"])
+        query = args["query"]
+        if personal is not None and isinstance(query, str) and query.strip().startswith(PERSONAL):
+            return [_personal_record(r) for r in personal.load().search(query.strip()[len(PERSONAL):], args["limit"])]
+        return memory.load().search(query, args["limit"])
     elif method == "claims":
         return memory.load().claims_by_id(args.get("ids", []))
     elif method == "day_lessons":
@@ -3168,7 +3231,11 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
     elif method == "recall":
         memory.load()
         query, limit = args["query"], args["limit"]
-        return memory.recall_pages(query, limit) + memory.recall(query, limit)
+        hits = memory.recall_pages(query, limit) + memory.recall(query, limit)
+        if personal is not None:
+            personal.load()
+            hits += [_personal_claim(c) for c in personal.recall_pages(query, limit) + personal.recall(query, limit)]
+        return hits
     elif method == "action_list" and actions:
         return [{key: word[key] for key in ("name", "description", "params", "uses", "source")}
                 for word in memory.load().action_words().values()]
@@ -3226,10 +3293,18 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             raise MemoryError("count must be a transcript count")
         return memory.transcript[start:start + 64]
     elif method == "recent":
-        return _recent(memory.load(), args.get("include_images", False), viewed,
-                       record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
-                       record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES), head=daydream,
-                       related=args.get("related") is True)
+        recent = _recent(memory.load(), args.get("include_images", False), viewed,
+                         record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
+                         record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES), head=daydream,
+                         related=args.get("related") is True)
+        if personal is not None and daydream is None and args.get("related") is True:
+            # The night dream sees the personal claims these records touch (and every personal standing one), so it
+            # updates them instead of adding near-duplicates.
+            records = [memory._records_by_id[r["id"]] for r in recent["records"] if r["id"] in memory._records_by_id]
+            recent["claims"] = [*recent.get("claims", []),
+                                *(_personal_claim(c) for c in personal.load().related_claims(records))]
+            recent["personal"] = True
+        return recent
     elif method == "image":
         ref = args["ref"]
         memory.load()
@@ -3314,7 +3389,7 @@ def _dream_actions(args):
 
 
 def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=False, daydream=False,
-           session_label=None, peer=False):
+           session_label=None, peer=False, personal_path=None):
     def reply(request_id, **fields):
         print(json.dumps({"id": request_id, **fields}), flush=True)
 
@@ -3349,6 +3424,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
             except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                 reply(request_id, error=str(exc))
         return
+    personal = _open_personal(personal_path) if personal_path else None
     lease = _Lease(memory)
     slot = _SessionSlot(memory, session_label) if record else None
     try:
@@ -3384,7 +3460,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
             else:
                 context = base_context
             return {"writable": owner, **({"contributor": True} if joined else {}), **({"peer": True} if is_peer else {}),
-                    **({"others": slot.others()} if slot else {})}
+                    **({"others": slot.others()} if slot else {}), **({"personal": True} if personal else {})}
 
         result = role()
         reply(0, result={**result, **({"action_sync": synced} if synced else {})})
@@ -3405,7 +3481,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
                 result = _handle_request(memory, request["method"], request["args"], writable=owner, context=context,
                                          image_bytes=image_bytes, resize=resize, viewed=viewed,
                                          actions=actions, contributor=bool(record and not owner),
-                                         peer=bool(record and not owner and peer))
+                                         peer=bool(record and not owner and peer), personal=personal)
                 reply(request_id, result=result)
             except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                 reply(request_id, error=str(exc))
@@ -3417,6 +3493,133 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
                 memory.set_phase("closed", allow_same=True)
             slot.close()
         lease.close()
+
+
+def _personal_ids(text):
+    return _LOCAL_ID.sub(lambda m: PERSONAL + m[1], text)
+
+
+def _open_personal(path):
+    """The personal store: one memory of the user shared by all their projects. It records no sessions itself;
+    dreams copy into it the records its claims cite."""
+    workspace = pathlib.Path(path).expanduser()
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    memory = SomniMemory(workspace, PERSONAL_SUBJECT)
+    if not os.path.lexists(memory.store):
+        SomniMemory.create(workspace, PERSONAL_SUBJECT, "personal", "personal")
+    return memory
+
+
+def _layered_index(memory, personal, max_bytes, *, query="", words=None):
+    """The project's index with a personal section after its header: personal standing preferences first, then the
+    personal claims that best match the prompt, in up to a third of the space, named with p: IDs."""
+    if personal is None:
+        return memory.inject(max_bytes, query=query, words=words)
+    section = ""
+    budget = max_bytes // 3
+    if budget >= 256 and any(c["state"] == "active" for c in personal.load().claims.values()):
+        lines = personal.inject(budget, query=query).splitlines(keepends=True)
+        body = [line for line in lines if line.startswith(("- ", "How the user wants"))]
+        if body:
+            section = ("From the user's personal memory (shared by all their projects; IDs start with p:):\n"
+                       + _personal_ids("".join(body)))
+            while section and len(section.encode("utf-8")) > budget:
+                section = section[:section.rstrip("\n").rfind("\n") + 1]
+    project = memory.inject(max_bytes - len(section.encode("utf-8")), query=query, words=words)
+    if not section:
+        return project
+    lines = project.splitlines(keepends=True)
+    head = 0
+    while head < len(lines) and lines[head].startswith(("# Subject memory index", "Claims are interpretations", "Dates say")):
+        head += 1
+    return "".join(lines[:head]) + section + "".join(lines[head:])
+
+
+def _personal_record(record):
+    return {**record, "id": PERSONAL + record["id"]}
+
+
+def _personal_claim(claim):
+    """A personal claim or page as a project session sees it: IDs and evidence refs prefixed with p:."""
+    out = json.loads(_personal_ids(json.dumps(claim)))
+    return {**out, "personal": True}
+
+
+def _strip_personal(value):
+    if isinstance(value, str):
+        return value[len(PERSONAL):] if value.startswith(PERSONAL) else value
+    if isinstance(value, list):
+        return [_strip_personal(item) for item in value]
+    return value
+
+
+def _dream_layered(memory, personal, parsed, *, project_pass=True, **options):
+    """Apply a dream proposal across the project and personal stores. An operation goes to the personal store when
+    it says "scope": "personal" or targets a p: claim; the project records its evidence cites are copied there
+    first. The project pass is committed even when every operation went personal: it marks the records reviewed."""
+    operations = parsed.get("operations") if isinstance(parsed, dict) else None
+    if personal is None or not isinstance(operations, list):
+        if isinstance(operations, list) and any(isinstance(op, dict) and op.get("scope") == "personal" for op in operations):
+            raise MemoryError("personal memory is off in this session; leave out \"scope\": \"personal\"")
+        return memory.dream(parsed, **options), None
+    project_ops, personal_ops = [], []  # (original index, operation)
+    for index, op in enumerate(operations):
+        if not isinstance(op, dict):
+            project_ops.append((index, op))
+            continue
+        targets = [op.get("claim_id"), *(op.get("claim_ids") or [])]
+        mine = op.get("scope") == "personal" or any(isinstance(t, str) and t.startswith(PERSONAL) for t in targets)
+        if op.get("scope") not in (None, "personal", "project"):
+            raise MemoryError('scope is "personal" or "project"')
+        op = {key: value for key, value in op.items() if key != "scope"}
+        (personal_ops if mine else project_ops).append((index, op))
+    rejected = []
+    personal_pass = None
+    if personal_ops:
+        memory.load()
+        prepared = []
+        for index, op in personal_ops:
+            try:
+                op = {key: _strip_personal(value) if key in ("claim_id", "claim_ids", "claims", "links") else value
+                      for key, value in op.items()}
+                if isinstance(op.get("evidence"), list):
+                    local = [item for item in op["evidence"] if isinstance(item, dict)
+                             and isinstance(item.get("ref"), str) and not item["ref"].startswith(PERSONAL)]
+                    missing = [item["ref"] for item in local if item["ref"] not in memory._records_by_id]
+                    if missing:
+                        raise MemoryError(f"evidence reference {missing[0]!r} is missing or unknown")
+                    mapping = personal.import_records([memory._records_by_id[item["ref"]] for item in local],
+                                                      str(memory.store))
+                    op["evidence"] = [{**item, "ref": mapping.get(item.get("ref"), _strip_personal(item.get("ref")))}
+                                      if isinstance(item, dict) else item for item in op["evidence"]]
+                prepared.append((index, op))
+            except MemoryError as exc:
+                rejected.append({"index": index, "reason": f"personal: {str(exc)[:290]}"})
+        if prepared:
+            try:
+                personal_pass = personal.dream({"schema": 1, "operations": [op for _, op in prepared]}, partial=True,
+                                               viewed_images=options.get("viewed_images"))
+                rejected += [{"index": prepared[r["index"]][0], "reason": f"personal: {r['reason']}"}
+                             for r in personal_pass.get("rejected", [])]
+            except MemoryError as exc:
+                rejected += [{"index": index, "reason": f"personal: {str(exc)[:290]}"} for index, _ in prepared]
+    if personal_ops and personal_pass is None and not project_ops:
+        raise MemoryError(f"nothing committed: all {len(personal_ops)} personal operation(s) were rejected. "
+                          + "; ".join(f"op {r['index']}: {r['reason']}" for r in rejected)[:1500])
+    layered = {"personal": personal_pass}
+    if not project_pass:  # a daytime personal note: the project's session is still open
+        return None, {**layered, "rejected": rejected}
+    try:
+        committed = memory.dream({"schema": 1, "operations": [op for _, op in project_ops]},
+                                 **{**options, "allow_empty": True})
+        rejected += [{"index": project_ops[r["index"]][0], "reason": r["reason"]} for r in committed.get("rejected", [])]
+    except MemoryError as exc:
+        if personal_pass is None or not str(exc).startswith("nothing committed"):
+            raise
+        # The personal operations stand. Commit an empty project pass so the records count as reviewed.
+        rejected += [{"index": index, "reason": f"project: {str(exc)[:290]}"} for index, _ in project_ops]
+        committed = memory.dream({"schema": 1, "operations": []}, **{**options, "allow_empty": True})
+    return committed, {**layered, "rejected": sorted(rejected, key=lambda r: r["index"])}
 
 
 def _validate_index_request(bound, query=""):
@@ -3499,6 +3702,7 @@ def parser():
     serve.add_argument("--run-label")
     serve.add_argument("--tags", default="[]")
     serve.add_argument("--session-label", help="tag for this session's records when another session owns recording")
+    serve.add_argument("--personal", help="the personal store's workspace (one memory of the user for all projects)")
     serve.add_argument("--peer", action="store_true", help="when another session owns recording, record as the user's "
                        "own session (tag session:LABEL; may save notes) rather than as a contributor such as a sub-agent")
     serve.add_argument("--image-bytes", type=int, default=DEFAULT_IMAGE_BYTES)
@@ -3530,7 +3734,8 @@ def main():
         if args.command == "serve":
             _serve(memory, args.record, context=_record_context(args.run_label, json.loads(args.tags)),
                    image_bytes=args.image_bytes, image_max_edge=args.image_max_edge,
-                   actions=args.actions, daydream=args.daydream, session_label=args.session_label, peer=args.peer)
+                   actions=args.actions, daydream=args.daydream, session_label=args.session_label, peer=args.peer,
+                   personal_path=args.personal)
         elif args.command == "session-open":
             memory.set_phase("open"); print("LAYERED_MEMORY_SESSION_OPEN")
         elif args.command == "session-close":

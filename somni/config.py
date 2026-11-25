@@ -62,6 +62,10 @@ SETTINGS = (
     Setting("store.python", "SOMNI_PYTHON", "str", "python3",
             "Interpreter for the backend. The config files themselves are read with `SOMNI_PYTHON` from the "
             "environment, or `python3`"),
+    Setting("personal.path", "SOMNI_PERSONAL", "str", "auto",
+            "Your personal memory, shared by every project: lessons about you (preferences, how you work) that dreams "
+            "file there instead of the project's store. `auto` is `~/.somni` in interactive Pi and off in scripted "
+            "runs (print, JSON or RPC mode); `none` turns it off; a path uses that store everywhere"),
     Setting("index.bytes", "SOMNI_INJECT_BYTES", "int", 4096, "Size of the memory index injected before each prompt",
             256, 8192),
     Setting("recording.tool_result_bytes", "SOMNI_TOOL_RESULT_BYTES", "int", 4096,

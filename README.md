@@ -75,6 +75,8 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
 - **[Memory over time](docs/memory-over-time.md).** Dated records; a fact that changed is kept as history (`update`)
   rather than treated as a mistake; claims fade from fresh to faint unless they are used; and after a month, old raw
   transcript keeps only a stub with its cited quotes.
+- **[Personal memory](docs/everyday-use.md#your-personal-memory-across-projects).** Lessons about you go to `~/.somni`
+  and follow you into every project; lessons about the project stay in it.
 - **[Standing preferences](docs/everyday-use.md#preferences-that-always-apply).** Say once how you like work done ("I
   like 2-space indents") and it heads every later session's index, whatever the task.
 - **[Outcomes](docs/outcomes.md).** `somni outcome` records what happened after the agent was done (a CI failure, a

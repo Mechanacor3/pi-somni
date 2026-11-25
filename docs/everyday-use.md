@@ -145,15 +145,32 @@ A daydream runs in a separate Pi process and never blocks your session. The next
 shows a one-line notice of what it added. It is experimental. A night `/somni-dream` and
 `/somni-wiki` are still worth running.
 
-## One memory across projects
+## Your personal memory, across projects
 
-To share one memory across several projects, point them all at the same store:
+Each project has its own memory (`.pi/somni`). Beside it, interactive Pi keeps a **personal memory** in `~/.somni`:
+what Somni learns about *you*, shared by every project. When the night dream finds a lesson about you ("likes 2-space
+indents", "wants the diff before any change", "is in Berlin"), it files it there; lessons about the project ("deploys
+from `release/*`") stay in the project. The agent can also save a note there straight away (`somni_note` with
+`"scope": "personal"`).
+
+The index shows both: after its header, a section "From the user's personal memory" with your
+[standing preferences](#preferences-that-always-apply) first, then the personal notes that match the prompt, in up
+to a third of the space. Personal IDs start with `p:` (`p:n000004`, `p:t000012`); `somni_recall` and `somni_search`
+find them too.
+
+A personal note still quotes what was said. Somni copies the project records it cites into the personal memory, each
+naming the store and record it came from, so the quotes check out there. The rest of the project's transcript stays
+in the project.
 
 ```yaml
 # ~/.config/somni/somni.conf
-store:
-  path: ~/.local/share/somni
+personal:
+  path: ~/.somni      # the default in interactive Pi; `none` turns it off
 ```
+
+Scripted runs (print, JSON or RPC mode: benchmarks, sub-agents) don't use it unless `personal.path` names a store.
+Daydreams leave it alone; the night dream files into it. To share one whole memory across projects instead, point
+them all at the same `store.path`.
 
 Several Pi sessions can use one store at once: each records into it, and what you say in any of
 them counts. One of them owns the store and runs its dreams; see

@@ -576,6 +576,42 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(SomniMemory(store, "pi").load().state["phase"], "closed")  # the last one out closes it
         self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port)  # tearDown closes it
 
+    def test_a_personal_note_made_in_one_project_heads_another_projects_index(self):
+        home = self.work / "home-somni"
+        other = self.work / "other-project"
+        other.mkdir()
+        self.pi.close()
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={"SOMNI_PERSONAL": str(home)})
+        note = {**PLANS["From now on"][0][0][1], "scope": "personal"}
+        with patch.dict(PLANS, {"From now on": [[("somni_note", note)]]}):
+            self.pi.prompt("From now on: I like 2-space indents.")
+        end = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_note")
+        self.assertFalse(end.get("isError"), end)
+        self.assertIn("p:n000001", text_of(end["result"]["content"]))
+        self.assertEqual(SomniMemory(self.work / ".pi" / "somni", "pi").load().claims, {})  # nothing in the project
+        dream = [[("somni_dream", {"proposal_json": json.dumps({"schema": 1, "operations": [
+            {"op": "add", "scope": "personal", "text": "Keep replies short.", "status": "uncertain", "salience": 3,
+             "evidence": [{"ref": "t000001"}]}]})})]]
+        with patch.dict(PLANS, {"Dream pass.": dream}):
+            self.pi.prompt("/somni-dream")
+            self.pi.read(lambda r: r.get("type") == "agent_settled")
+        end = [e for e in self.pi.tool_ends() if e["toolName"] == "somni_dream"][-1]
+        self.assertFalse(end.get("isError"), end)
+        prompt = next(text_of(m.get("content")) for m in self.upstream.requests[-2]["messages"]
+                      if text_of(m.get("content")).startswith("Dream pass."))
+        self.assertIn("Two memories: this project's, and the user's personal memory", prompt)
+        self.assertIn("p:n000001", prompt)  # the standing personal claim, so the dream can update it
+        self.assertEqual(sorted(SomniMemory(home, "personal").load().claims), ["n000001", "n000002"])
+        self.assertEqual(len(SomniMemory(self.work / ".pi" / "somni", "pi").load().dreams), 1)  # records reviewed
+        there = PiSession("extensions/somni.ts", other, self.upstream.port, env={"SOMNI_PERSONAL": str(home)})
+        try:
+            there.prompt("What is the fee to cancel economy fare 300?")
+            sent = json.dumps(self.upstream.requests[-1]["messages"])
+            self.assertIn("From the user's personal memory", sent)
+            self.assertIn("p:n000001 [standing; evidence=p:t000001] Indent code with 2 spaces.", sent)
+        finally:
+            there.close()
+
     def test_recall_after_restart(self):
         self.pi.prompt("What is the fee to cancel economy fare 300?")
         self.pi.prompt("Remember that for later.")

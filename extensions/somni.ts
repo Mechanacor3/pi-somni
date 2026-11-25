@@ -37,6 +37,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Backend } from "./backend.ts";
@@ -191,6 +192,13 @@ const STANDING_GUIDE = "Standing preferences: when the user says how they want w
 	"update or merge one rather than adding a near-duplicate. When the user changes a preference, update it (it stays " +
 	"standing); when it no longer applies, update it with \"standing\": false or retract it. ";
 
+/** Which store a lesson belongs in, when a personal store sits beside the project's. */
+const SCOPE_GUIDE = "Two memories: this project's, and the user's personal memory, shared by all their projects " +
+	"(its claims and records have IDs starting p:). Add \"scope\": \"personal\" to an add for a lesson about the user " +
+	"that holds in any project: their preferences, how they like to work and be told things, facts about them. Lessons " +
+	"about this project, its code, tools and people stay here (leave scope out). Cite this project's records as usual; " +
+	"Somni copies them into the personal memory. To correct, update, merge or retract a personal claim, use its p: ID. ";
+
 /** Keeps Somni's own machinery out of daytime memory. Kept in step with SELF_GUIDE in somni/dream.py. */
 const SELF_GUIDE = "Somni's own machinery is not the user's work. Don't write claims about how dreams, action words or " +
 	"rpc.TOOL calls work: every dream gets those instructions fresh, and in the daytime they confuse the agent about " +
@@ -273,6 +281,7 @@ const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
 	contributor: false, // another session owns recording; this one appends its records beside it (a sub-agent, say)
 	peer: false, // ...as another session of the user's: its records are the user's own, and it may save notes
+	personal: false, // a personal store (one memory of the user for all projects) sits beside the project's
 	backend: undefined as Backend | undefined,
 	recordWarning: false, indexWarning: false,
 	words: new Map<string, string>(), // registered action word -> source
@@ -377,6 +386,14 @@ async function refreshRole(ctx?: ExtensionContext) {
 	state.writable = role.writable;
 	state.contributor = Boolean(role.contributor);
 	state.peer = Boolean(role.peer);
+}
+
+/** The personal store's workspace for this session, or undefined when personal memory is off. */
+function personalPath(ctx: ExtensionContext) {
+	const value = (process.env.SOMNI_PERSONAL ?? "auto").trim();
+	if (!value || value === "none" || (value === "auto" && ctx.mode !== "tui")) return undefined;
+	const path = value === "auto" ? "~/.somni" : value;
+	return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(2)) : resolve(ctx.cwd, path);
 }
 
 /** A second session of the user's (interactive Pi) is a peer; a scripted one, such as a sub-agent, is a contributor. */
@@ -1004,7 +1021,7 @@ ${candidateGuide(candidates)}`;
 				}
 				const when = timeClause(h.strength, h.history);
 				const outcomes = h.outcome_evidence?.length ? `; outcome-backed (${h.outcome_evidence.join(", ")})` : "";
-				return `${h.id} [${h.status}${h.standing ? ", standing" : ""}; ${h.evidence.length} cited${outcomes}${lineage}${when ? `; ${when}` : ""}]${contextLabel(h)} ${h.text}`;
+				return `${h.id} [${h.personal ? "personal, " : ""}${h.status}${h.standing ? ", standing" : ""}; ${h.evidence.length} cited${outcomes}${lineage}${when ? `; ${when}` : ""}]${contextLabel(h)} ${h.text}`;
 			});
 			return { content: asText(limit.note + (lines.join("\n\n") || "no matching memory")), details: hits };
 		},
@@ -1047,13 +1064,16 @@ ${candidateGuide(candidates)}`;
 			"or the image_sha256 of a stored image from each record. Use 'uncertain' for interpretations. Salience 1-5. " +
 			"For longer claims, an optional one-line gist of up to 160 UTF-8 bytes appears in the memory index. " +
 			"Set standing: true when the user tells you how they want work done from now on (\"I like 2-space indents\"): " +
-			"it then heads every later session's index. Cite the user's message as evidence; not for one-off requests.",
+			"it then heads every later session's index. Cite the user's message as evidence; not for one-off requests. " +
+			"Set scope: \"personal\" for something about the user that holds in every project (when the index shows a " +
+			"personal memory); leave it out for this project's facts.",
 		parameters: Type.Object({
 			text: Type.String(),
 			gist: Type.Optional(Type.String({ maxLength: 160 })),
 			status: Type.Union([Type.Literal("verified"), Type.Literal("uncertain")]),
 			salience: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
 			standing: Type.Optional(Type.Boolean()),
+			scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("personal")])),
 			evidence: Evidence,
 		}),
 		async execute(_id: string, params: any) {
@@ -1068,7 +1088,8 @@ ${candidateGuide(candidates)}`;
 		description:
 			"Only during /somni-dream or /somni-wiki: submit one consolidation pass as JSON text " +
 			'{"schema":1,"operations":[...]} with add/correct/update/merge/retract/promote claim operations (add/correct/update/merge take an optional ' +
-			'"standing": true for a lasting preference of the user\'s) and page/drop_page wiki ' +
+			'"standing": true for a lasting preference of the user\'s, and "scope": "personal" for a lesson about the user ' +
+			'that belongs in their personal memory) and page/drop_page wiki ' +
 			'operations. A merge takes {"op":"merge","claim_ids":["n000001","n000002"],"text":"combined guidance"} and inherits their evidence. ' +
 			"Use update (fields as correct) when the world changed since a claim was true; it keeps the old claim as history " +
 			"and needs evidence newer than the old claim's. Use correct when the claim was wrong." +
@@ -1191,7 +1212,7 @@ ${candidateGuide(candidates)}`;
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
 				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
-				actionsGuide + TIME_GUIDE + STANDING_GUIDE + SELF_GUIDE + (recent.records.some((r) => r.source === "outcome") ? OUTCOME_GUIDE : "") +
+				actionsGuide + TIME_GUIDE + STANDING_GUIDE + (state.personal ? SCOPE_GUIDE : "") + SELF_GUIDE + (recent.records.some((r) => r.source === "outcome") ? OUTCOME_GUIDE : "") +
 				`Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				relatedClaims(recent.claims) +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +
@@ -1312,7 +1333,7 @@ ${candidateGuide(candidates)}`;
 		}
 		const workspace = process.env.SOMNI_WORKSPACE ?? join(ctx.cwd, ".pi", "somni");
 		state.dream = undefined;
-		state.writable = state.contributor = state.peer = state.recordWarning = state.indexWarning = false;
+		state.writable = state.contributor = state.peer = state.personal = state.recordWarning = state.indexWarning = false;
 		state.wordCalls.clear();
 		state.wordTimings.clear();
 		state.wordGuideShown = false;
@@ -1327,6 +1348,8 @@ ${candidateGuide(candidates)}`;
 		if (process.env.SOMNI_TAGS !== undefined) args.push(`--tags=${process.env.SOMNI_TAGS}`);
 		args.push(`--session-label=${ctx.sessionManager.getSessionId().slice(0, 36)}`);
 		if (isPeer(ctx)) args.push("--peer");
+		const personal = DAYDREAM_CHILD ? undefined : personalPath(ctx);
+		if (personal) args.push(`--personal=${personal}`);
 		if (RECORD && !DAYDREAM_CHILD) args.push("--record");
 		if (DAYDREAM_CHILD) args.push("--daydream");
 		if (ACTIONS) args.push("--actions");
@@ -1338,8 +1361,9 @@ ${candidateGuide(candidates)}`;
 			notify(ctx, `Somni backend stopped. ${error.message}`);
 		});
 		try {
-			const { writable, contributor, peer, action_sync: synced } =
-				await backend.ready as { writable: boolean; contributor?: boolean; peer?: boolean; action_sync?: any };
+			const { writable, contributor, peer, personal: layered, action_sync: synced } = await backend.ready as
+				{ writable: boolean; contributor?: boolean; peer?: boolean; personal?: boolean; action_sync?: any };
+			state.personal = Boolean(layered);
 			state.backend = backend;
 			state.writable = writable;
 			state.contributor = Boolean(contributor);
@@ -1418,7 +1442,7 @@ ${candidateGuide(candidates)}`;
 		const notice = day.notice ? `${day.notice}${lessons}\n\n` : "";
 		day.notice = "";
 		day.lessons = "";
-		if (!/^-(?: n\d{6} | page `| word `)/m.test(index)) {
+		if (!/^-(?: (?:p:)?n\d{6} | page `| word `)/m.test(index)) {
 			return notice ? { message: { customType: "somni-index", content: notice.trim(), display: false } } : undefined;
 		}
 		let guide = "";
