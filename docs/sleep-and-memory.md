@@ -133,6 +133,15 @@ records that may contradict them. It has to choose: did the world change (`updat
 until then), or was the claim wrong (`correct` or `retract`)? An update must cite a record newer than all of the old
 claim's evidence. That is the mismatch that, in reconsolidation, opens a memory to change.
 
+### Outcomes: feedback from outside
+
+Feedback teaches the most when it contradicts a confident answer. Errors made with high confidence are corrected more
+often than low-confidence ones once the right answer is shown, the *hypercorrection effect* (Butterfield & Metcalfe,
+2001). [Outcomes](outcomes.md) give Somni that feedback: what happened after the agent was done, recorded from
+outside. A dream sees each one beside the agent's own report, flagged when the agent claimed success and the outcome
+says it failed. They are also a source distinction (Johnson, Hashtroudi & Lindsay, 1993): what the agent concluded is
+kept apart from what the world said.
+
 ## Action words, habits, tricks and reflexes
 
 Somni's learned procedures go by several names: action words, habits, tricks, reflexes. They are interchangeable and
@@ -158,6 +167,8 @@ enough to need no thought", which is what a word that chains tool calls back to 
 - Bjork, R. A., & Bjork, E. L. (1992). A new theory of disuse and an old theory of stimulus fluctuation. In A. F.
   Healy, S. M. Kosslyn & R. M. Shiffrin (Eds.), *From learning processes to cognitive processes* (Vol. 2, pp. 35–67).
   Erlbaum.
+- Butterfield, B., & Metcalfe, J. (2001). Errors committed with high confidence are hypercorrected. *Journal of
+  Experimental Psychology: Learning, Memory, and Cognition*, 27, 1491–1494.
 - Cai, D. J., Mednick, S. A., Harrison, E. M., Kanady, J. C., & Mednick, S. C. (2009). REM, not incubation, improves
   creativity by priming associative networks. *PNAS*, 106, 10130–10134.
 - Christoff, K., Irving, Z. C., Fox, K. C. R., Spreng, R. N., & Andrews-Hanna, J. R. (2016). Mind-wandering as

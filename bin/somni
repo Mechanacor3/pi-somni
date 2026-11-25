@@ -2,6 +2,8 @@
 """somni: offline tools for a Somni memory setup.
 
     somni doctor [--cwd DIR] [--all] [--json]   check settings, runtime and the store
+    somni outcome --text TEXT [--verdict pass|fail|mixed] [--by WHO] [--run-label LABEL] [--image FILE] [--cwd DIR]
+                                                record what happened afterwards, from outside the agent
     somni config template                       print a commented config file with every setting
     somni config show [--cwd DIR]               print every setting's value and where it came from
     somni config table                          print the settings table in docs/settings.md
@@ -13,6 +15,31 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+def outcome(argv):
+    import argparse
+    import os
+    from somni import config as C
+    from somni import store as S
+    ap = argparse.ArgumentParser(prog="somni outcome", description="Record an outcome from outside the agent: a "
+                                 "verdict, CI or test output, a review comment, what the user found afterwards.")
+    ap.add_argument("--cwd", default=os.getcwd(), help="the directory Pi starts in (default: here)")
+    S.outcome_arguments(ap)
+    args = ap.parse_args(argv)
+    values = {key: item["value"] for key, item in C.resolve(pathlib.Path(args.cwd).resolve(), dict(os.environ))["settings"].items()}
+    workspace = pathlib.Path(values["store.path"])
+    if not (workspace / S.STORE_DIR).is_dir():
+        print(f"somni: no store at {workspace}; the first Pi session creates it", file=sys.stderr)
+        return 2
+    if args.image_bytes == S.DEFAULT_IMAGE_BYTES:
+        args.image_bytes = values["recording.image_bytes"]
+    try:
+        print(S.record_outcome_from_args(S.SomniMemory(workspace, values["store.subject"]), args))
+    except (S.MemoryError, OSError) as exc:
+        print(f"somni: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -21,6 +48,8 @@ def main(argv):
     if command == "doctor":
         from somni import doctor
         return doctor.main(rest)
+    if command == "outcome":
+        return outcome(rest)
     if command == "config":
         from somni import config
         if rest[:1] == ["show"]:

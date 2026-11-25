@@ -587,6 +587,34 @@ class SomniPiEndToEnd(unittest.TestCase):
                         recall)
         self.assertIn("n000001 [PAST: true until 2026-01-05; now n000002; verified] Pens are blue.", recall)
 
+    def test_an_outcome_from_outside_the_agent_sits_beside_the_report_it_judges_in_the_dream(self):
+        self.pi.close()
+        store = self.work / "outcome-memory"
+        store.mkdir()
+        memory = SomniMemory.create(store, "pi", "test", "outcome")
+        memory.set_phase("open")
+        memory.record_many([("agent_output", "AGENT: DONE — placed four dirt blocks in a straight line")],
+                           context={"run_label": "try-1"})
+        memory.set_phase("closed")
+        verdict = memory.record_outcome("no line of four", by="grader", verdict="fail", run_label="try-1")
+        lesson = {"op": "add", "text": "Before reporting a line done, check the whole line, not the placement counter.",
+                  "status": "verified", "salience": 4,
+                  "evidence": [{"ref": "t000001", "quote": "DONE — placed four"}, {"ref": verdict, "quote": "no line of four"}]}
+        self.upstream.script = plan_script({"Dream pass.": [[("somni_dream", {"proposal_json": json.dumps(
+            {"schema": 1, "operations": [lesson]})})]], "Recall the line": [[("somni_recall", {"query": "line placement counter"})]]})
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={"SOMNI_WORKSPACE": store.name})
+        self.pi.prompt("/somni-dream")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        messages = [text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]]
+        prompt = next(m for m in messages if m.startswith("Dream pass."))
+        self.assertIn("OUTCOME records come from outside the agent", prompt)
+        self.assertIn("[t000002] (OUTCOME, from outside the agent; by grader; verdict fail) [run: try-1] no line of four\n"
+                      "    judges the agent's report [t000001]: AGENT: DONE — placed four dirt blocks in a straight line\n"
+                      "    The agent reported success; this outcome says it failed.", prompt)
+        self.pi.prompt("Recall the line")
+        recall = text_of(next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_recall")["result"]["content"])
+        self.assertIn("n000001 [verified; 2 cited; outcome-backed (t000002)] [run: try-1]", recall)
+
     def test_wiki_pass_accepts_cycles_and_receives_custom_page_guide(self):
         self.pi.close()
         guide = "Describe terrain cues and where to aim."

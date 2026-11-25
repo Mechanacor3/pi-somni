@@ -86,7 +86,28 @@ TIME_GUIDE = ("Records are dated (day headers in the listing). When a record dis
               "until a newer record changes it.")
 
 
-def render_records(records, max_chars=2_400):
+OUTCOME_GUIDE = ("OUTCOME records come from outside the agent, after the fact: a grader, CI or tests, a reviewer, the "
+                 "user. About whether something worked they outrank the agent's own reports and its counters; when they "
+                 "disagree, the outcome is right, and a claim about the result should cite the outcome (an exact quote "
+                 "from it can be verified). Each outcome shows the agent's report it judges. When the agent said it was "
+                 "done and the outcome says it failed, that pair is the most useful thing to learn from: write what the "
+                 "agent should have checked before reporting success, citing both records.")
+
+
+def describe_outcome(record, report=None):
+    """The label and the paired agent report for an outcome record in a dream listing."""
+    details = record.get("outcome", {})
+    label = "; ".join(filter(None, ["OUTCOME, from outside the agent", details.get("by") and f"by {details['by']}",
+                                    details.get("verdict") and f"verdict {details['verdict']}"]))
+    pair = ""
+    if report:
+        pair = f"\n    judges the agent's report [{report['ref']}]: {report['text']}"
+        if report.get("overclaim"):
+            pair += "\n    The agent reported success; this outcome says it failed."
+    return label, pair
+
+
+def render_records(records, max_chars=2_400, memory=None):
     lines = []
     day = None
     for record in records:
@@ -96,7 +117,12 @@ def render_records(records, max_chars=2_400):
         text = record["text"]
         if len(text) > max_chars:
             text = text[:max_chars] + " …[truncated]"
-        lines.append(f"[{record['id']}] ({record['source']}) {text}")
+        source, pair = record["source"], ""
+        if source == "outcome":
+            report = record.get("report") or (memory.outcome_report(record) if memory is not None else None)
+            source, pair = describe_outcome(record, report)
+        run = f" [run: {record['run_label']}]" if record.get("run_label") else ""
+        lines.append(f"[{record['id']}] ({source}){run} {text}{pair}")
     return "\n".join(lines)
 
 
@@ -131,8 +157,9 @@ def dream_pass(memory, records, complete, *, focus=DEFAULT_FOCUS, max_ops=12, re
     proposal; the trace says what happened.
     """
     prompt = prompt_override or (f"Focus: {focus}.\n\n## Current claims\n{render_claims(memory)}\n\n"
-                                 f"## Transcript window\n{render_records(records)}\n")
-    system = SYSTEM.replace("{max_ops}", str(max_ops)).replace("{time_guide}", TIME_GUIDE)
+                                 f"## Transcript window\n{render_records(records, memory=memory)}\n")
+    guide = TIME_GUIDE + ("\n" + OUTCOME_GUIDE if any(r.get("source") == "outcome" for r in records) else "")
+    system = SYSTEM.replace("{max_ops}", str(max_ops)).replace("{time_guide}", guide)
     trace = {"window": [records[0]["id"], records[-1]["id"]] if records else None, "attempts": []}
     for attempt in range(retries + 1):
         try:

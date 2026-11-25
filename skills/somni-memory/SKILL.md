@@ -19,10 +19,12 @@ Before each user prompt you get a short index, headed "Subject memory index". It
   `somni_search` or `somni_recall`.
 - Prefer what the user says now. If they contradict a memory, follow them and note the change.
 - `uncertain` entries are interpretations. `verified` ones quote what was actually seen.
-- `fading` or `faint` means a memory hasn't been seen or used for a while. It may still be right, but things
-  change: check it before you rely on it.
+- `as of 2026-10-02` (and `faint`) means a memory hasn't been seen or used for a while. Unless something newer
+  says otherwise, it is still the latest you know: use it and give its date.
 - `since 2026-11-20; before that: ...` means the fact changed. Use the current one. `somni_recall` also returns
   past versions, marked `PAST: true until <date>`, for questions about how things were.
+- "Outcomes since the last dream" are reports from outside you: CI, a reviewer, a grader, the user afterwards. On
+  whether earlier work succeeded, they outrank what you reported at the time. `outcome-backed` claims cite one.
 
 ## Looking things up
 

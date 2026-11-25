@@ -160,9 +160,10 @@ const Evidence = Type.Array(Type.Object({
 }), { minItems: 1, maxItems: 16 });
 
 type RecordContext = { tags?: string[]; run_label?: string; run_labels?: string[] };
+type OutcomeReport = { ref: string; text: string; claimed_success: boolean; overclaim: boolean };
 type TranscriptRecord = RecordContext & {
 	id: string; source: string; text: string; at?: string; tool_ok?: boolean; images?: { sha256: string }[];
-	omitted_images?: number;
+	omitted_images?: number; outcome?: { by?: string; verdict?: string }; report?: OutcomeReport;
 };
 type Strength = { level: "fresh" | "fading" | "faint"; activation: number; last_used?: string; first_seen?: string };
 type PastVersion = { id: string; text: string; until_ref?: string; until?: string | null };
@@ -178,6 +179,14 @@ const TIME_GUIDE = "Records are dated (the --- day --- lines). When a record dis
 	"since when in the text. Age is not doubt: never write 'verify before relying', 'may be stale' or 'check the files " +
 	"first' into a claim that nothing has contradicted. Date it instead ('as of 2026-01-12'); it stays the best " +
 	"information until a newer record changes it. ";
+
+/** How a dream should weigh outcomes from outside the agent. Kept in step with OUTCOME_GUIDE in somni/dream.py. */
+const OUTCOME_GUIDE = "OUTCOME records come from outside the agent, after the fact: a grader, CI or tests, a reviewer, the " +
+	"user. About whether something worked they outrank the agent's own reports and its counters; when they disagree, " +
+	"the outcome is right, and a claim about the result should cite the outcome (an exact quote from it can be " +
+	"verified). Each outcome shows the agent's report it judges. When the agent said it was done and the outcome says " +
+	"it failed, that pair is the most useful thing to learn from: write what the agent should have checked before " +
+	"reporting success, citing both records. ";
 
 /** Lines for `records` with a `--- YYYY-MM-DD ---` header wherever the day changes. */
 function withDays(records: TranscriptRecord[], render: (record: TranscriptRecord) => string) {
@@ -431,6 +440,14 @@ function describeRecord(record: TranscriptRecord, chars = record.text.length) {
 	const omitted = record.omitted_images ? ` [${record.omitted_images} image(s) omitted by storage limits or format]` : "";
 	const excerpt = record.text.length > chars ? `${record.text.slice(0, chars)} [excerpt truncated]` : record.text;
 	const status = record.tool_ok === undefined ? "" : record.tool_ok ? " [tool ok]" : " [tool error]";
+	if (record.source === "outcome") {
+		const { by, verdict } = record.outcome ?? {};
+		const label = ["OUTCOME, from outside the agent", by && `by ${by}`, verdict && `verdict ${verdict}`].filter(Boolean).join("; ");
+		const report = record.report;
+		const pair = report ? `\n    judges the agent's report [${report.ref}]: ${report.text}` +
+			(report.overclaim ? "\n    The agent reported success; this outcome says it failed." : "") : "";
+		return `[${record.id}] (${label})${contextLabel(record)} ${excerpt}${images}${omitted}${pair}`;
+	}
 	return `[${record.id}] (${record.source})${status}${contextLabel(record)} ${excerpt}${images}${omitted}`;
 }
 
@@ -937,7 +954,8 @@ ${candidateGuide(candidates)}`;
 					return `${h.id} [PAST: true until ${until}; now ${h.superseded_by}; ${h.status}]${contextLabel(h)} ${h.text}`;
 				}
 				const when = timeClause(h.strength, h.history);
-				return `${h.id} [${h.status}; ${h.evidence.length} cited${lineage}${when ? `; ${when}` : ""}]${contextLabel(h)} ${h.text}`;
+				const outcomes = h.outcome_evidence?.length ? `; outcome-backed (${h.outcome_evidence.join(", ")})` : "";
+				return `${h.id} [${h.status}; ${h.evidence.length} cited${outcomes}${lineage}${when ? `; ${when}` : ""}]${contextLabel(h)} ${h.text}`;
 			});
 			return { content: asText(limit.note + (lines.join("\n\n") || "no matching memory")), details: hits };
 		},
@@ -1119,7 +1137,8 @@ ${candidateGuide(candidates)}`;
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
 				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
-				actionsGuide + TIME_GUIDE + `Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
+				actionsGuide + TIME_GUIDE + (recent.records.some((r) => r.source === "outcome") ? OUTCOME_GUIDE : "") +
+				`Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				relatedClaims(recent.claims) +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +
 					`use somni_recall to see what they produced and somni_search if you need one of them.\n\n` : "") +

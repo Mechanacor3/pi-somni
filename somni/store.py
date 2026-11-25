@@ -121,7 +121,14 @@ MAX_CACHE_TEXT = 8_192
 MAX_ACTION_TOOLS = 256
 MAX_ACTION_TOOL_SCHEMA_BYTES = 4096
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
-SOURCES = {"ordinary_observation", "tool_result", "agent_output"}
+SOURCES = {"ordinary_observation", "tool_result", "agent_output", "outcome"}
+# An outcome is evidence from outside the agent, added afterwards by a harness or a person: a grader's verdict, CI or
+# test output, a review comment, the user's "that didn't work". Only `record_outcome` writes one, never a session.
+OUTCOME_VERDICTS = ("pass", "fail", "mixed")
+OUTCOME_SCAN = 400  # records before an outcome searched for the agent report it judges
+OUTCOME_REPORT_CHARS = 400
+SUCCESS_CLAIM = re.compile(r"\b(done|fixed|finished|completed?|succeed(?:s|ed)?|success(?:ful(?:ly)?)?|passe[sd]|"
+                           r"(?:tests?|checks?|it) pass|works|resolved|solved)\b|\u2705|\u2713", re.I)
 STATUSES = {"verified", "uncertain"}
 FILES = ("manifest.json", "state.json", "transcript.jsonl", "notes.jsonl", "dreams.jsonl", "memory.lock")
 VERIFIED_FILES = (*FILES, "wiki.jsonl", ".transaction.json")
@@ -1495,7 +1502,7 @@ class SomniMemory:
 
     def record_many(self, items, *, context=None, images=(), omitted_images=0, clip=False,
                     image_bytes=DEFAULT_IMAGE_BYTES, resize=None, tool_ok=None, calls=None, via_word=None,
-                    word_stamp=None):
+                    word_stamp=None, outcome=None):
         """Append several (source, text) records under one lock.
 
         `calls` ([{tool, ok, start_ms, ms}]) times an action word's nested calls on the word's own result.
@@ -1520,18 +1527,23 @@ class SomniMemory:
         for source, text in items:
             if not isinstance(source, str) or source not in SOURCES:
                 raise MemoryError("invalid transcript source")
+        is_outcome = items[0][0] == "outcome"
+        if any(source == "outcome" for source, _ in items) and (len(items) != 1 or not isinstance(outcome, dict)):
+            raise MemoryError("outcomes are recorded one at a time, with record_outcome")
+        if outcome is not None and not is_outcome:
+            raise MemoryError("outcome details need an outcome record")
         with self._locked():
             self._load_locked()
             max_bytes = self._limit("max_record_bytes")
             if any(not isinstance(text, str) or not text.strip() or (not clip and len(text.encode("utf-8")) > max_bytes)
                    for _, text in items):
                 raise MemoryError("transcript text is empty or too large")
-            if self.state["phase"] != "open":
+            if self.state["phase"] != "open" and not is_outcome:  # an outcome arrives after the session, often
                 raise MemoryError("recording requires an open subject session")
             if self.state["transcript_count"] + len(items) > self._limit("max_transcript_records"):
                 raise MemoryError("transcript record limit reached; seal the bounded attempt")
-            if (images or omitted_images) and (len(items) != 1 or items[0][0] != "tool_result"):
-                raise MemoryError("images can only attach to one tool result at a time")
+            if (images or omitted_images) and (len(items) != 1 or items[0][0] not in ("tool_result", "outcome")):
+                raise MemoryError("images can only attach to one tool result or outcome at a time")
             attachments = []
             for image in images:
                 decoded = _image_bytes(image, image_bytes, resize)
@@ -1556,6 +1568,8 @@ class SomniMemory:
                     record["via_word"] = via_word
                 if word_stamp:
                     record["word"] = word_stamp
+                if is_outcome:
+                    record["outcome"] = outcome
                 if attachments:
                     record["images"] = attachments
                 if omitted_images:
@@ -1570,6 +1584,71 @@ class SomniMemory:
             self.transcript.extend(records)
             self._records_by_id.update(zip(ids, records))
         return ids
+
+    def record_outcome(self, text, *, by=None, verdict=None, run_label=None, tags=None, images=(),
+                       image_bytes=DEFAULT_IMAGE_BYTES, resize=None):
+        """Record what happened from outside the agent: a verdict, CI or test output, a review, the user's report.
+
+        Works with or without an open session. ``run_label`` names the run it concerns, matching that run's records
+        (SOMNI_RUN_LABEL); ``by`` says who reported it (grader, ci, reviewer, user); ``verdict`` is pass, fail or mixed.
+        """
+        details = {}
+        if by is not None:
+            if not isinstance(by, str) or not by.strip() or not by.isprintable() or len(by.encode("utf-8")) > 40:
+                raise MemoryError("outcome 'by' must be printable text up to 40 bytes, such as ci, grader or reviewer")
+            details["by"] = by.strip()
+        if verdict is not None:
+            if verdict not in OUTCOME_VERDICTS:
+                raise MemoryError(f"outcome verdict must be one of {', '.join(OUTCOME_VERDICTS)}")
+            details["verdict"] = verdict
+        return self.record_many([("outcome", text)], context={"run_label": run_label, "tags": tags}, images=images,
+                                image_bytes=image_bytes, resize=resize, outcome=details)[0]
+
+    def outcome_report(self, record):
+        """The agent's report an outcome judges: in the same run (or, with no run label, among unlabelled records),
+        before the outcome, the last agent output that claims success, else the last agent output. None if none."""
+        position = record["seq"] - 1
+        label = record.get("run_label")
+        last = claimed = None
+        for earlier in reversed(self.transcript[max(0, position - OUTCOME_SCAN):position]):
+            if earlier.get("run_label") != label:
+                continue
+            if earlier["source"] == "outcome":
+                if last or claimed:
+                    break  # an earlier outcome already judged what came before it
+                continue
+            if earlier["source"] != "agent_output":
+                continue
+            last = last or earlier
+            if SUCCESS_CLAIM.search(earlier["text"]):
+                claimed = earlier
+                break
+        chosen = claimed or last
+        if chosen is None:
+            return None
+        text = chosen["text"]
+        return {"ref": chosen["id"], "text": text[:OUTCOME_REPORT_CHARS] + (" …" if len(text) > OUTCOME_REPORT_CHARS else ""),
+                "claimed_success": claimed is not None,
+                "overclaim": claimed is not None and record.get("outcome", {}).get("verdict") == "fail"}
+
+    def outcome_counts(self):
+        outcomes = [r for r in self.transcript if r["source"] == "outcome"]
+        if not outcomes:
+            return {"records": 0}
+        verdicts = Counter(r.get("outcome", {}).get("verdict", "none") for r in outcomes)
+        reports = [self.outcome_report(r) for r in outcomes]
+        evidence = {item["ref"] for claim in self.claims.values() if claim["state"] == "active" for item in claim["evidence"]}
+        return {"records": len(outcomes), "by_verdict": dict(sorted(verdicts.items())),
+                "overclaims": sum(bool(report and report["overclaim"]) for report in reports),
+                "cited_by_active_claims": sum(r["id"] in evidence for r in outcomes)}
+
+    def outcome_refs(self, claim):
+        return [item["ref"] for item in claim["evidence"]
+                if self._records_by_id.get(item["ref"], {}).get("source") == "outcome"]
+
+    def undreamed_outcomes(self):
+        reviewed = self.dreams[-1]["transcript_count"] if self.dreams else 0
+        return [r for r in self.transcript[reviewed:] if r["source"] == "outcome"]
 
     def add_note(self, text, status, evidence, salience=3, links=None, *, gist=None):
         with self._locked():
@@ -2088,6 +2167,8 @@ class SomniMemory:
         out = []
         for _, score, claim in hits[:limit]:
             extra = {"strength": self.strength(claim, now)}
+            if outcomes := self.outcome_refs(claim):
+                extra["outcome_evidence"] = outcomes
             if claim["state"] == "past":
                 extra["until"] = self.record_time(claim.get("until_ref"))
             elif history := self.history(claim):
@@ -2579,6 +2660,9 @@ class SomniMemory:
                        "you know unless something newer says otherwise: answer with it and give its date.\n")
         lines = [header]
         remaining = max_bytes - len(header.encode("utf-8"))
+        outcome_lines = self._index_outcomes(remaining // 4)
+        lines += outcome_lines
+        remaining -= sum(len(line.encode("utf-8")) for line in outcome_lines)
         if words:
             word_lines = self._index_words(words, query, min(remaining // 4, 1536))
             lines += word_lines
@@ -2620,7 +2704,9 @@ class SomniMemory:
             context = f" (context: {labels[:160]})" if labels else ""
             text = claim.get("gist", claim["text"])
             when = f" ({timing[claim['id']]})" if timing[claim["id"]] else ""
-            line = f"- {claim['id']} [{claim['status']}; salience={claim['salience']}; evidence={refs}] {text}{when}{context}\n"
+            backed = ", outcome-backed" if self.outcome_refs(claim) else ""
+            line = (f"- {claim['id']} [{claim['status']}{backed}; salience={claim['salience']}; evidence={refs}] "
+                    f"{text}{when}{context}\n")
             size = len(line.encode("utf-8"))
             if size > remaining:
                 omitted += 1
@@ -2632,6 +2718,33 @@ class SomniMemory:
             if len(suffix.encode("utf-8")) <= remaining:
                 lines.append(suffix)
         return "".join(lines)
+
+    def _index_outcomes(self, budget, limit=3, chars=160):
+        """Lines for the newest outcomes no dream has reviewed yet, so the next session sees them before a dream."""
+        pending = self.undreamed_outcomes()[-limit:]
+        if not pending:
+            return []
+        lines = ["Outcomes since the last dream (from outside the agent; about whether work succeeded they outrank its "
+                 "own reports):\n"]
+        for record in reversed(pending):
+            details = record.get("outcome", {})
+            labels = "; ".join(filter(None, [details.get("by"), details.get("verdict"),
+                                             record.get("run_label") and f"run: {record['run_label'][:40]}"]))
+            text = " ".join(record["text"].split())
+            report = self.outcome_report(record)
+            said = ""
+            if report and report["overclaim"]:
+                said = f" (the agent had reported success in {report['ref']})"
+            lines.append(f"- {record['id']} [{labels or 'outcome'}] {text[:chars]}{'…' if len(text) > chars else ''}{said}\n")
+        used = 0
+        kept = []
+        for line in lines:
+            size = len(line.encode("utf-8"))
+            if used + size > budget:
+                break
+            kept.append(line)
+            used += size
+        return kept if len(kept) > 1 else []
 
     def metrics(self):
         transcript_bytes = sum(len((canonical(item) + "\n").encode("utf-8")) for item in self.transcript)
@@ -2669,6 +2782,7 @@ class SomniMemory:
             "claims_by_strength": dict(Counter(self.strength(claim)["level"] for claim in self.claims.values()
                                                if claim["state"] == "active")),
             "past_claims": sum(claim["state"] == "past" for claim in self.claims.values()),
+            "outcomes": self.outcome_counts(),
             **({"word_use": use} if (use := self.word_use()) else {}),
         }
 
@@ -2862,7 +2976,9 @@ def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORD
                     break
             if len(attachments) == MAX_RECORD_IMAGES:
                 break
-    excerpts = [{**r, "text": _clip_record(r["text"], record_bytes, b" [excerpt truncated]")} for r in records]
+    excerpts = [{**r, "text": _clip_record(r["text"], record_bytes, b" [excerpt truncated]"),
+                 **({"report": report} if r["source"] == "outcome" and (report := memory.outcome_report(r)) else {})}
+                for r in records]
     claims = memory.related_claims(records) if related else []
     return {"records": excerpts, "attachments": attachments, **({"reviewed_through": reviewed} if reviewed else {}),
             **({"claims": claims} if claims else {})}
@@ -2887,6 +3003,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
     if method == "phase":
         memory.set_phase(args["phase"], allow_same=True)
     elif method == "record":
+        if args.get("source") == "outcome":
+            raise MemoryError("a session can't record an outcome: outcomes come from outside the agent (somni outcome)")
         index_bytes = args.get("index_bytes")
         query = args.get("query", "")
         if index_bytes is not None:
@@ -3188,6 +3306,43 @@ def _input_json(memory, value):
         raise MemoryError(f"invalid JSON input: {exc}") from exc
 
 
+def outcome_arguments(ap):
+    text = ap.add_mutually_exclusive_group(required=True)
+    text.add_argument("--text", help="what happened, in the reporter's words (- reads stdin)")
+    text.add_argument("--text-file", help="read the text from a file")
+    ap.add_argument("--verdict", choices=OUTCOME_VERDICTS, help="pass, fail or mixed")
+    ap.add_argument("--by", help="who reported it: ci, grader, reviewer, user, ...")
+    ap.add_argument("--run-label", help="the run it concerns (that run's SOMNI_RUN_LABEL)")
+    ap.add_argument("--tag", action="append", default=[], help="a tag for the record (repeatable)")
+    ap.add_argument("--image", action="append", default=[], help="an image of the end state (PNG, JPEG, WebP or GIF; repeatable)")
+    ap.add_argument("--image-bytes", type=int, default=DEFAULT_IMAGE_BYTES, help=argparse.SUPPRESS)
+    return ap
+
+
+def record_outcome_from_args(memory, args):
+    """`outcome` from the command line; returns the new record's ID."""
+    if args.text_file is not None:
+        text = pathlib.Path(args.text_file).read_text(encoding="utf-8")
+    else:
+        text = sys.stdin.read() if args.text == "-" else args.text
+    images = []
+    for path in args.image:
+        data = pathlib.Path(path).read_bytes()
+        if len(data) > MAX_IMAGE_INPUT:
+            raise MemoryError(f"{path} is larger than {MAX_IMAGE_INPUT} bytes")
+        mime = _image_type(data)
+        if mime is None:
+            raise MemoryError(f"{path} is not a PNG, JPEG, WebP or GIF image")
+        images.append({"type": "image", "mimeType": mime, "data": base64.b64encode(data).decode("ascii")})
+    ref = memory.record_outcome(text.strip(), by=args.by, verdict=args.verdict, run_label=args.run_label,
+                                tags=args.tag or None, images=images, image_bytes=args.image_bytes)
+    stored = memory._records_by_id[ref]
+    if args.image and len(stored.get("images", [])) < len(args.image):
+        print(f"somni: {len(args.image) - len(stored.get('images', []))} image(s) not stored (too large for the image cap)",
+              file=sys.stderr)
+    return ref
+
+
 def parser():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--workspace", required=True)
@@ -3204,8 +3359,9 @@ def parser():
     serve.add_argument("--session-label", help="tag for this session's records when another session owns recording")
     serve.add_argument("--image-bytes", type=int, default=DEFAULT_IMAGE_BYTES)
     serve.add_argument("--image-max-edge", type=int, default=0)
-    record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES), required=True); record.add_argument("--text", required=True)
+    record = commands.add_parser("record"); record.add_argument("--source", choices=sorted(SOURCES - {"outcome"}), required=True); record.add_argument("--text", required=True)
     record.add_argument("--inject-max-bytes", type=int, help="emit the updated index instead of the record ID")
+    outcome_arguments(commands.add_parser("outcome", help="record an outcome from outside the agent"))
     note = commands.add_parser("note"); note.add_argument("--input", required=True, help="claim JSON relative to workspace, or - for stdin")
     dream = commands.add_parser("dream"); dream.add_argument("--input", required=True, help="proposal JSON relative to workspace, or - for stdin")
     search = commands.add_parser("search"); search.add_argument("query"); search.add_argument("--limit", type=int, default=20)
@@ -3241,6 +3397,8 @@ def main():
                 print(record)
             else:
                 sys.stdout.write(memory.inject(bound))
+        elif args.command == "outcome":
+            print(record_outcome_from_args(memory, args))
         elif args.command == "note":
             claim = _input_json(memory, args.input)
             if not isinstance(claim, dict) or set(claim) - {"text", "gist", "status", "evidence", "salience", "links"}:

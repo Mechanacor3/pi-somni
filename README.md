@@ -75,6 +75,9 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
 - **[Memory over time](docs/memory-over-time.md).** Dated records; a fact that changed is kept as history (`update`)
   rather than treated as a mistake; claims fade from fresh to faint unless they are used; and after a month, old raw
   transcript keeps only a stub with its cited quotes.
+- **[Outcomes](docs/outcomes.md).** `somni outcome` records what happened after the agent was done (a CI failure, a
+  review, a grader's verdict, the user's "that didn't work"). Dreams see it beside the agent's own report and learn
+  most from the times it said "done" and wasn't.
 - **[Action words](docs/action-words.md)** (experimental). Dreams turn a recurring sequence of tool calls into one
   checked Python function that the agent calls as a single tool.
 - **[Daydreams](docs/long-sessions.md#daydreams-experimental)** (experimental). Dreams that run beside a long session,
