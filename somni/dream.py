@@ -66,6 +66,13 @@ guidance in text.
 Return at most {max_ops} operations. Return only the JSON object."""
 
 
+SELF_GUIDE = ("Somni's own machinery is not the user's work. Don't write claims about how dreams, action words or "
+              "rpc.TOOL calls work: every dream gets those instructions fresh, and in the daytime they confuse the agent "
+              "about which tools it has. If the user was configuring or building Somni, keep what they decided (a "
+              "setting, a preference) and say in the claim that it is about the Somni memory tool. Never phrase rpc.* "
+              "as a way to call a tool.")
+
+
 def render_pages(memory, body_chars=400):
     if not memory.pages:
         return "(no pages yet)"
@@ -158,7 +165,7 @@ def dream_pass(memory, records, complete, *, focus=DEFAULT_FOCUS, max_ops=12, re
     """
     prompt = prompt_override or (f"Focus: {focus}.\n\n## Current claims\n{render_claims(memory)}\n\n"
                                  f"## Transcript window\n{render_records(records, memory=memory)}\n")
-    guide = TIME_GUIDE + ("\n" + OUTCOME_GUIDE if any(r.get("source") == "outcome" for r in records) else "")
+    guide = TIME_GUIDE + "\n" + SELF_GUIDE + ("\n" + OUTCOME_GUIDE if any(r.get("source") == "outcome" for r in records) else "")
     system = SYSTEM.replace("{max_ops}", str(max_ops)).replace("{time_guide}", guide)
     trace = {"window": [records[0]["id"], records[-1]["id"]] if records else None, "attempts": []}
     for attempt in range(retries + 1):

@@ -180,6 +180,12 @@ const TIME_GUIDE = "Records are dated (the --- day --- lines). When a record dis
 	"first' into a claim that nothing has contradicted. Date it instead ('as of 2026-01-12'); it stays the best " +
 	"information until a newer record changes it. ";
 
+/** Keeps Somni's own machinery out of daytime memory. Kept in step with SELF_GUIDE in somni/dream.py. */
+const SELF_GUIDE = "Somni's own machinery is not the user's work. Don't write claims about how dreams, action words or " +
+	"rpc.TOOL calls work: every dream gets those instructions fresh, and in the daytime they confuse the agent about " +
+	"which tools it has. If the user was configuring or building Somni, keep what they decided (a setting, a " +
+	"preference) and say in the claim that it is about the Somni memory tool. Never phrase rpc.* as a way to call a tool. ";
+
 /** How a dream should weigh outcomes from outside the agent. Kept in step with OUTCOME_GUIDE in somni/dream.py. */
 const OUTCOME_GUIDE = "OUTCOME records come from outside the agent, after the fact: a grader, CI or tests, a reviewer, the " +
 	"user. About whether something worked they outrank the agent's own reports and its counters; when they disagree, " +
@@ -487,7 +493,8 @@ function dreamStepPrompt(focus: string, recent: Recent) {
 		"ordinary lesson, 5 only for what matters in most sessions) and an optional one-line gist. Don't repeat what an " +
 		"earlier step or the memory index already holds; correct or retract a claim the work has shown to be wrong, and " +
 		"update one whose subject has changed since (the old claim stays as history). Use an " +
-		"empty operations array if nothing new was learned. Tonight's dream checks these lessons against the records.\n\n" +
+		"empty operations array if nothing new was learned. Tonight's dream checks these lessons against the records. " +
+		SELF_GUIDE + "\n\n" +
 		(recent.reviewed_through ? `Records through ${recent.reviewed_through} were reviewed by earlier steps.\n` : "") +
 		`Records since then (ID, source and the start of each; the full text is in the conversation above, except for ` +
 		`records from another session, given in full):\n${anchors.join("\n")}`;
@@ -1137,7 +1144,7 @@ ${candidateGuide(candidates)}`;
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
 				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
-				actionsGuide + TIME_GUIDE + (recent.records.some((r) => r.source === "outcome") ? OUTCOME_GUIDE : "") +
+				actionsGuide + TIME_GUIDE + SELF_GUIDE + (recent.records.some((r) => r.source === "outcome") ? OUTCOME_GUIDE : "") +
 				`Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				relatedClaims(recent.claims) +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +

@@ -1,6 +1,6 @@
 ---
 name: somni-action-words
-description: Somni action words are learned Python functions that call this session's tools as rpc.TOOL(...) and appear as ordinary tools. Use when a tool says "Learned action word", when writing or repairing one in a Somni dream (define_action, revise_action, retire_action), or when reading or editing files in Somni's actions folder.
+description: Somni action words are learned procedures that appear in your tool list as ordinary tools; call one by its name like any other tool. (rpc.TOOL(...) is only how a word's Python source calls tools, written during a Somni dream; it is never a tool you can call.) Use when a tool says "Learned action word", when writing or repairing one in a Somni dream (define_action, revise_action, retire_action), or when reading or editing files in Somni's actions folder.
 ---
 
 # Somni action words
@@ -9,7 +9,7 @@ An action word is a short Python function that Somni learned from your own trans
 
 ## Using a word
 
-Call it like any tool. It returns JSON: whatever the function returns. If the word's final call returned images, such as a screenshot, up to two of them come back with the result. Images from earlier calls do not, because they may show the state before the word's later calls.
+Call it like any tool, by the name in your tool list. Never call `rpc.something` yourself: `rpc` exists only inside a word's source while Somni runs it, and the tools it names are your ordinary tools. It returns JSON: whatever the function returns. If the word's final call returned images, such as a screenshot, up to two of them come back with the result. Images from earlier calls do not, because they may show the state before the word's later calls.
 
 - Each call it makes goes through Pi like your own calls do: the same argument checks, the same permission hooks, and the same recording.
 - If one of its calls fails, the word stops and the error names the calls that already ran. Those calls' effects stay in place. Check the state before you retry.

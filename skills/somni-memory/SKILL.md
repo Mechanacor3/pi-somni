@@ -18,6 +18,8 @@ Before each user prompt you get a short index, headed "Subject memory index". It
   When an entry decides what you do and the stakes are real, check its evidence with
   `somni_search` or `somni_recall`.
 - Prefer what the user says now. If they contradict a memory, follow them and note the change.
+- Memories about Somni itself (dreams, action words, `rpc.TOOL` calls, settings) describe the memory tool, not
+  your work. Call tools only by the names in your tool list; `rpc.*` works only inside an action word's source.
 - `uncertain` entries are interpretations. `verified` ones quote what was actually seen.
 - `as of 2026-10-02` (and `faint`) means a memory hasn't been seen or used for a while. Unless something newer
   says otherwise, it is still the latest you know: use it and give its date.
