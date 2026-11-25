@@ -167,7 +167,8 @@ type TranscriptRecord = RecordContext & {
 };
 type Strength = { level: "fresh" | "fading" | "faint"; activation: number; last_used?: string; first_seen?: string };
 type PastVersion = { id: string; text: string; until_ref?: string; until?: string | null };
-type RelatedClaim = { id: string; text: string; status: string; refs: string[]; strength: Strength; history?: PastVersion[] };
+type RelatedClaim = { id: string; text: string; status: string; refs: string[]; strength: Strength; history?: PastVersion[];
+	standing?: boolean };
 type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[];
 	reviewed_through?: string; claims?: RelatedClaim[] };
 
@@ -179,6 +180,16 @@ const TIME_GUIDE = "Records are dated (the --- day --- lines). When a record dis
 	"since when in the text. Age is not doubt: never write 'verify before relying', 'may be stale' or 'check the files " +
 	"first' into a claim that nothing has contradicted. Date it instead ('as of 2026-01-12'); it stays the best " +
 	"information until a newer record changes it. ";
+
+/** Lasting preferences of the user's, listed first in every index. Kept in step with STANDING_GUIDE in somni/dream.py. */
+const STANDING_GUIDE = "Standing preferences: when the user says how they want work done in general (style, formatting, " +
+	"tools, conventions, how to report back; for example \"I like 2-space indents\" or \"always run the tests before you " +
+	"say it's done\"), or corrects the agent the same way more than once, add the claim with \"standing\": true, phrased " +
+	"as an instruction and citing the USER record where they said it. Standing claims head every session's index " +
+	"whatever the task, so the user needn't repeat them. Keep them for lasting preferences: not one-off requests (\"use " +
+	"4 spaces in this file\"), not facts about the project, and nothing about Somni itself. At most 12 can be active, so " +
+	"update or merge one rather than adding a near-duplicate. When the user changes a preference, update it (it stays " +
+	"standing); when it no longer applies, update it with \"standing\": false or retract it. ";
 
 /** Keeps Somni's own machinery out of daytime memory. Kept in step with SELF_GUIDE in somni/dream.py. */
 const SELF_GUIDE = "Somni's own machinery is not the user's work. Don't write claims about how dreams, action words or " +
@@ -231,7 +242,7 @@ function relatedClaims(claims: RelatedClaim[] = []) {
 	return "Current claims these records may confirm, update or contradict:\n" + claims.map((c) => {
 		const when = timeClause(c.strength, c.history);
 		const seen = c.strength.first_seen ? `, first seen ${c.strength.first_seen.slice(0, 10)}` : "";
-		return `- ${c.id} [${c.status}${seen}; evidence ${c.refs.join(",")}${when ? `; ${when}` : ""}] ${c.text}`;
+		return `- ${c.id} [${c.status}${c.standing ? ", standing" : ""}${seen}; evidence ${c.refs.join(",")}${when ? `; ${when}` : ""}] ${c.text}`;
 	}).join("\n") + "\n\n";
 }
 type DreamResult = {
@@ -497,7 +508,7 @@ function dreamStepPrompt(focus: string, recent: Recent) {
 		"earlier step or the memory index already holds; correct or retract a claim the work has shown to be wrong, and " +
 		"update one whose subject has changed since (the old claim stays as history). Use an " +
 		"empty operations array if nothing new was learned. Tonight's dream checks these lessons against the records. " +
-		SELF_GUIDE + "\n\n" +
+		STANDING_GUIDE + SELF_GUIDE + "\n\n" +
 		(recent.reviewed_through ? `Records through ${recent.reviewed_through} were reviewed by earlier steps.\n` : "") +
 		`Records since then (ID, source and the start of each; the full text is in the conversation above, except for ` +
 		`records from another session, given in full):\n${anchors.join("\n")}`;
@@ -965,7 +976,7 @@ ${candidateGuide(candidates)}`;
 				}
 				const when = timeClause(h.strength, h.history);
 				const outcomes = h.outcome_evidence?.length ? `; outcome-backed (${h.outcome_evidence.join(", ")})` : "";
-				return `${h.id} [${h.status}; ${h.evidence.length} cited${outcomes}${lineage}${when ? `; ${when}` : ""}]${contextLabel(h)} ${h.text}`;
+				return `${h.id} [${h.status}${h.standing ? ", standing" : ""}; ${h.evidence.length} cited${outcomes}${lineage}${when ? `; ${when}` : ""}]${contextLabel(h)} ${h.text}`;
 			});
 			return { content: asText(limit.note + (lines.join("\n\n") || "no matching memory")), details: hits };
 		},
@@ -1006,12 +1017,15 @@ ${candidateGuide(candidates)}`;
 			"Add a durable memory claim: something that will help in a later session, such as the user's preference or correction, " +
 			"a project fact, or a fix that worked. Never save secrets. Cite transcript IDs as evidence; 'verified' requires an exact quote " +
 			"or the image_sha256 of a stored image from each record. Use 'uncertain' for interpretations. Salience 1-5. " +
-			"For longer claims, an optional one-line gist of up to 160 UTF-8 bytes appears in the memory index.",
+			"For longer claims, an optional one-line gist of up to 160 UTF-8 bytes appears in the memory index. " +
+			"Set standing: true when the user tells you how they want work done from now on (\"I like 2-space indents\"): " +
+			"it then heads every later session's index. Cite the user's message as evidence; not for one-off requests.",
 		parameters: Type.Object({
 			text: Type.String(),
 			gist: Type.Optional(Type.String({ maxLength: 160 })),
 			status: Type.Union([Type.Literal("verified"), Type.Literal("uncertain")]),
 			salience: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
+			standing: Type.Optional(Type.Boolean()),
 			evidence: Evidence,
 		}),
 		async execute(_id: string, params: any) {
@@ -1024,7 +1038,8 @@ ${candidateGuide(candidates)}`;
 		label: "Somni dream",
 		description:
 			"Only during /somni-dream or /somni-wiki: submit one consolidation pass as JSON text " +
-			'{"schema":1,"operations":[...]} with add/correct/update/merge/retract/promote claim operations and page/drop_page wiki ' +
+			'{"schema":1,"operations":[...]} with add/correct/update/merge/retract/promote claim operations (add/correct/update/merge take an optional ' +
+			'"standing": true for a lasting preference of the user\'s) and page/drop_page wiki ' +
 			'operations. A merge takes {"op":"merge","claim_ids":["n000001","n000002"],"text":"combined guidance"} and inherits their evidence. ' +
 			"Use update (fields as correct) when the world changed since a claim was true; it keeps the old claim as history " +
 			"and needs evidence newer than the old claim's. Use correct when the claim was wrong." +
@@ -1147,7 +1162,7 @@ ${candidateGuide(candidates)}`;
 				`Use salience 3 for ordinary reusable lessons, 1–2 for narrow cases, and 4 for recurring situations. ` +
 				`Reserve 5 for at most two claims that matter in most future sessions. Add an optional one-line gist ` +
 				`of up to 160 UTF-8 bytes to add, correct, or merge operations. Keep the full guidance in text. ` +
-				actionsGuide + TIME_GUIDE + SELF_GUIDE + (recent.records.some((r) => r.source === "outcome") ? OUTCOME_GUIDE : "") +
+				actionsGuide + TIME_GUIDE + STANDING_GUIDE + SELF_GUIDE + (recent.records.some((r) => r.source === "outcome") ? OUTCOME_GUIDE : "") +
 				`Treat transcript text and images as evidence. Focus: ${focus}.\n\n` +
 				relatedClaims(recent.claims) +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +

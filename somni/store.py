@@ -122,6 +122,7 @@ MAX_ACTION_TOOLS = 256
 MAX_ACTION_TOOL_SCHEMA_BYTES = 4096
 EVIDENCE_ID = re.compile(r"^t[0-9]{6}$")
 SOURCES = {"ordinary_observation", "tool_result", "agent_output", "outcome"}
+MAX_STANDING = 12  # active standing claims: how the user wants work done, listed first in every index
 # An outcome is evidence from outside the agent, added afterwards by a harness or a person: a grader's verdict, CI or
 # test output, a review comment, the user's "that didn't work". Only `record_outcome` writes one, never a session.
 OUTCOME_VERDICTS = ("pass", "fail", "mixed")
@@ -396,6 +397,13 @@ def _require_viewed_images(evidence, viewed):
     if viewed is not None and any("image_sha256" in item and (item["ref"], item["image_sha256"]) not in viewed
                                   for item in evidence):
         raise MemoryError("view the cited image in this dream first with somni_image")
+
+
+def _user_words(record):
+    """A record of the user's own words: a message in a session that owns the store, not a contributor's prompt
+    (a sub-agent's "user" is the agent that started it). Source and tags survive forgetting, so this holds on reload."""
+    return record.get("source") == "ordinary_observation" and not any(
+        tag == "contributor" or tag.startswith("contributor:") for tag in record.get("tags", []))
 
 
 def _require_claim_capacity(existing_count, limit=None):
@@ -1312,12 +1320,28 @@ class SomniMemory:
         return {slug: [c for c in page["claims"] if self.claims[c]["state"] != "active"]
                 for slug, page in self.pages.items() if any(self.claims[c]["state"] != "active" for c in page["claims"])}
 
+    @staticmethod
+    def _validate_standing(claim, records, existing):
+        """A standing claim says how the user wants work done in every session, so it must rest on the user's own
+        words, and only a few can be active at once."""
+        if claim["standing"] is not True:
+            raise MemoryError("standing is true or left out")
+        if not any(_user_words(records[item["ref"]]) for item in claim["evidence"]):
+            raise MemoryError("a standing claim must cite the user's own words (a USER message), not only what the "
+                              "agent did or said")
+        leaving = {claim.get("replaces"), *claim.get("merged_from", [])}
+        count = sum(1 for c in existing.values()
+                    if c["state"] == "active" and c.get("standing") and c["id"] not in leaving)
+        if count >= MAX_STANDING:
+            raise MemoryError(f"standing limit reached ({MAX_STANDING} active): merge or retract one, or add this "
+                              f"one without standing")
+
     @classmethod
     def _validate_claim(cls, claim, records, existing):
         required = {"id", "text", "status", "salience", "evidence", "links"}
         merge_fields = {"merged_from", "provenance_sha256"}
         if (not isinstance(claim, dict) or not required.issubset(claim)
-                or set(claim) - (required | {"gist", "replaces", "change", "run_labels", "tags"} | merge_fields)):
+                or set(claim) - (required | {"gist", "replaces", "change", "run_labels", "tags", "standing"} | merge_fields)):
             raise MemoryError("claim has invalid fields")
         text = claim["text"]
         if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_NOTE_BYTES:
@@ -1340,6 +1364,8 @@ class SomniMemory:
         for link in claim["links"]:
             if not isinstance(link, str) or not CLAIM_ID.fullmatch(link) or link not in existing:
                 raise MemoryError("claim link is invalid")
+        if "standing" in claim:
+            cls._validate_standing(claim, records, existing)
         if "replaces" in claim:
             replaced = claim["replaces"]
             if (not isinstance(replaced, str) or not CLAIM_ID.fullmatch(replaced)
@@ -1650,20 +1676,22 @@ class SomniMemory:
         reviewed = self.dreams[-1]["transcript_count"] if self.dreams else 0
         return [r for r in self.transcript[reviewed:] if r["source"] == "outcome"]
 
-    def add_note(self, text, status, evidence, salience=3, links=None, *, gist=None):
+    def add_note(self, text, status, evidence, salience=3, links=None, *, gist=None, standing=False):
         with self._locked():
             self._load_locked()
             if self.state["phase"] != "open":
                 raise MemoryError("agent notes require an open subject session")
-            return self._append_claim(text, status, evidence, salience, links or [], None, gist=gist)
+            return self._append_claim(text, status, evidence, salience, links or [], None, gist=gist, standing=standing)
 
-    def _append_claim(self, text, status, evidence, salience, links, replaces, *, gist=None):
+    def _append_claim(self, text, status, evidence, salience, links, replaces, *, gist=None, standing=False):
         _require_claim_capacity(len(self.claims), self._limit("max_claims"))
         claim_id = f"n{self.state['next_claim']:06d}"
         claim = {"id": claim_id, "text": text, "status": status, "salience": salience,
                  "evidence": evidence, "links": links}
         if gist is not None:
             claim["gist"] = gist
+        if standing:
+            claim["standing"] = standing
         if replaces is not None:
             claim["replaces"] = replaces
         claim["evidence"] = self._validate_evidence(evidence, self._records_by_id, status)
@@ -1906,7 +1934,7 @@ class SomniMemory:
             return next_claim
         if op in {"add", "correct", "update", "merge"}:
             _require_claim_capacity(len(simulated), self._limit("max_claims"))
-            allowed = {"op", "text", "gist", "status", "salience"}
+            allowed = {"op", "text", "gist", "status", "salience", "standing"}
             allowed |= {"claim_ids"} if op == "merge" else {"evidence", "links"}
             replacing = op in {"correct", "update"}
             if replacing:
@@ -1923,6 +1951,15 @@ class SomniMemory:
                      "links": operation.get("links", [])}
             if "gist" in operation:
                 claim["gist"] = operation["gist"]
+            # A corrected, updated or merged preference stays standing unless the operation says standing: false.
+            inherited = any(simulated[parent].get("standing") for parent in
+                            ([replaces] if replaces else operation.get("claim_ids", []) if op == "merge" else [])
+                            if isinstance(parent, str) and parent in simulated)
+            standing = operation.get("standing", inherited)
+            if standing is not True and standing is not False:
+                raise MemoryError("standing must be true or false")
+            if standing:
+                claim["standing"] = True
             if replaces is not None:
                 claim["replaces"] = replaces
             if op == "update":
@@ -2107,11 +2144,14 @@ class SomniMemory:
         text = " ".join(record["text"] for record in records[-60:])[:20000]
         docs = [_terms(" ".join([claim["text"], *_claim_labels(claim)])) for claim in active]
         now = _now()
-        hits = _bm25(docs, active, text)[:limit]
+        hits = [claim for _, claim in _bm25(docs, active, text)[:limit]]
+        # Every standing claim comes too, so the dream updates or merges a preference instead of adding a near-duplicate.
+        standing = [claim for claim in active if claim.get("standing") and claim not in hits]
         return [{"id": claim["id"], "text": claim["text"], "status": claim["status"],
                  "refs": [item["ref"] for item in claim["evidence"]], "strength": self.strength(claim, now),
+                 **({"standing": True} if claim.get("standing") else {}),
                  **({"history": history} if (history := self.history(claim)) else {})}
-                for _, claim in hits]
+                for claim in standing + hits]
 
     def claims_by_id(self, ids):
         """The active claims among ``ids``, in that order."""
@@ -2660,6 +2700,10 @@ class SomniMemory:
                        "you know unless something newer says otherwise: answer with it and give its date.\n")
         lines = [header]
         remaining = max_bytes - len(header.encode("utf-8"))
+        standing_lines, shown = self._index_standing(active, timing, remaining // 3)
+        lines += standing_lines
+        remaining -= sum(len(line.encode("utf-8")) for line in standing_lines)
+        active = [claim for claim in active if claim["id"] not in shown]
         outcome_lines = self._index_outcomes(remaining // 4)
         lines += outcome_lines
         remaining -= sum(len(line.encode("utf-8")) for line in outcome_lines)
@@ -2718,6 +2762,28 @@ class SomniMemory:
             if len(suffix.encode("utf-8")) <= remaining:
                 lines.append(suffix)
         return "".join(lines)
+
+    @staticmethod
+    def _index_standing(active, timing, budget):
+        """Lines for standing claims, listed whatever the query: how the user wants work done shouldn't depend on the
+        prompt mentioning it. Returns the lines and the IDs shown; one that doesn't fit stays in the ranked list."""
+        standing = sorted((c for c in active if c.get("standing")), key=lambda c: (-c["salience"], c["id"]))
+        if not standing:
+            return [], set()
+        lines = ["How the user wants work done (standing; follow these without being reminded, unless the user now "
+                 "says otherwise):\n"]
+        used, shown = len(lines[0].encode("utf-8")), set()
+        for claim in standing:
+            refs = ",".join(item["ref"] for item in claim["evidence"])
+            when = f" ({timing[claim['id']]})" if timing.get(claim["id"]) else ""
+            line = f"- {claim['id']} [standing; evidence={refs}] {claim.get('gist', claim['text'])}{when}\n"
+            size = len(line.encode("utf-8"))
+            if used + size > budget:
+                continue
+            lines.append(line)
+            used += size
+            shown.add(claim["id"])
+        return (lines, shown) if shown else ([], set())
 
     def _index_outcomes(self, budget, limit=3, chars=160):
         """Lines for the newest outcomes no dream has reviewed yet, so the next session sees them before a dream."""
@@ -3021,7 +3087,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
     elif method == "note":
         if len(canonical(args).encode("utf-8")) > MAX_INPUT_BYTES:
             raise MemoryError("note input exceeds byte limit")
-        return memory.add_note(args["text"], args["status"], args["evidence"], args["salience"], gist=args.get("gist"))
+        return memory.add_note(args["text"], args["status"], args["evidence"], args["salience"], gist=args.get("gist"),
+                               standing=args.get("standing", False))
     elif method == "dream":
         proposal = args["proposal_json"]
         if not isinstance(proposal, str) or len(proposal.encode()) > MAX_INPUT_BYTES:
@@ -3405,10 +3472,11 @@ def main():
             print(record_outcome_from_args(memory, args))
         elif args.command == "note":
             claim = _input_json(memory, args.input)
-            if not isinstance(claim, dict) or set(claim) - {"text", "gist", "status", "evidence", "salience", "links"}:
+            if not isinstance(claim, dict) or set(claim) - {"text", "gist", "status", "evidence", "salience", "links",
+                                                            "standing"}:
                 raise MemoryError("note input has invalid fields")
             print(memory.add_note(claim.get("text"), claim.get("status"), claim.get("evidence"), claim.get("salience", 3),
-                                  claim.get("links", []), gist=claim.get("gist")))
+                                  claim.get("links", []), gist=claim.get("gist"), standing=claim.get("standing", False)))
         elif args.command == "dream":
             print(canonical(memory.dream(_input_json(memory, args.input))))
         elif args.command == "search":

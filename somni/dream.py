@@ -23,6 +23,16 @@ DEFAULT_FOCUS = ("durable lessons that would help in future, similar situations:
 WIKI_LINK_GUIDE = ("Wiki links can point to pages created later in the same pass and can form cycles. "
                    "Every link must resolve at the end of the pass. " + 'Group pages in folders when a topic has several pages: a slug may be a path such as topic/page or topic/subtopic/page (at most 3 levels). Link with the full path, [[topic/page]].')
 
+STANDING_GUIDE = ("Standing preferences: when the user says how they want work done in general (style, formatting, "
+                  "tools, conventions, how to report back; for example \"I like 2-space indents\" or \"always run the "
+                  "tests before you say it's done\"), or corrects the agent the same way more than once, add the claim "
+                  "with \"standing\": true, phrased as an instruction and citing the USER record where they said it. "
+                  "Standing claims head every session's index whatever the task, so the user needn't repeat them. Keep "
+                  "them for lasting preferences: not one-off requests (\"use 4 spaces in this file\"), not facts about "
+                  "the project, and nothing about Somni itself. At most 12 can be active, so update or merge one rather "
+                  "than adding a near-duplicate. When the user changes a preference, update it (it stays standing); "
+                  "when it no longer applies, update it with \"standing\": false or retract it.")
+
 SYSTEM = """You consolidate an agent's memory offline ("dreaming").
 
 You see numbered transcript records (IDs like t000123) and the current memory claims (IDs like n000004).
@@ -41,6 +51,7 @@ OP is one of:
   {"op": "page", "slug": "lowercase-hyphenated or folder/page", "title": "...", "body": "markdown", "claims": ["n000004", ...]}
   {"op": "drop_page", "slug": "...", "reason": "merged into other-slug"}
   {"op": "promote", "claim_id": "n000004", "salience": 5}   (raise a broadly useful claim up the index)
+add, correct, update and merge also take "standing": true for a lasting preference of the user's (see below).
 
 Rules the store enforces (violations are rejected):
 - Every evidence ref must be a transcript ID shown to you, at most once per claim, 1-16 refs.
@@ -48,6 +59,7 @@ Rules the store enforces (violations are rejected):
 - "verified" needs a quote for every ref; use "uncertain" for interpretations you cannot quote directly.
 - links may only name existing claim IDs. correct/update/retract may only target active claims.
 - update needs at least one evidence record newer than every record the old claim cites.
+- A standing claim must cite at least one USER record; at most 12 are active at once.
 - merge synthesizes two or more distinct active claims with related guidance. The store inherits their
   evidence and keeps their provenance. Use a page when the claims are better kept as separate ideas.
 - Pages (wiki): a page gathers what is known about ONE subject. Its body is markdown that cites claims
@@ -62,6 +74,7 @@ existing claim over adding a near-duplicate. Use salience 3 for ordinary reusabl
 cases, and 4 for recurring situations. Reserve 5 for at most two claims that matter in most future runs.
 Add, correct and merge may include a one-line gist of up to 160 UTF-8 bytes for the index. Keep the full
 guidance in text.
+""" + STANDING_GUIDE + """
 """ + "\n" + "{time_guide}" + """
 Return at most {max_ops} operations. Return only the JSON object."""
 
@@ -142,7 +155,7 @@ def render_claims(memory, limit=120):
     def timing(claim):
         clause = memory.describe_time(claim)
         return f"; {clause}" if clause else ""
-    lines = [f"[{c['id']}] (salience {c['salience']}, {c['status']}, evidence "
+    lines = [f"[{c['id']}] (salience {c['salience']}, {c['status']}{', standing' if c.get('standing') else ''}, evidence "
              f"{','.join(e['ref'] for e in c['evidence'])}{timing(c)}) {c['text']}" for c in active[:limit]]
     if len(active) > limit:
         lines.append(f"… {len(active) - limit} lower-salience claims not shown")

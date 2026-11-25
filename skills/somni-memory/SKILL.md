@@ -14,7 +14,9 @@ fixed, and work the way they and their project prefer.
 Before each user prompt you get a short index, headed "Subject memory index". It holds the notes
 (claims) and wiki pages that best match the prompt, plus any learned action words.
 
-- Treat it as advice from your past self, not as fact. Each line cites evidence IDs (`t000123`).
+- "How the user wants work done" lists their lasting preferences (`standing`): indentation, commit style, how
+  to report back. Follow them in every task without being reminded, unless the user now says otherwise.
+- Treat the rest as advice from your past self, not as fact. Each line cites evidence IDs (`t000123`).
   When an entry decides what you do and the stakes are real, check its evidence with
   `somni_search` or `somni_recall`.
 - Prefer what the user says now. If they contradict a memory, follow them and note the change.
@@ -54,6 +56,9 @@ How to write one:
 - Leave out one-off details (today's ticket number, a temporary path) unless they will matter again.
 - Cite the transcript records it rests on. `verified` needs an exact quote from each cited
   record; otherwise use `uncertain`.
+- When the user says how they want work done from now on ("I like 2-space indents", "always show me the diff
+  first"), add `"standing": true` and cite their message. A standing note heads every later index, whatever the
+  task. Don't use it for a one-off request ("4 spaces in this file") or a project fact.
 - Salience 3 is an ordinary lesson. Use 4 for something that comes up often, and 1–2 for
   narrow cases.
 - Never save secrets, passwords, tokens or keys, even if the user shows you one.

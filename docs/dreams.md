@@ -75,7 +75,9 @@ recall and the injected index skip them.
 
 ## The injected index
 
-Before each Pi turn, Somni injects a small memory index ranked against the current user prompt. It prioritizes exact
+Before each Pi turn, Somni injects a small memory index ranked against the current user prompt. Standing claims
+(the user's lasting preferences; see [everyday use](everyday-use.md#preferences-that-always-apply)) come first, whatever
+the prompt, in up to a third of the space; one that doesn't fit is ranked with the rest. It prioritizes exact
 run labels and tags, then uses lexical similarity (BM25), salience, and the recency of the cited evidence. Pages get up
 to half the available space, with an excerpt from the best matching page. A long page can contribute its procedure
 section. Claim lines include evidence IDs and use a short gist when one is available. The index skips entries that

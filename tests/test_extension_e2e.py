@@ -33,6 +33,8 @@ PLANS = {
          "evidence": [{"ref": "t000002", "quote": "not in the record"}]},
         {"op": "merge", "claim_ids": ["n000002", "n000001"], "text": "Look up the cancellation fee before quoting its floor."}]})})]],
     "Anything else": [],
+    "From now on": [[("somni_note", {"text": "Indent code with 2 spaces.", "status": "verified", "salience": 3,
+                                     "standing": True, "evidence": [{"ref": "t000001", "quote": "I like 2-space indents"}]})]],
     "Look around": [
         {"text": "I will look down.", "tool_calls": [("screenshot", {})]},
         {"text": "The frame is fresh.", "tool_calls": [("stream_read", {})]},
@@ -66,6 +68,16 @@ class SomniPiEndToEnd(unittest.TestCase):
     def tearDown(self):
         self.pi.close()
         self.upstream.close()
+
+    def test_a_standing_preference_heads_a_later_index_whatever_the_prompt(self):
+        self.pi.prompt("From now on: I like 2-space indents.")
+        note = next(e for e in self.pi.tool_ends() if e["toolName"] == "somni_note")
+        self.assertFalse(note.get("isError"), note)
+        self.assertTrue(SomniMemory(self.work / ".pi" / "somni", "pi").load().claims["n000001"]["standing"])
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        sent = json.dumps(self.upstream.requests[-1]["messages"])
+        self.assertIn("How the user wants work done (standing", sent)
+        self.assertIn("Indent code with 2 spaces.", sent)
 
     def test_record_note_inject_and_dream(self):
         self.pi.prompt("What is the fee to cancel economy fare 300?")
@@ -231,6 +243,7 @@ class SomniPiEndToEnd(unittest.TestCase):
                             if text_of(m.get("content")).startswith("Dream pass."))
         self.assertIn("- rpc.lookup_fee(cabin: str, price: float): Return the cancellation fee for a fare.\n", dream_prompt)
         self.assertNotIn("- somni_note", dream_prompt)
+        self.assertIn('Standing preferences: when the user says how they want work done', dream_prompt)
         self.assertEqual(sorted(memory.load().action_words()), ["quote_fees"])
         self.assertIn("rpc.pi.lookup_fee", (store / "somni-v1" / "actions" / "quote_fees.py").read_text())
 
@@ -347,7 +360,7 @@ class SomniPiEndToEnd(unittest.TestCase):
         for _ in range(2):
             self.pi.prompt("Quote both fees for 200")
             hidden.append("\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]))
-        self.assertEqual(hidden[0].count("## Using a learned action word\nCall it like any tool."), 1)
+        self.assertEqual(hidden[0].count("## Using a learned action word\nCall it like any tool, by the name in your tool list."), 1)
         self.assertIn("Check the effect with a tool before you say the work is done.", hidden[0])
         self.assertEqual(hidden[1].count("## Using a learned action word"), 1)  # the first turn's, not a second copy
 

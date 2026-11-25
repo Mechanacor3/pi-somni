@@ -87,6 +87,21 @@ Good memories are reusable. These are worth saying out loud:
 Not worth keeping: one-off details like today's ticket number. Dreams are told to leave those
 out.
 
+### Preferences that always apply
+
+Most memories reach the index only when they match what you asked. A preference about how you
+work ("I like 2-space indents", "always run the tests before you say it's done", "lead with the
+answer") should apply to every task, whether or not the prompt mentions it. Say it once as a
+standing rule ("from now on…", "I always…"), and Somni keeps it as a **standing** note. Standing
+notes head every session's index, under "How the user wants work done".
+
+- The agent can save one straight away with `somni_note` (`"standing": true`), or the next dream
+  finds it. A dream also makes one when you correct the agent the same way more than once.
+- A standing note has to cite something you said. The agent's own habits and a sub-agent's
+  instructions don't count.
+- Up to 12 can be active. Change one by saying so ("actually, 4 spaces now"): the dream updates
+  it and it stays standing. Say it no longer applies, and the dream drops it.
+
 ## When a memory is wrong
 
 The vault is a view, so editing it changes nothing. Tell the agent instead:
