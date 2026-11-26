@@ -419,6 +419,36 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertEqual(sum("Somni daydream d000001" in message for message in shown()), 1, shown())
 
     @unittest.skipUnless(BINARY, "the daydream worker starts the host Pi binary")
+    def test_turns_left_undreamed_at_quit_are_dreamed_when_the_next_session_starts(self):
+        self.pi.close()
+        proposal = {"schema": 1, "operations": [{"op": "add", "text": "Economy cancellation fees have a $50 floor.",
+                                                 "status": "verified", "salience": 3,
+                                                 "evidence": [{"ref": "t000002", "quote": "\"fee\":50"}]}]}
+        self.upstream.script = plan_script({
+            "What is the fee": [[("lookup_fee", {"cabin": "economy", "price": 300})]],
+            "Dream pass.": [[("somni_dream", {"proposal_json": json.dumps(proposal)})]],
+            "Anything else": [],
+        })
+        env = {"SOMNI_DAYDREAM_EVERY_TURNS": "10"}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        self.pi.close()  # /quit long before the tenth turn
+        store = self.work / ".pi" / "somni"
+        self.assertEqual(SomniMemory(store, "pi").load().dreams, [])
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not SomniMemory(store, "pi").load().dreams:
+            time.sleep(0.5)
+        memory = SomniMemory(store, "pi").load()
+        self.assertEqual(len(memory.dreams), 1, "the next session did not dream the turns left over")
+        self.assertTrue(memory.dreams[0]["live"])
+        self.assertIn("n000001", memory.claims)
+        time.sleep(1)  # let the worker's exit settle the notice
+        self.pi.prompt("Anything else?")
+        injected = "\n".join(text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"])
+        self.assertIn("Somni daydream d000001 from your last session's undreamed turns: +1 claim(s)", injected)
+
+    @unittest.skipUnless(BINARY, "the daydream worker starts the host Pi binary")
     def test_a_forked_daydream_starts_from_the_session_and_keeps_its_prefix(self):
         self.pi.close()
         proposal = {"schema": 1, "operations": [{"op": "add", "text": "Economy cancellation fees have a $50 floor.",

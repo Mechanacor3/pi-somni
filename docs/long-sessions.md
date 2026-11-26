@@ -17,6 +17,14 @@ A daydream reviews only the records since the last pass, plus the eight before t
 `SOMNI_DREAM_RECORDS`), so frequent daydreams don't resend records that earlier passes already reviewed. An offline
 `/somni-dream` still reviews the newest `SOMNI_DREAM_RECORDS` records.
 
+**Quitting between daydreams.** With `every_turns: 10`, quitting after the eighth turn leaves eight turns that no
+daydream has reviewed. They are already in the store, since every turn is recorded as it happens; what they taught
+is not in any note yet. The next session in that project starts by dreaming them: when daydreams are on and the store
+holds a turn of yours that no pass has reviewed, it starts a daydream right away, beside your first prompt. Its notice
+says `from your last session's undreamed turns`. It starts cold, because the new session's conversation doesn't hold
+those turns, and it counts toward `SOMNI_DAYDREAM_PER_HOUR` like any other. A daydream still running when you quit is
+stopped, and its turns are caught up the same way. A night `/somni-dream` before you quit reviews them too.
+
 A daydream is kept small so it doesn't hold up your session. Its record listing is capped at
 `daydreams.prompt_bytes` (16 KiB, newest first), and each tool result in it is a one-line stub with the call and the
 start of its output; `somni_search "t000123"` returns the whole record. A daydream gets `daydreams.max_reads`

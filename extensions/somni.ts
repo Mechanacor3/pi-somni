@@ -303,6 +303,7 @@ const day = {
 	announced: undefined as string | undefined, // the live pass whose notice is already queued
 	forkBroken: false, // a forked daydream failed, so this session's daydreams start cold
 	lessons: "", // the claims the announced pass added, shown to the model with its notice
+	catchUp: false, // the running or last daydream reviews turns an earlier session left undreamed
 };
 
 /** The claims a live pass added, one line each, for the hidden notice: the session can use them right away. */
@@ -324,7 +325,8 @@ function livePassNotice(pass: any) {
 	const u = pass.usage;
 	const spent = u ? `, $${u.cost.toFixed(2)}, ${Math.round(u.totalTokens / 1000)}k tok, ` +
 		`${Math.round((u.duration_ms ?? 0) / 1000)}s` : "";
-	return `Somni daydream ${pass.id}: +${pass.added_count ?? 0} claim(s), ${pass.merged_count ?? 0} merged` +
+	const from = day.catchUp ? " from your last session's undreamed turns" : "";
+	return `Somni daydream ${pass.id}${from}: +${pass.added_count ?? 0} claim(s), ${pass.merged_count ?? 0} merged` +
 		`${words}, ${pass.rejected_count} rejected (records up to ${pass.transcript_count}${spent}).`;
 }
 
@@ -694,8 +696,10 @@ export default function (pi: ExtensionAPI) {
 	 * Start a daydream if one is due: a child Pi runs /somni-dream against a `serve --daydream` backend,
 	 * which reads up to the current transcript head and commits one live pass while this session records on.
 	 * Never blocks: skipped while one runs, when nothing new was recorded, or past SOMNI_DAYDREAM_PER_HOUR.
+	 * `catchUp` is the one a session starts with when an earlier session ended before its next daydream; it starts cold,
+	 * since this session's conversation doesn't hold those turns.
 	 */
-	async function maybeDaydream(ctx: ExtensionContext) {
+	async function maybeDaydream(ctx: ExtensionContext, catchUp = false) {
 		if (!DAYDREAMS || day.child || !canRecord() || !state.writable) return; // the owner runs daydreams
 		const now = Date.now();
 		day.starts = day.starts.filter((start) => now - start < 3_600_000);
@@ -711,10 +715,11 @@ export default function (pi: ExtensionAPI) {
 		day.starts.push(now);
 		day.turns = 0;
 		day.before = status.last_pass?.id;
+		day.catchUp = catchUp;
 		const model = process.env.SOMNI_DAYDREAM_MODEL || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 		// A fork starts from the saved session and its cached prefix; it needs the session's model to reuse the cache.
 		const sessionFile = ctx.sessionManager.getSessionFile();
-		const fork = DAYDREAM_FORK && !day.forkBroken && sessionFile && existsSync(sessionFile) && !process.env.SOMNI_DAYDREAM_MODEL;
+		const fork = DAYDREAM_FORK && !catchUp && !day.forkBroken && sessionFile && existsSync(sessionFile) && !process.env.SOMNI_DAYDREAM_MODEL;
 		const forkDir = fork ? join(state.workspace, "somni-v1", "forks", `${process.pid}-${now}`) : undefined;
 		if (forkDir) mkdirSync(forkDir, { recursive: true });
 		// The fork keeps its session's ID (in its own session folder, so nothing collides): providers route requests and
@@ -777,6 +782,19 @@ export default function (pi: ExtensionAPI) {
 			done();
 			notify(ctx, day.notice);
 		});
+	}
+
+	/** Whether an earlier session left a turn of the user's that no pass has reviewed yet. */
+	async function undreamedTurns() {
+		try {
+			const status = await getBackend().request<{ transcript_count: number; last_pass: { transcript_count: number } | null }>("status");
+			const since = status.last_pass?.transcript_count ?? 0;
+			if (status.transcript_count <= since) return false;
+			const records = await getBackend().request<TranscriptRecord[]>("records_since", { count: since });
+			return records.some((r) => r.source === "ordinary_observation" && r.text.startsWith("USER:"));
+		} catch {
+			return false;
+		}
 	}
 
 	/** Tools an action word may call: everything callable except Somni's own tools (and SOMNI_ACTION_TOOLS, if set). */
@@ -1377,6 +1395,8 @@ ${candidateGuide(candidates)}`;
 			}
 			await registerWords(ctx);
 			await recordToolCatalog(ctx);
+			// Quitting between daydreams leaves the last turns undreamed: dream them now, beside this session's first turns.
+			if (DAYDREAMS && writable && await undreamedTurns()) void maybeDaydream(ctx, true);
 			if (DAYDREAMS && DAYDREAM_MINUTES > 0 && writable) {
 				if (day.timer) clearInterval(day.timer);
 				day.timer = setInterval(() => { if (lastCtx && !state.dream) void maybeDaydream(lastCtx); }, DAYDREAM_MINUTES * 60_000);
