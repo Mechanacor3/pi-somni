@@ -85,7 +85,7 @@ def evidence(memory, claim, record_hash):
             "revisions": len(memory.history(claim)), "uses": len(memory._uses(claim))}
 
 
-def summarize(items):
+def summarize(items, *, notes=True):
     """One line on what backs a guideline, from the evidence of the claims it cites."""
     records = {row["id"] + ("" if not item.get("personal") else "p"): row for item in items for row in item["records"]}
     rows = list(records.values())
@@ -107,7 +107,7 @@ def summarize(items):
         parts.append("outcomes " + ", ".join(f"{n} {v}" for v, n in sorted(verdicts.items())) +
                      (f" ({', '.join(by)})" if by else ""))
     unverified = sum(item["status"] != "verified" for item in items)
-    if unverified:
+    if unverified and notes:
         parts.append(f"{unverified} of {len(items)} note(s) unverified")
     revised = sum(item["revisions"] for item in items)
     if revised:
@@ -116,7 +116,7 @@ def summarize(items):
 
 
 def _line(claim_id, claim, item, text):
-    summary = summarize([item])
+    summary = summarize([item], notes=False)  # the line shows its status already
     return f"- {claim_id} [{claim['status']}; {summary}] {text}"
 
 
