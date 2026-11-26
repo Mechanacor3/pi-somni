@@ -1,5 +1,7 @@
 # pi-somni
 
+<p align="center"><img src="docs/images/somni-sheep.webp" width="600" alt="A sheep asleep on a cloud; under a glass dome in its wool, a small robot brain dreams three note cards into one stack."></p>
+
 **Somni** gives the [Pi coding agent](https://pi.dev) a memory that gets better the more you work with it.
 It remembers what you told it, what worked and what went wrong, and your project's conventions.
 With action words on, it can also turn chores you repeat into one-step tools. Every memory cites the
