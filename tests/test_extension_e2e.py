@@ -33,6 +33,11 @@ PLANS = {
          "evidence": [{"ref": "t000002", "quote": "not in the record"}]},
         {"op": "merge", "claim_ids": ["n000002", "n000001"], "text": "Look up the cancellation fee before quoting its floor."}]})})]],
     "Anything else": [],
+    "Share pass.": [[("somni_share", {"name": "home-tutor", "description": "x", "guidelines": [
+        {"text": "Ask Quentin before quoting.", "claims": ["n000001"]}]})],
+                    [("somni_share", {"name": "fee-quotes", "description": "How to quote cancellation fees.",
+                                      "guidelines": [{"text": "Look the fee up before quoting it; there is a floor.",
+                                                      "claims": ["n000001"]}]})]],
     "From now on": [[("somni_note", {"text": "Indent code with 2 spaces.", "status": "verified", "salience": 3,
                                      "standing": True, "evidence": [{"ref": "t000001", "quote": "I like 2-space indents"}]})]],
     "Look around": [
@@ -78,6 +83,26 @@ class SomniPiEndToEnd(unittest.TestCase):
         sent = json.dumps(self.upstream.requests[-1]["messages"])
         self.assertIn("How the user wants work done (standing", sent)
         self.assertIn("Indent code with 2 spaces.", sent)
+
+    def test_share_writes_a_skill_with_its_evidence_and_refuses_personal_details(self):
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        self.pi.prompt("Remember that for later.")
+        self.pi.close()
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={"SOMNI_NEVER_SHARE": "Quentin"})
+        self.pi.prompt("/somni-share fees")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        sent = json.dumps(self.upstream.requests[-2]["messages"])
+        self.assertIn("Share pass.", sent)
+        self.assertIn("- n000001 [verified; 1 record(s)", sent)
+        first, second = [e for e in self.pi.tool_ends() if e["toolName"] == "somni_share"]
+        self.assertTrue(first["isError"], first)
+        self.assertIn("a name that identifies the user or this machine (Quentin)", text_of(first["result"]["content"]))
+        self.assertFalse(second["isError"], second)
+        folder = self.work / ".pi" / "somni" / "shares" / "fee-quotes"
+        self.assertIn("1. Look the fee up before quoting it; there is a floor.\n   *Evidence: 1 record(s)",
+                      (folder / "SKILL.md").read_text())
+        self.assertIn("| t000002 | tool result |", (folder / "EVIDENCE.md").read_text())
+        self.assertFalse((self.work / ".pi" / "somni" / "shares" / "home-tutor").exists())
 
     def test_record_note_inject_and_dream(self):
         self.pi.prompt("What is the fee to cancel economy fare 300?")

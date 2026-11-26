@@ -66,6 +66,10 @@ SETTINGS = (
             "Your personal memory, shared by every project: lessons about you (preferences, how you work) that dreams "
             "file there instead of the project's store. `auto` is `~/.somni` in interactive Pi and off in scripted "
             "runs (print, JSON or RPC mode); `none` turns it off; a path uses that store everywhere"),
+    Setting("personal.never_share", "SOMNI_NEVER_SHARE", "str", "",
+            "Comma-separated names that `/somni-share` must never write, such as your name, your team's or a "
+            "client's. Your username, the machine's name and your git name and email are refused anyway",
+            default_text="none"),
     Setting("index.bytes", "SOMNI_INJECT_BYTES", "int", 4096, "Size of the memory index injected before each prompt",
             256, 8192),
     Setting("recording.tool_result_bytes", "SOMNI_TOOL_RESULT_BYTES", "int", 4096,

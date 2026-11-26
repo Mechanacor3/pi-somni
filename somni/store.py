@@ -3142,9 +3142,22 @@ def _action_module():
     return actions
 
 
+def _share_module():
+    _action_module()  # puts the package on sys.path
+    from somni import share
+    return share
+
+
+def _package_version():
+    try:
+        return json.loads((pathlib.Path(__file__).resolve().parent.parent / "package.json").read_text())["version"]
+    except (OSError, ValueError, KeyError):
+        return "unknown"
+
+
 def _handle_request(memory, method, args, *, writable, context=None, image_bytes=DEFAULT_IMAGE_BYTES,
                     resize=None, viewed=None, actions=False, daydream=None, contributor=False, peer=False, personal=None):
-    if daydream is not None and method in {"phase", "record", "note", "wiki", "action_tools"}:
+    if daydream is not None and method in {"phase", "record", "note", "wiki", "action_tools", "share"}:
         raise MemoryError("a daydream may only read memory and submit its pass")
     # A second Pi on the store may append records: a contributor (such as a sub-agent) or a peer (another session of
     # the user's, which may also save notes). The owner keeps the phase, dreams and the wiki.
@@ -3286,6 +3299,22 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         merged = {**words, draft["name"]: draft}
         return A.step(A.shared_runtime(merged), draft, args["params"], args["history"],
                       max_calls=args.get("max_calls", A.MAX_CALLS), catalog=A.namespace(memory._read_action_tools(), merged))
+    elif method in ("share_material", "share"):
+        S = _share_module()
+        memory.load()
+        if personal is not None:
+            personal.load()
+        try:
+            if method == "share_material":
+                topic = args.get("topic") or ""
+                if not isinstance(topic, str) or len(topic) > 2_000:
+                    raise MemoryError("topic must be text up to 2000 characters")
+                return S.material(memory, personal, topic, record_hash=_record_hash, personal_claim=_personal_claim)
+            return S.build(memory, personal, args.get("proposal"), record_hash=_record_hash, personal_prefix=PERSONAL,
+                           version=_package_version(), cwd=args.get("cwd") or memory.workspace,
+                           deny=args.get("deny") or "", home=args.get("home"))
+        except S.ShareError as exc:
+            raise MemoryError(str(exc)) from None
     elif method == "records_since":
         memory.load()
         start = args.get("count")

@@ -1143,6 +1143,30 @@ ${candidateGuide(candidates)}`;
 		},
 	});
 
+	pi.registerTool({
+		name: "somni_share",
+		label: "Somni share",
+		description:
+			"Only when the user asks to share what this memory learned (for example after /somni-share): write a skill " +
+			"other people's agents can load, as SKILL.md plus EVIDENCE.md. Each guideline is an instruction in your own " +
+			"words, general enough for someone else's projects, citing the claim IDs it rests on. Somni adds what backs " +
+			"each one and refuses a draft with personal details in it. It writes files only; it publishes nothing.",
+		parameters: Type.Object({
+			name: Type.String({ description: "lowercase-hyphenated, up to 64 characters" }),
+			description: Type.String({ description: "what the skill does and when to load it, up to 1024 characters" }),
+			intro: Type.Optional(Type.String()),
+			guidelines: Type.Array(Type.Object({ text: Type.String(), claims: Type.Array(Type.String()) })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const out = await getBackend().request<{ path: string; name: string; guidelines: number; replaced: boolean }>(
+				"share", { proposal: params, cwd: ctx?.cwd ?? process.cwd(), home: homedir(),
+					deny: process.env.SOMNI_NEVER_SHARE ?? "" });
+			const text = `${out.replaced ? "Replaced" : "Wrote"} the share "${out.name}" (${out.guidelines} guideline(s)) ` +
+				`in ${out.path}: SKILL.md and EVIDENCE.md. Read both before sharing them; nothing was published.`;
+			return { content: asText(text), details: out };
+		},
+	});
+
 	if (ACTIONS) pi.registerTool({
 		name: "somni_action_try",
 		label: "Somni action try",
@@ -1299,6 +1323,30 @@ ${candidateGuide(candidates)}`;
 			// Headless Pi keeps stdout for the model's reply, so the report goes to stderr there.
 			if (ctx.mode === "print" || ctx.mode === "json") console.error(report);
 			else pi.sendMessage({ customType: "somni-doctor", content: report, display: true });
+		},
+	});
+
+	pi.registerCommand("somni-share", {
+		description: "Draft a skill other people can use from what memory learned about a topic, with the evidence " +
+			"behind each guideline: `/somni-share <topic>`. Writes files only.",
+		handler: async (args, ctx) => {
+			if (!ctx.isIdle()) {
+				notify(ctx, "Somni: wait for the current Pi turn to settle first.");
+				return;
+			}
+			const topic = args?.trim() ?? "";
+			const material = await getBackend().request<{ guide: string; claims: string; n: number }>("share_material", { topic });
+			if (!material.n) {
+				pi.sendMessage({ customType: "somni-share", content: topic ? `Somni has no current notes about "${topic}" ` +
+					"to share yet. A night /somni-dream turns your sessions into notes." : "Somni has no current notes to share yet.",
+					display: true });
+				return;
+			}
+			const content = `${material.guide}\nTopic: ${topic || "what this memory knows best, as one skill"}\n\n` +
+				`## Notes to pick from\n${material.claims}\n\nWhen the share is written, tell the user where it is and ` +
+				"suggest they read SKILL.md and EVIDENCE.md before sharing them.";
+			pi.sendMessage({ customType: "somni-share-input", content, display: false }, { triggerTurn: true });
+			if (ctx.mode === "json" || ctx.mode === "print") await ctx.waitForIdle();
 		},
 	});
 

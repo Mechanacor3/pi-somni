@@ -52,6 +52,7 @@ with what is most relevant. The design follows Anthropic's essay
 |---|---|
 | `/somni-dream [focus]` | Consolidate recent sessions into claims |
 | `/somni-wiki [goal]` | Gather claims into linked wiki pages |
+| `/somni-share <topic>` | Draft a skill for other people from what memory learned about a topic, with its evidence |
 | `/somni-doctor [all]` | Check settings, the store and features offline, without a model call |
 
 | Tool | Purpose |
@@ -61,6 +62,7 @@ with what is most relevant. The design follows Anthropic's essay
 | `somni_image` | Load image evidence by transcript ID and SHA-256 |
 | `somni_note` | Add a cited claim while working |
 | `somni_dream` | Submit a consolidation pass during `/somni-dream` or `/somni-wiki` |
+| `somni_share` | Write a shared skill (SKILL.md and EVIDENCE.md) when the user asks for one |
 
 Two skills come with the package. `somni-memory` tells the agent how to use the index, when to recall, and what is
 worth a note. `somni-action-words` covers action words. Pi lists a skill only when the `read` tool is active.
@@ -82,6 +84,9 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
 - **[Outcomes](docs/outcomes.md).** `somni outcome` records what happened after the agent was done (a CI failure, a
   review, a grader's verdict, the user's "that didn't work"). Dreams see it beside the agent's own report and learn
   most from the times it said "done" and wasn't.
+- **[Sharing](docs/sharing.md).** `/somni-share <topic>` turns what you learned over weeks of work into a skill
+  other people's agents can load. Each guideline says what backs it (records, days, CI and benchmark outcomes), and
+  drafts with personal details in them are refused.
 - **[Action words](docs/action-words.md)** (experimental). Dreams turn a recurring sequence of tool calls into one
   checked Python function that the agent calls as a single tool.
 - **[Daydreams](docs/long-sessions.md#daydreams-experimental)** (experimental). Dreams that run beside a long session,
