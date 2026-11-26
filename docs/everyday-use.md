@@ -142,8 +142,9 @@ daydreams:
 ```
 
 A daydream runs in a separate Pi process and never blocks your session. The next prompt's index
-shows a one-line notice of what it added. It is experimental. A night `/somni-dream` and
-`/somni-wiki` are still worth running.
+shows a one-line notice of what it added. If you quit before the next one is due, the next
+session in that project dreams those last turns first. It is experimental. A night
+`/somni-dream` and `/somni-wiki` are still worth running.
 
 ## Your personal memory, across projects
 
@@ -176,14 +177,23 @@ Several Pi sessions can use one store at once: each records into it, and what yo
 them counts. One of them owns the store and runs its dreams; see
 [several sessions on one memory](long-sessions.md#several-sessions-on-one-memory).
 
+## Sharing what you learned
+
+After a couple of weeks on something new, `/somni-share <topic>` turns what Somni learned about it into a skill other
+people's agents can load: a `SKILL.md` whose guidelines each say what backs them (how many records, over how many
+days, what CI or a benchmark found) and an `EVIDENCE.md` listing those records by hash, without their text. It refuses
+drafts with your name, paths or keys in them, and it only writes files, in `.pi/somni/shares/`. See
+[Sharing](sharing.md).
+
 ## Privacy and pausing
 
-- Everything stays on your machine, in the store directory. Somni sends memory to a model only
-  as the agent's own context, and during the dreams and daydreams you run.
+- Everything stays on your machine, in the store directory and `~/.somni`. Somni sends memory to
+  a model only as the agent's own context, and during the dreams and daydreams you run. A share
+  is written to disk; it goes no further unless you send it.
 - `SOMNI_RECORD=0 pi` runs one session that uses memory but records nothing. To stop recording
   in a project, set `store.record: false` in its `.pi/somni.conf`.
-- To start fresh, close Pi and move the store directory somewhere private. The next session
-  creates a new one.
+- To start fresh, close Pi and move the store directory (and `~/.somni`, for what Somni learned
+  about you) somewhere private. The next session creates a new one.
 
 ## Checking that it helps
 

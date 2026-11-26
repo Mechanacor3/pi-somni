@@ -107,7 +107,8 @@ their own order.
 
 Each recording session holds a lock file under `.somni-sessions/` for its life, so the others can tell it's still
 there; a file whose session is gone is removed. Pi starts one local Python child for the session and exchanges
-requests over private pipes. The owner's child holds an OS lock on `.somni-session.lock`. The file stays in the workspace; leave it in place so concurrent sessions lock the same file.
+requests over private pipes. The owner's child holds an OS lock on `.somni-session.lock`. The file stays in the
+workspace; leave it in place so concurrent sessions lock the same file.
 If Pi is killed, the pipe closes and the child releases its lock. If the child is killed too, the kernel releases it
 directly. The next writer verifies the chain and recovers an interrupted transaction on startup. PID namespaces do not
 affect ownership on the same mounted store. New writes extend the hash chain and use a transaction journal. A

@@ -91,3 +91,10 @@ checks the settings and the store without a model call and says what to fix.
 If the index lists learned action words, see the `somni-action-words` skill. A word does a
 recurring chore in one call. When one fits your next step, use it instead of making its tool
 calls one by one, then check that it had the effect you needed.
+
+## Sharing
+
+When the user asks to share what you learned about a topic with other people, as a skill or a
+guide, use `/somni-share <topic>` or call `somni_share`: write each guideline for someone else's
+projects, cite the claims it rests on, and leave out names, paths and anything private. Tell
+the user where the files are and to read them before sharing; nothing is published.
