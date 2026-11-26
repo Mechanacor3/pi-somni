@@ -56,7 +56,7 @@ class ShareTest(unittest.TestCase):
         self.assertIn("- p:n000001 [verified;", everything["claims"])
 
     def test_a_share_writes_a_skill_and_its_evidence_with_record_hashes(self):
-        result = self.share(intro="Lessons from two weeks of CI work.",
+        result = self.share(intro="Lessons from two weeks of CI work.", title="Container-first test runs",
                             guidelines=[{"text": "Run slow test suites in a container rather than on the host.",
                                          "claims": ["n000001"]},
                                         {"text": "Lead each reply with the answer.", "claims": ["p:n000001"]}])
@@ -64,6 +64,7 @@ class ShareTest(unittest.TestCase):
         self.assertEqual((folder.name, result["guidelines"], result["replaced"]), ("container-tests", 2, False))
         skill = (folder / "SKILL.md").read_text()
         self.assertTrue(skill.startswith("---\nname: container-tests\ndescription: \"How to run flaky"), skill)
+        self.assertIn("# Container-first test runs\n\nLessons from two weeks of CI work.", skill)
         self.assertIn("1. Run slow test suites in a container rather than on the host.\n   *Evidence: 3 record(s)", skill)
         self.assertIn("the author said it once; 1 tool result(s); outcomes 1 pass (ci). [E1](EVIDENCE.md#e1)*", skill)
         evidence = (folder / "EVIDENCE.md").read_text()

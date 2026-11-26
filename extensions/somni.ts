@@ -1154,6 +1154,7 @@ ${candidateGuide(candidates)}`;
 		parameters: Type.Object({
 			name: Type.String({ description: "lowercase-hyphenated, up to 64 characters" }),
 			description: Type.String({ description: "what the skill does and when to load it, up to 1024 characters" }),
+			title: Type.Optional(Type.String({ description: "the heading, up to 80 characters" })),
 			intro: Type.Optional(Type.String()),
 			guidelines: Type.Array(Type.Object({ text: Type.String(), claims: Type.Array(Type.String()) })),
 		}),

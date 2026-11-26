@@ -47,7 +47,7 @@ GUIDE = (
     "many days. Leave out claims an outcome contradicted. Don't overstate: a guideline that rests on one record says "
     "so (\"in one case ...\"), or is left out.\n"
     "- name: lowercase-hyphenated, up to 64 characters. description: what the skill does and when to load it, for an "
-    "agent deciding whether to (up to 1024 characters). intro: an optional short paragraph.\n"
+    "agent deciding whether to (up to 1024 characters). title: an optional heading. intro: an optional short paragraph.\n"
     "- Somni adds each guideline's evidence and writes EVIDENCE.md with the records' hashes; don't write those "
     "yourself. It refuses a draft with personal details in it (home paths, the user's name or username, the machine's "
     "name, emails, IP addresses, anything shaped like a key); fix what it lists and call again.\n")
@@ -216,6 +216,9 @@ def build(memory, personal, proposal, *, record_hash, personal_prefix, version, 
         raise ShareError("a share is an object with name, description, intro and guidelines")
     name, description = proposal.get("name"), proposal.get("description")
     intro, guidelines = proposal.get("intro") or "", proposal.get("guidelines")
+    title = proposal.get("title") or name.replace("-", " ").capitalize()
+    if not isinstance(title, str) or not title.strip() or len(title) > 80 or "\n" in title:
+        raise ShareError("title must be one line up to 80 characters")
     if not isinstance(name, str) or not NAME.fullmatch(name) or len(name) > MAX_NAME:
         raise ShareError("name must be lowercase words joined by hyphens, up to 64 characters")
     if not isinstance(description, str) or not description.strip() or len(description) > MAX_DESCRIPTION:
@@ -239,7 +242,7 @@ def build(memory, personal, proposal, *, record_hash, personal_prefix, version, 
             item["personal"] = store is personal
             items.append(item)
         rows.append({"text": " ".join(text.split()), "items": items})
-    texts = [("name", name), ("description", description), ("intro", intro)]
+    texts = [("name", name), ("title", title), ("description", description), ("intro", intro)]
     texts += [(f"guideline {n}", row["text"]) for n, row in enumerate(rows, 1)]
     texts += [(f"guideline {n} evidence", " ".join(item.get("by", "") for i in row["items"] for item in i["records"]))
               for n, row in enumerate(rows, 1)]
@@ -252,8 +255,7 @@ def build(memory, personal, proposal, *, record_hash, personal_prefix, version, 
     replaced = folder.exists()
     folder.mkdir(parents=True, exist_ok=True)
     today = datetime.date.today().isoformat()
-    title = name.replace("-", " ").capitalize()
-    body = [f"# {title}", ""]
+    body = [f"# {title.strip()}", ""]
     if intro.strip():
         body += [intro.strip(), ""]
     body += ["## Guidelines", ""]
