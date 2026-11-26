@@ -3453,7 +3453,7 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
             except (ValueError, OSError, KeyError, TypeError, RecursionError, OverflowError) as exc:
                 reply(request_id, error=str(exc))
         return
-    personal = _open_personal(personal_path) if personal_path else None
+    personal = _open_personal(personal_path, scheduled_verification=True) if personal_path else None
     lease = _Lease(memory)
     slot = _SessionSlot(memory, session_label) if record else None
     try:
@@ -3528,15 +3528,16 @@ def _personal_ids(text):
     return _LOCAL_ID.sub(lambda m: PERSONAL + m[1], text)
 
 
-def _open_personal(path):
+def _open_personal(path, *, scheduled_verification=False):
     """The personal store: one memory of the user shared by all their projects. It records no sessions itself;
-    dreams copy into it the records its claims cite."""
+    dreams copy into it the records its claims cite. A serving backend verifies its chains on a schedule, as it
+    does the project's, instead of on every turn's index."""
     workspace = pathlib.Path(path).expanduser()
     workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
     memory = SomniMemory(workspace, PERSONAL_SUBJECT)
     if not os.path.lexists(memory.store):
         SomniMemory.create(workspace, PERSONAL_SUBJECT, "personal", "personal")
-    return memory
+    return SomniMemory(workspace, PERSONAL_SUBJECT, scheduled_verification=scheduled_verification)
 
 
 def _layered_index(memory, personal, max_bytes, *, query="", words=None):
