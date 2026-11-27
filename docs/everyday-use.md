@@ -135,6 +135,29 @@ in its tool list and memory index, and calls it in one step.
     tools: [read, grep, mcp__tracker__get_issue, mcp__tracker__comment]
   ```
 
+## Search by meaning (optional)
+
+`somni_search` ranks the transcript by words: records holding the whole query first, then those sharing the most
+of its words, newer first among equals. A query in double quotes finds that exact phrase only.
+
+Words miss paraphrases ("milestone post" for "funding announcement"). Point `search.embeddings_url` at any
+OpenAI-compatible embeddings endpoint and search also ranks by meaning, fusing the two. A small BERT model served
+locally works; for example, with llama.cpp:
+
+```sh
+llama-server -m bge-small-en-v1.5-f16.gguf --embeddings --host 127.0.0.1 --port 8091
+```
+
+```yaml
+search:
+  embeddings_url: http://127.0.0.1:8091/v1/embeddings
+  embeddings_query_prefix: "Represent this sentence for searching relevant passages: "
+```
+
+Vectors are cached in `embeddings.sqlite` beside the store, outside its hash chain. The first search embeds every
+record; `somni embed` does that ahead of time and drops vectors of text that has since been forgotten. If the endpoint
+is down, search ranks words only.
+
 ## Long sessions (optional)
 
 If one Pi session runs for hours, Somni can dream in the background while you keep working:

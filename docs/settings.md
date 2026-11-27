@@ -59,6 +59,10 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `dreams.lenient_image_evidence` | `SOMNI_LENIENT_IMAGE_EVIDENCE` | off | Keep a citation's `{ref}` when only its image is wrong, downgrading the claim to uncertain if needed |
 | `memory.forget_after_days` | `SOMNI_FORGET_AFTER_DAYS` | `30` | After a night dream, transcript records older than this keep only a stub: the start of their text, the quotes claims cite, and their place in the hash chain. See [Memory over time](memory-over-time.md). `0` keeps every record in full, and so does a value that isn't a number of days (0–36500) |
 | `memory.decay` | `SOMNI_MEMORY_DECAY` | `0.5` | How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation. `0` ranks claims by how often they were used, ignoring time (0–1) |
+| `search.embeddings_url` | `SOMNI_EMBEDDINGS_URL` | `` | An OpenAI-compatible embeddings endpoint (`http://127.0.0.1:8091/v1/embeddings` for a local llama.cpp server). `somni_search` then ranks by meaning as well as words; `somni embed` builds the cache ahead. Empty: words only |
+| `search.embeddings_model` | `SOMNI_EMBEDDINGS_MODEL` | `` | The model name sent to that endpoint |
+| `search.embeddings_query_prefix` | `SOMNI_EMBEDDINGS_QUERY_PREFIX` | `` | Text put before each search query, for models trained with one (bge: `Represent this sentence for searching relevant passages: `) |
+| `search.embeddings_cache` | `SOMNI_EMBEDDINGS_CACHE` | embeddings.sqlite beside the store | The SQLite file holding vectors, outside the store's hash chain; copies of a store can share one |
 | `merge.forgetting` | `SOMNI_MERGE_FORGETTING` | `wins` | What `somni merge` does with a shared record one side forgot. `wins` forgets it here too; `conflict` stops the merge and lists them; `keep` takes the whole text back from the side that still has it |
 | `wiki.link_style` | `SOMNI_LINK_STYLE` | `markdown` | Vault links: `markdown` (relative `[Title](path.md)`) or `wikilink` (Obsidian `[[slug\|Title]]`) |
 | `wiki.page_guide` | `SOMNI_PAGE_GUIDE` | practical playbook guidance | Replaces the default wiki-writing guidance |

@@ -11,6 +11,8 @@
     somni snapshot --show FILE                  describe a snapshot without restoring it
     somni merge SOURCE [--personal | --store DIR] [--cwd DIR] [--forgetting wins|conflict|keep] [--dry-run]
                                                 bring what a fork learned (a snapshot or a store) into this store
+    somni embed [--personal | --store DIR] [--cwd DIR] [--no-prune]
+                                                build the search embeddings cache now; drop vectors nothing uses
     somni config template                       print a commented config file with every setting
     somni config show [--cwd DIR]               print every setting's value and where it came from
     somni config table                          print the settings table in docs/settings.md
@@ -144,6 +146,35 @@ def merge_command(argv):
         return 2
 
 
+def embed_command(argv):
+    import argparse
+    import json
+    import os
+    from somni import config as C
+    from somni import embed as E
+    from somni import store as S
+    ap = argparse.ArgumentParser(prog="somni embed", description="Embed every transcript record for meaning-based "
+                                 "search (search.embeddings_url), and drop cached vectors no current record uses.")
+    ap.add_argument("--cwd", default=os.getcwd(), help="the directory Pi starts in, which decides the store (default: here)")
+    ap.add_argument("--personal", action="store_true", help="the personal store (~/.somni)")
+    ap.add_argument("--store", help="the store directory (holding somni-v1/)")
+    ap.add_argument("--subject", help="the store's subject, when --store names a store with another subject")
+    ap.add_argument("--no-prune", action="store_true", help="keep vectors of text that is gone (forgotten or replaced)")
+    args = ap.parse_args(argv)
+    try:
+        os.environ.update(C.resolve(pathlib.Path(args.cwd).resolve(), dict(os.environ))["env"])
+        workspace, subject = store_location(args)
+        memory = S.SomniMemory(workspace, subject).load()
+
+        def text_of(record):
+            return " ".join((record["text"], record.get("run_label", ""), *record.get("tags", [])))
+        print(json.dumps(E.warm(memory, text_of, prune=not args.no_prune), indent=2))
+        return 0
+    except (S.MemoryError, ValueError, OSError, C.ConfigError) as exc:
+        print(f"somni: {exc}", file=sys.stderr)
+        return 2
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -158,6 +189,8 @@ def main(argv):
         return snapshot_command(rest, command == "restore")
     if command == "merge":
         return merge_command(rest)
+    if command == "embed":
+        return embed_command(rest)
     if command == "config":
         from somni import config
         if rest[:1] == ["show"]:

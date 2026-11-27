@@ -2295,6 +2295,12 @@ class SomniMemory:
 
         ranked = {record["seq"]: score for score, record in
                   _bm25([terms(record) for record in self.transcript], self.transcript, query)}
+        meaning = _embed_module().rank(self, self.transcript, lambda r: " ".join(fields(r)), query)
+        if meaning is not None:  # fuse word and meaning rankings by reciprocal rank
+            words = {seq: position for position, seq in
+                     enumerate(sorted(ranked, key=lambda s: (ranked[s], s), reverse=True))}
+            ranked = {seq: (1 / (60 + words[seq]) if seq in words else 0.0) +
+                      (1 / (60 + meaning[seq]) if seq in meaning else 0.0) for seq in {*words, *meaning}}
         hits = [record for record in self.transcript if record["seq"] in exact or record["seq"] in ranked]
         hits.sort(key=lambda r: (r["seq"] in exact, ranked.get(r["seq"], 0.0), r["seq"]), reverse=True)
         return hits[:limit]
@@ -3241,6 +3247,12 @@ def _action_module():
         sys.path.insert(0, root)
     from somni import actions
     return actions
+
+
+def _embed_module():
+    _action_module()  # puts the package on sys.path
+    from somni import embed
+    return embed
 
 
 def _share_module():

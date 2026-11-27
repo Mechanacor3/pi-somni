@@ -4,7 +4,8 @@ import { createInterface } from "node:readline";
 type Reply = { id: number; result?: unknown; error?: string };
 
 /** The settings the store itself reads. The backend gets these and nothing else from Pi's environment. */
-const STORE_ENV = ["SOMNI_LINK_STYLE", "SOMNI_NOW", "SOMNI_FORGET_AFTER_DAYS", "SOMNI_MEMORY_DECAY", "SOMNI_DREAM_RECORDS", "SOMNI_RUN_LABEL"];
+const STORE_ENV = ["SOMNI_LINK_STYLE", "SOMNI_NOW", "SOMNI_FORGET_AFTER_DAYS", "SOMNI_MEMORY_DECAY", "SOMNI_DREAM_RECORDS", "SOMNI_RUN_LABEL",
+	"SOMNI_EMBEDDINGS_URL", "SOMNI_EMBEDDINGS_MODEL", "SOMNI_EMBEDDINGS_QUERY_PREFIX", "SOMNI_EMBEDDINGS_CACHE"];
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void };
 
 export class Backend {

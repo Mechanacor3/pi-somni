@@ -180,7 +180,11 @@ class SchemaCoverage(unittest.TestCase):
             if match and match.group(2):
                 lines.append(f"  {match.group(1)}: {match.group(2)}")
             elif re.fullmatch(r"[a-z]+:", line):
+                if lines and re.fullmatch(r"[a-z]+:", lines[-1]):
+                    lines.pop()  # a section whose settings all default to empty
                 lines.append(line)
+        if lines and re.fullmatch(r"[a-z]+:", lines[-1]):
+            lines.pop()
         with tempfile.TemporaryDirectory() as tmp:
             conf = pathlib.Path(tmp) / "all.conf"
             conf.write_text("\n".join(lines) + "\n")

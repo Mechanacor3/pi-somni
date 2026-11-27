@@ -108,6 +108,17 @@ SETTINGS = (
     Setting("memory.decay", "SOMNI_MEMORY_DECAY", "number", 0.5,
             "How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation. "
             "`0` ranks claims by how often they were used, ignoring time", 0, 1.0),
+    Setting("search.embeddings_url", "SOMNI_EMBEDDINGS_URL", "str", "",
+            "An OpenAI-compatible embeddings endpoint (`http://127.0.0.1:8091/v1/embeddings` for a local llama.cpp "
+            "server). `somni_search` then ranks by meaning as well as words; `somni embed` builds the cache ahead. "
+            "Empty: words only"),
+    Setting("search.embeddings_model", "SOMNI_EMBEDDINGS_MODEL", "str", "", "The model name sent to that endpoint"),
+    Setting("search.embeddings_query_prefix", "SOMNI_EMBEDDINGS_QUERY_PREFIX", "text", "",
+            "Text put before each search query, for models trained with one (bge: `Represent this sentence for "
+            "searching relevant passages: `)"),
+    Setting("search.embeddings_cache", "SOMNI_EMBEDDINGS_CACHE", "path", None,
+            "The SQLite file holding vectors, outside the store's hash chain; copies of a store can share one",
+            default_text="embeddings.sqlite beside the store"),
     Setting("merge.forgetting", "SOMNI_MERGE_FORGETTING", "enum", "wins",
             "What `somni merge` does with a shared record one side forgot. `wins` forgets it here too; `conflict` stops "
             "the merge and lists them; `keep` takes the whole text back from the side that still has it",
