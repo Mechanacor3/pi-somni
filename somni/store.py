@@ -1051,13 +1051,16 @@ class SomniMemory:
             if not isinstance(item, dict) or set(item) - {"ref", "quote", "image_sha256"}:
                 raise MemoryError("evidence must contain ref and optional quote or image_sha256")
             ref, quote = item.get("ref"), item.get("quote")
-            if not isinstance(ref, str) or not EVIDENCE_ID.fullmatch(ref) or ref not in records or ref in seen:
+            if not isinstance(ref, str) or not EVIDENCE_ID.fullmatch(ref):
+                raise MemoryError(f"evidence reference {ref!r} is not a transcript ID such as t000123")
+            if ref not in records:
                 horizon = getattr(records, "horizon", None)
-                beyond = horizon and isinstance(ref, str) and EVIDENCE_ID.fullmatch(ref) and ref > horizon
-                raise MemoryError(f"evidence reference {ref!r} is after this daydream's snapshot ({horizon})" if beyond
-                                  else f"evidence reference {ref!r} is missing, duplicated, or unknown")
+                raise MemoryError(f"evidence reference {ref!r} is after this pass's snapshot ({horizon})"
+                                  if horizon and ref > horizon else f"evidence reference {ref!r} is not in the transcript")
             if quote is not None and (not isinstance(quote, str) or not quote or quote not in records[ref]["text"]):
-                raise MemoryError("evidence quote must occur exactly in the referenced transcript")
+                raise MemoryError(f"evidence quote for {ref} must occur exactly in that record")
+            if ref in seen:  # a record cited twice (two quotes from it): its first citation stands
+                continue
             digest = item.get("image_sha256")
             if "image_sha256" in item:
                 digest = _resolve_digest(records[ref], ref, digest)

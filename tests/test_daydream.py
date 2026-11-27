@@ -52,7 +52,7 @@ class DaydreamTest(unittest.TestCase):
     def test_snapshot_pass_commits_while_recording_and_cites_only_up_to_its_head(self):
         daydream = SomniMemory(self.ws, "s").load()  # a second writer, as a daydream backend is
         self.m.record("tool_result", 'TOOL probe({"i":4}) -> {"echo":4}', tool_ok=True)  # t000004, after H=3
-        with self.assertRaisesRegex(SomniError, "'t000004' is after this daydream's snapshot \\(t000003\\)"):
+        with self.assertRaisesRegex(SomniError, "'t000004' is after this pass's snapshot \\(t000003\\)"):
             daydream.dream({"schema": 1, "operations": [add("t000004", '"echo":4')]}, snapshot=3)
         with self.assertRaisesRegex(SomniError, "offline-only"):
             daydream.dream({"schema": 1, "operations": [add("t000001", '"echo":1')]})  # no snapshot: still closed-only

@@ -53,6 +53,18 @@ class BacklogTest(unittest.TestCase):
         self.assertEqual(self.m.load().day_lessons(), [])  # backlog passes are not daydreams
         self.assertEqual(self.request("dream_status")["undreamed"], 0)
 
+    def test_a_record_cited_twice_keeps_its_first_citation_and_both_quotes_must_hold(self):
+        twice = {"op": "add", "text": "Notes are numbered.", "status": "verified", "salience": 2,
+                 "evidence": [{"ref": self.ids[0], "quote": "note number"}, {"ref": self.ids[0], "quote": "number 0"}]}
+        self.request("dream", proposal_json=json.dumps({"schema": 1, "operations": [twice]}))
+        self.assertEqual(self.m.load().claims["n000001"]["evidence"], [{"ref": self.ids[0], "quote": "note number"}])
+        bad = {**twice, "evidence": [{"ref": self.ids[0], "quote": "note number"}, {"ref": self.ids[0], "quote": "nope"}]}
+        with self.assertRaisesRegex(SomniError, f"quote for {self.ids[0]} must occur exactly"):
+            self.request("dream", proposal_json=json.dumps({"schema": 1, "operations": [bad]}))
+        with self.assertRaisesRegex(SomniError, "'t999999' is not in the transcript"):
+            self.request("dream", proposal_json=json.dumps({"schema": 1, "operations": [
+                {**twice, "evidence": [{"ref": "t999999"}], "status": "uncertain"}]}))
+
     def test_status_counts_the_users_unreviewed_turns_and_when_the_last_dream_ran(self):
         status = self.request("dream_status")
         self.assertEqual((status["undreamed"], status["undreamed_turns"], status["last_at"]), (30, 30, None))
