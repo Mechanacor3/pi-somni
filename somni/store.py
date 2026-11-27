@@ -1748,7 +1748,7 @@ class SomniMemory:
         return claim_id
 
     def dream(self, proposal, partial=False, *, allow_empty=False, viewed_images=None, actions=None,
-              snapshot=None, usage=None, lenient_images=False):
+              snapshot=None, usage=None, lenient_images=False, backlog=False):
         """Apply one offline consolidation pass.
 
         By default the pass is all-or-nothing.  With ``partial=True`` an operation
@@ -1763,6 +1763,9 @@ class SomniMemory:
         ``snapshot`` (a transcript count H) makes this a live pass, a daydream: it may run
         while a session keeps recording, may cite only records 1..H, and is bound to the
         transcript head at H rather than the current head.
+
+        ``backlog`` with ``snapshot`` H makes this one pass of a night that works through a backlog in order: it
+        reviewed records up to H only, so the next pass starts there. It is not a daydream (not ``live``).
 
         ``lenient_images`` keeps a citation's {ref} when only its image digest is wrong or unviewed,
         downgrading a verified claim that is left without proof; the pass lists each downgrade.
@@ -1807,6 +1810,7 @@ class SomniMemory:
             forget = self._plan_forgetting(prepared) if night else {}
             self._commit_dream(proposal_bytes, prepared, next_claim, rejected,
                                author=(actions or {}).get("author", "dream"), snapshot=snapshot, usage=usage,
+                               backlog=backlog,
                                downgrades=downgrades, forgot={str(seq): sha(stub) for seq, stub in forget.items()})
             self._load_locked(force=True)
             if forget:
@@ -2038,7 +2042,7 @@ class SomniMemory:
         return next_claim
 
     def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None, usage=None,
-                      downgrades=(), forgot=None):
+                      downgrades=(), forgot=None, backlog=False):
         words = [body for op, body in prepared if op == "action"]
         prepared = [(op, body) for op, body in prepared if op != "action"]
         wiki_events = []
@@ -2079,7 +2083,9 @@ class SomniMemory:
             dream["operation_count"] += len(words)
         if author != "dream":
             dream["author"] = author
-        if snapshot is not None:
+        if snapshot is not None and backlog:
+            dream["backlog"] = True  # one pass of a backlog: it reviewed records up to its snapshot only
+        elif snapshot is not None:
             dream["live"] = True  # a daydream: committed while recording continued past its snapshot
         if downgrades:
             dream["image_downgrades"] = list(downgrades)
@@ -2871,6 +2877,10 @@ class SomniMemory:
                 active[claim["status"]] += 1
         return {
             "phase": self.state["phase"], "transcript_count": self.state["transcript_count"],
+            "undreamed": self.state["transcript_count"] - (self.dreams[-1]["transcript_count"] if self.dreams else 0),
+            "undreamed_turns": sum(r["source"] == "ordinary_observation" and r["text"].startswith("USER:")
+                                   and not any(t == "contributor" or t.startswith("contributor:") for t in r.get("tags", ()))
+                                   for r in self.transcript[self.dreams[-1]["transcript_count"] if self.dreams else 0:]),
             "transcript_head": self.state["transcript_head"], "active_claims_by_status": active,
             "claim_count": len(self.claims), "dream_count": self.state["dream_count"],
             "last_pass": _dream_summary(self.dreams[-1]) if self.dreams else None,
@@ -3080,10 +3090,12 @@ def _dream_summary(dream):
             **({"rejected": dream["rejected"]} if dream.get("rejected") else {}),
             **({"image_downgrades": dream["image_downgrades"]} if dream.get("image_downgrades") else {}),
             **({"live": True} if dream.get("live") else {}),
+            **({"backlog": True} if dream.get("backlog") else {}),
             **({"usage": dream["usage"]} if dream.get("usage") else {}),
             **({"added_ids": dream["added_ids"]} if dream.get("added_ids") else {}),
             "merged_count": dream.get("merged_count", default), "rejected_count": len(dream.get("rejected", [])),
             "operation_count": dream["operation_count"], "transcript_count": dream["transcript_count"],
+            **({"at": dream["at"]} if dream.get("at") else {}),
             "transcript_head": dream["transcript_head"]}
 
 
@@ -3091,21 +3103,34 @@ DAYDREAM_OVERLAP = 8  # records before the last pass's head that a daydream sees
 
 
 def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORDS,
-            record_bytes=DEFAULT_DREAM_RECORD_BYTES, head=None, related=False):
+            record_bytes=DEFAULT_DREAM_RECORD_BYTES, head=None, related=False, backlog=False):
     """The records a dream reviews: the newest `record_limit` up to the head. A daydream (`head` set) starts a few
-    records before the last pass's head instead, so it doesn't resend records earlier passes already reviewed."""
+    records before the last pass's head instead, so it doesn't resend records earlier passes already reviewed.
+
+    With `backlog`, a night dream facing more unreviewed records than it can take reviews the oldest of them first,
+    and says how far it got (`through`, a transcript count to bind its pass to) and how many wait (`remaining`)."""
     if type(record_limit) is not int or not 1 <= record_limit <= DEFAULT_DREAM_RECORDS:
         raise MemoryError(f"dream record limit must be 1-{DEFAULT_DREAM_RECORDS}")
     if type(record_bytes) is not int or not 64 <= record_bytes <= MAX_RECORD_BYTES:
         raise MemoryError(f"dream record excerpt must be 64-{MAX_RECORD_BYTES} bytes")
     records = memory.transcript if head is None else memory.transcript[:head]
     reviewed = None
+    chunk = {}
+    last = memory.dreams[-1]["transcript_count"] if memory.dreams else 0
+    if head is None and backlog and len(records) - last > record_limit:
+        start = max(0, last - DAYDREAM_OVERLAP)
+        if start:
+            reviewed = records[start - 1]["id"]
+        through = last + record_limit
+        chunk = {"through": through, "remaining": len(records) - through}
+        records = records[start:through]
     if head is not None and memory.dreams:
         start = min(max(0, memory.dreams[-1]["transcript_count"] - DAYDREAM_OVERLAP), max(0, len(records) - DAYDREAM_OVERLAP))
         if start:
             reviewed = records[start - 1]["id"]  # this record and those before it were reviewed by earlier passes
         records = records[start:]
-    records = records[-record_limit:]
+    if not chunk:
+        records = records[-record_limit:]
     attachments = []
     budget = 1024 * 1024
     viewed.clear()
@@ -3131,7 +3156,7 @@ def _recent(memory, include_images, viewed, *, record_limit=DEFAULT_DREAM_RECORD
                 for r in records]
     claims = memory.related_claims(records) if related else []
     return {"records": excerpts, "attachments": attachments, **({"reviewed_through": reviewed} if reviewed else {}),
-            **({"claims": claims} if claims else {})}
+            **({"claims": claims} if claims else {}), **chunk}
 
 
 def _action_module():
@@ -3215,10 +3240,16 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
             raise MemoryError(f"proposal_json is not valid JSON ({exc}); nothing committed") from None
         # A deep-sleep run commits while its session keeps recording: a live pass bound to the current head.
         live = memory.load().state["transcript_count"] if args.get("live") is True and writable and daydream is None else None
+        through = args.get("through") if daydream is None else None
+        if through is not None:  # one pass of a backlog: bound to the records it reviewed
+            if type(through) is not int or not 0 < through <= memory.load().state["transcript_count"]:
+                raise MemoryError("through must be a transcript count")
+            live = through
         dream, layered = _dream_layered(memory, personal if daydream is None else None, parsed, partial=True,
                                         allow_empty=True, viewed_images=viewed, actions=options,
                                         snapshot=daydream if daydream is not None else live, usage=args.get("usage"),
-                                        lenient_images=args.get("lenient_images") is True)
+                                        lenient_images=args.get("lenient_images") is True,
+                                        **({"backlog": True} if through is not None else {}))
         memory.clear_dream_cache()
         summary = {**dream, **_dream_summary(dream)}
         if layered:
@@ -3315,6 +3346,14 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
                            deny=args.get("deny") or "", home=args.get("home"))
         except S.ShareError as exc:
             raise MemoryError(str(exc)) from None
+    elif method == "dream_status":  # light: read every turn for the status line
+        memory.load()
+        last = memory.dreams[-1] if memory.dreams else None
+        tail = memory.transcript[last["transcript_count"] if last else 0:]
+        return {"undreamed": len(tail), "last_at": last.get("at") if last else None,
+                "undreamed_turns": sum(r["source"] == "ordinary_observation" and r["text"].startswith("USER:") and
+                                       not any(t == "contributor" or t.startswith("contributor:") for t in r.get("tags", ()))
+                                       for r in tail)}
     elif method == "records_since":
         memory.load()
         start = args.get("count")
@@ -3325,6 +3364,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         recent = _recent(memory.load(), args.get("include_images", False), viewed,
                          record_limit=args.get("record_limit", DEFAULT_DREAM_RECORDS),
                          record_bytes=args.get("record_bytes", DEFAULT_DREAM_RECORD_BYTES), head=daydream,
+                         backlog=daydream is None and args.get("backlog") is True,
                          related=args.get("related") is True)
         if personal is not None and daydream is None and args.get("related") is True:
             # The night dream sees the personal claims these records touch (and every personal standing one), so it
@@ -3436,9 +3476,12 @@ def _serve(memory, record, *, context, image_bytes, image_max_edge, actions=Fals
         # A daydream backend takes no lease: the live session keeps recording. It reads up to the head
         # it saw at start and may write only its dream pass, under the store lock, bound to that head.
         memory = SomniMemory(memory.workspace, memory.subject_id, scheduled_verification=True)
-        head = memory.load().state["transcript_count"]
+        memory.load()
+        head = memory.state["transcript_count"]
         if not head:
             raise MemoryError("nothing to daydream about: the transcript is empty")
+        # Facing a backlog, a daydream reviews its oldest records first: the next one continues from there.
+        head = min(head, (memory.dreams[-1]["transcript_count"] if memory.dreams else 0) + DEFAULT_DREAM_RECORDS)
         reply(0, result={"writable": True, "daydream_head": head})
         while line := sys.stdin.buffer.readline(MAX_BACKEND_REQUEST + 1):
             if len(line) > MAX_BACKEND_REQUEST:

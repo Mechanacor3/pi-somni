@@ -443,6 +443,38 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.pi.prompt("Anything else?")
         self.assertEqual(sum("Somni daydream d000001" in message for message in shown()), 1, shown())
 
+    def test_a_night_works_through_a_backlog_oldest_first_and_the_footer_counts_what_waits(self):
+        self.pi.close()
+        empty = json.dumps({"schema": 1, "operations": []})
+        self.upstream.script = plan_script({
+            "What is the fee": [[("lookup_fee", {"cabin": "economy", "price": 300})]],
+            "Dream pass.": [[("somni_dream", {"proposal_json": empty})]],
+            "Anything else": [],
+        })
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port,
+                            env={"SOMNI_DREAM_RECORDS": "2", "SOMNI_DREAM_MAX_PASSES": "2"})
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        self.pi.prompt("Anything else?")
+        status = lambda: [re.sub(r"\x1b\[[0-9;]*m", "", e.get("statusText") or "") for e in self.pi.events
+                          if e.get("method") == "setStatus" and e.get("statusKey") == "somni"]
+        self.assertIn("somni: 2 turns, no dream yet", status())
+        store = self.work / ".pi" / "somni"
+        total = SomniMemory(store, "pi").load().state["transcript_count"]
+        self.assertGreater(total, 4)
+        self.pi.prompt("/somni-dream")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and len(SomniMemory(store, "pi").load().dreams) < 2:
+            time.sleep(0.3)
+        self.pi.read(lambda r: r.get("method") == "notify" and "still wait for a dream" in r.get("message", ""))
+        dreams = SomniMemory(store, "pi").load().dreams
+        self.assertEqual([(d["transcript_count"], bool(d.get("backlog"))) for d in dreams], [(2, True), (4, True)])
+        self.pi.read(lambda r: r.get("method") == "setStatus" and "last dream" in r.get("statusText", ""))
+        sent = [json.dumps(r["messages"]) for r in self.upstream.requests if "Dream pass." in json.dumps(r["messages"])]
+        self.assertIn("These are the oldest records no dream has reviewed yet", sent[0])
+        shown = [e.get("message", "") for e in self.pi.events if e.get("method") == "notify"]
+        self.assertTrue(any(f"{total - 4} record(s) still wait for a dream" in m for m in shown), shown)
+        self.assertRegex(status()[-1], r"somni: last dream \d+ turns? and under a day ago")
+
     @unittest.skipUnless(BINARY, "the daydream worker starts the host Pi binary")
     def test_turns_left_undreamed_at_quit_are_dreamed_when_the_next_session_starts(self):
         self.pi.close()
@@ -568,15 +600,24 @@ class SomniPiEndToEnd(unittest.TestCase):
         memory.record("ordinary_observation", "Earlier record outside the dream window")
         memory.record("tool_result", "Recent evidence " + "雪" * 80 + " hidden tail")
         memory.set_phase("closed")
+        self.upstream.script = plan_script({"Dream pass.": [[("somni_dream", {"proposal_json": json.dumps(
+            {"schema": 1, "operations": []})})]]})
         self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port,
                             env={"SOMNI_WORKSPACE": store.name, "SOMNI_DREAM_RECORDS": "1",
                                  "SOMNI_DREAM_RECORD_BYTES": "80"})
         self.pi.prompt("/somni-dream fees")
         self.pi.read(lambda r: r.get("type") == "agent_settled")
-        messages = [text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]]
-        prompt = next(m for m in messages if m.startswith("Dream pass."))
-        self.assertNotIn("Earlier record outside the dream window", prompt)
-        excerpt = prompt.split("[t000002] (tool_result) ")[1]
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and len(memory.load().dreams) < 2:
+            time.sleep(0.2)
+        texts = [text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]]
+        prompts = [t for t in texts if t.startswith("Dream pass.")]
+        first, second = prompts[0], prompts[-1]  # one record per pass, oldest first
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Earlier record outside the dream window", first)
+        self.assertNotIn("[t000002]", first)
+        self.assertNotIn("Earlier record outside the dream window", second)
+        excerpt = second.split("[t000002] (tool_result) ")[1]
         self.assertTrue(excerpt.startswith("Recent evidence 雪"))
         self.assertTrue(excerpt.endswith("[excerpt truncated]"))
         self.assertLessEqual(len(excerpt.encode("utf-8")), 80)
@@ -832,7 +873,7 @@ class SomniPiEndToEnd(unittest.TestCase):
         status = json.loads(result)
         self.assertEqual(status["phase"], "closed")
         self.assertEqual(status["active_claims_by_status"], {"uncertain": 0, "verified": 1})
-        self.assertEqual(status["last_pass"], {
+        self.assertEqual({k: v for k, v in status["last_pass"].items() if k != "at"}, {
             "id": "d000001", "transcript_head": status["transcript_head"], "operation_count": 1,
             "transcript_count": status["transcript_count"], "added_count": 1, "rejected_count": 0, "merged_count": 0,
             "added_ids": ["n000001"],

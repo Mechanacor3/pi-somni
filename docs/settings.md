@@ -48,7 +48,9 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `recording.digest_tools` | `SOMNI_DIGEST_TOOLS` | `stream_read` | Tools whose text output is recorded as a byte count and SHA-256 beside their arguments. An empty list disables this |
 | `recording.image_bytes` | `SOMNI_IMAGE_BYTES` | `262144` | Stored bytes per image. `0` disables image capture (0–2097152) |
 | `recording.image_max_edge` | `SOMNI_IMAGE_MAX_EDGE` | `0` | Optional thumbnail edge in pixels. Needs Pillow in the backend's Python (0–4096) |
-| `dreams.records` | `SOMNI_DREAM_RECORDS` | `120` | Recent transcript records sent to `/somni-dream` (1–120) |
+| `dreams.records` | `SOMNI_DREAM_RECORDS` | `120` | Transcript records one `/somni-dream` pass reviews. With more waiting, a night works through them oldest first, one pass per part (1–120) |
+| `dreams.max_passes` | `SOMNI_DREAM_MAX_PASSES` | `4` | Passes one `/somni-dream` runs through a backlog before leaving the rest for the next one (1–50) |
+| `dreams.status_line` | `SOMNI_DREAM_STATUS` | on | Show in Pi's footer how many of your turns no dream has reviewed, and when the last dream ran |
 | `dreams.record_bytes` | `SOMNI_DREAM_RECORD_BYTES` | `1500` | Text excerpt per dream record, in UTF-8 bytes, including the truncation marker (64–8192) |
 | `dreams.max_reads` | `SOMNI_DREAM_MAX_READS` | `16` | Somni evidence reads per dream or wiki turn (1–64) |
 | `dreams.max_images` | `SOMNI_DREAM_MAX_IMAGES` | `16` | Distinct images a dream may view, including those attached to its prompt (0–64) |

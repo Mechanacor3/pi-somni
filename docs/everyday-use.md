@@ -66,7 +66,10 @@ setting also has an environment variable, which wins over the files, for scripts
    session and turns it into short notes, each citing what it saw. It also corrects or retires
    older notes that today's work contradicted. A dream is one short run of your current model.
    You can steer it: `/somni-dream how we release` or `/somni-dream what went wrong with the
-   migration`.
+   migration`. Dreaming is up to you: nothing dreams on its own unless you turn on
+   [daydreams](#long-sessions-optional). Pi's footer shows how long it has been, for example
+   `somni: last dream 14 turns and 2 days ago`. Skip a few days and the next `/somni-dream`
+   works through the backlog oldest first; see [a backlog](dreams.md#a-backlog).
 4. **Organize now and then.** Once a week, or after a big piece of work, run `/somni-wiki`.
    It gathers the notes into linked pages, one subject per page, like a small team wiki. Give it
    a goal if you like: `/somni-wiki onboarding a new teammate`.

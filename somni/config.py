@@ -82,7 +82,12 @@ SETTINGS = (
     Setting("recording.image_max_edge", "SOMNI_IMAGE_MAX_EDGE", "int", 0,
             "Optional thumbnail edge in pixels. Needs Pillow in the backend's Python", 0, 4096),
     Setting("dreams.records", "SOMNI_DREAM_RECORDS", "int", 120,
-            "Recent transcript records sent to `/somni-dream`", 1, 120),
+            "Transcript records one `/somni-dream` pass reviews. With more waiting, a night works through them oldest "
+            "first, one pass per part", 1, 120),
+    Setting("dreams.max_passes", "SOMNI_DREAM_MAX_PASSES", "int", 4,
+            "Passes one `/somni-dream` runs through a backlog before leaving the rest for the next one", 1, 50),
+    Setting("dreams.status_line", "SOMNI_DREAM_STATUS", "bool", True,
+            "Show in Pi's footer how many of your turns no dream has reviewed, and when the last dream ran"),
     Setting("dreams.record_bytes", "SOMNI_DREAM_RECORD_BYTES", "int", 1500,
             "Text excerpt per dream record, in UTF-8 bytes, including the truncation marker", 64, 8192),
     Setting("dreams.max_reads", "SOMNI_DREAM_MAX_READS", "int", 16, "Somni evidence reads per dream or wiki turn",

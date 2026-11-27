@@ -23,6 +23,17 @@ records older than `memory.forget_after_days` keep only a stub.
   evidence, and hashes the parent fingerprints together with the combined text and status. Parent order and salience
   changes leave the digest stable. The claim log and rendered vault show the parent IDs and the provenance digest.
 
+### A backlog
+
+A pass reviews up to `dreams.records` (120) transcript records. When more than that have piled up since the last
+pass (a long day, a week without dreaming), `/somni-dream` works through them oldest first. Each pass reviews the
+next part, with a few earlier records for context, and is bound to the end of that part, so the next pass starts
+there. The first passes are told that newer records wait, so they learn what held at the time and leave changes to
+later passes. One `/somni-dream` runs up to `dreams.max_passes` (4) passes. If records still wait after that, it says
+how many, and the next `/somni-dream` continues. A daydream facing a backlog likewise reviews its oldest part, and a
+catch-up daydream starts the next one when it is done. `status --json` reports `undreamed`, the records no pass has
+reviewed.
+
 ### Budgets
 
 Offline dream and wiki turns allow 16 Somni evidence reads, 16 viewed images and three submission attempts by default

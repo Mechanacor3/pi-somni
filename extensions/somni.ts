@@ -151,6 +151,8 @@ const configuredDreamRecordBytes = Number(process.env.SOMNI_DREAM_RECORD_BYTES ?
 const DREAM_RECORD_BYTES = Number.isInteger(configuredDreamRecordBytes) ? Math.min(8192, Math.max(64, configuredDreamRecordBytes)) : 1500;
 const configuredDreamRecords = Number(process.env.SOMNI_DREAM_RECORDS ?? 120);
 const DREAM_RECORDS = Number.isInteger(configuredDreamRecords) ? Math.min(120, Math.max(1, configuredDreamRecords)) : 120;
+const DREAM_MAX_PASSES = Math.floor(envNumber("SOMNI_DREAM_MAX_PASSES", 4, 1, 50));
+const DREAM_STATUS = !["0", "false", "off", "no"].includes((process.env.SOMNI_DREAM_STATUS ?? "1").toLowerCase());
 const DIGEST_TOOLS = new Set((process.env.SOMNI_DIGEST_TOOLS ?? "stream_read").split(",").map((name) => name.trim()));
 const MAX_IMAGE_INPUT = 4 * 1024 * 1024;
 const MAX_RECORD_IMAGES = 4;
@@ -171,7 +173,7 @@ type PastVersion = { id: string; text: string; until_ref?: string; until?: strin
 type RelatedClaim = { id: string; text: string; status: string; refs: string[]; strength: Strength; history?: PastVersion[];
 	standing?: boolean };
 type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[];
-	reviewed_through?: string; claims?: RelatedClaim[] };
+	reviewed_through?: string; claims?: RelatedClaim[]; through?: number; remaining?: number };
 
 /** How a dream should treat a record that disagrees with a claim. Kept in step with TIME_GUIDE in somni/dream.py. */
 const TIME_GUIDE = "Records are dated (the --- day --- lines). When a record disagrees with a claim, decide what happened. " +
@@ -275,7 +277,8 @@ type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; resu
 type DreamKind = "dream" | "wiki" | "daydream" | "deepsleep";
 type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string;
 	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string; resumed?: number;
-	live?: boolean }; // other sessions are recording: the pass is bound to the head it saw, and the phase stays open
+	live?: boolean; // other sessions are recording: the pass is bound to the head it saw, and the phase stays open
+	through?: number; remaining?: number }; // one pass of a backlog: it reviews records up to `through`, `remaining` wait
 type CachedRead = { tool: string; args: unknown; text: string; images?: { ref: string; sha256: string }[] };
 const state = {
 	dream: undefined as DreamRun | undefined, writable: false,
@@ -641,7 +644,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startDream(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
-			kind: "dream" | "wiki" | "deepsleep") {
+			kind: "dream" | "wiki" | "deepsleep"): Promise<DreamRun | undefined> {
 		const headless = ctx.mode === "print" || ctx.mode === "json";
 		let run: DreamRun | undefined;
 		try {
@@ -682,11 +685,30 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			if (run) await finishDream(run);
 		}
+		return run;
+	}
+
+	/**
+	 * A night dream facing more unreviewed records than one pass takes works through them oldest first, one pass per
+	 * part, up to SOMNI_DREAM_MAX_PASSES; what is left waits for the next /somni-dream (and shows in the status line).
+	 */
+	async function dreamBacklog(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>) {
+		for (let pass = 1; ; pass++) {
+			const run = await startDream(ctx, load, "dream");
+			const left = run?.result ? run.remaining ?? 0 : 0;
+			if (!left) break;
+			if (pass >= DREAM_MAX_PASSES) {
+				notify(ctx, `Somni: ${left} record(s) still wait for a dream. Run /somni-dream again to continue.`);
+				break;
+			}
+			notify(ctx, `Somni: ${left} newer record(s) wait; dreaming the next part.`);
+		}
+		await showDreamStatus(ctx);
 	}
 
 	function submitCommand(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
 			kind: "dream" | "wiki" | "deepsleep") {
-		const task = startDream(ctx, load, kind);
+		const task = kind === "dream" && !DAYDREAM_CHILD ? dreamBacklog(ctx, load) : startDream(ctx, load, kind);
 		if (ctx.mode === "json" || ctx.mode === "print") return task;
 		// RPC clients get the handled reply first and can then wait for agent_settled.
 		void task.catch((error: Error) => notify(ctx, `Somni dream cleanup failed. ${error.message}`));
@@ -710,7 +732,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			return;
 		}
-		if (status.transcript_count <= day.lastCount) return;
+		if (!catchUp && status.transcript_count <= day.lastCount) return;
 		day.lastCount = status.transcript_count;
 		day.starts.push(now);
 		day.turns = 0;
@@ -763,6 +785,9 @@ export default function (pi: ExtensionAPI) {
 					if (day.notice === notice) day.lessons = lessons;
 					done();
 					notify(ctx, notice);
+					// A catch-up facing a long backlog reviews its oldest part; the next one continues.
+					if (day.catchUp && await undreamedTurns()) void maybeDaydream(ctx, true);
+					void showDreamStatus(ctx);
 					return;
 				} else if (AUTH_ERROR.test(stderr)) {
 					day.notice = "Somni daydream skipped: auth. The daydream's Pi could not authenticate with its provider. " +
@@ -794,6 +819,23 @@ export default function (pi: ExtensionAPI) {
 			return records.some((r) => r.source === "ordinary_observation" && r.text.startsWith("USER:"));
 		} catch {
 			return false;
+		}
+	}
+
+	/** The footer's dream clue: your turns no dream has reviewed, and how long ago the last dream ran. */
+	async function showDreamStatus(ctx: ExtensionContext) {
+		if (!DREAM_STATUS || DAYDREAM_CHILD || !state.backend || !(ctx as { hasUI?: boolean }).hasUI) return;
+		try {
+			const status = await getBackend().request<{ undreamed_turns: number; last_at: string | null }>("dream_status");
+			const turns = `${status.undreamed_turns} turn${status.undreamed_turns === 1 ? "" : "s"}`;
+			let text = `somni: ${turns}, no dream yet`;
+			if (status.last_at) {
+				const days = Math.floor((Date.now() - Date.parse(status.last_at)) / 86_400_000);
+				text = `somni: last dream ${turns} and ${days <= 0 ? "under a day" : days === 1 ? "1 day" : `${days} days`} ago`;
+			}
+			ctx.ui.setStatus("somni", ctx.ui.theme.fg("dim", text));
+		} catch {
+			// A status line is a hint; a failed lookup leaves the last one.
 		}
 	}
 
@@ -1125,6 +1167,7 @@ ${candidateGuide(candidates)}`;
 					proposal_json: params.proposal_json,
 					...(LENIENT_IMAGE_EVIDENCE ? { lenient_images: true } : {}),
 					...(run.kind === "deepsleep" || run.live ? { live: true } : {}),
+					...(run.through ? { through: run.through } : {}),
 					// A daydream worker reports what it spent up to this submission; it lands on the live pass.
 					...(DAYDREAM_CHILD ? { usage: { ...state.usage, duration_ms: Math.round(process.uptime() * 1000) } } : {}),
 					...(ACTIONS ? {
@@ -1234,8 +1277,13 @@ ${candidateGuide(candidates)}`;
 			const recent = await getBackend().request<Recent>("recent", {
 				include_images: ctx.model?.input.includes("image") ?? false,
 				record_limit: DREAM_RECORDS, record_bytes: DREAM_RECORD_BYTES, related: !FORK_OF && !DAYDREAM_CHILD,
+				backlog: !FORK_OF && !DAYDREAM_CHILD,
 			});
 			if (FORK_OF) return asText(dreamStepPrompt(args?.trim() || DAYDREAM_FOCUS, recent));
+			if (state.dream && recent.through) {
+				state.dream.through = recent.through;
+				state.dream.remaining = recent.remaining;
+			}
 			const actionsGuide = ACTIONS ? actionGuide(await getBackend().request<ActionWord[]>("action_list"),
 				await getBackend().request<any>("action_catalog", { live: liveTools() }),
 				await getBackend().request<Candidate[]>("action_candidates"),
@@ -1260,6 +1308,9 @@ ${candidateGuide(candidates)}`;
 				relatedClaims(recent.claims) +
 				(recent.reviewed_through ? `Earlier records, through ${recent.reviewed_through}, were reviewed by earlier passes; ` +
 					`use somni_recall to see what they produced and somni_search if you need one of them.\n\n` : "") +
+				(recent.remaining ? `These are the oldest records no dream has reviewed yet; ${recent.remaining} newer ` +
+					`record(s) wait for the next pass, which runs after this one. Learn from these as of their dates: a ` +
+					`later pass will update what newer records change.\n\n` : "") +
 				(DAYDREAM_CHILD ? daydreamListing(recent.records) : withDays(recent.records, (r) => describeRecord(r)).join("\n"));
 			const content: (TextContent | ImageContent)[] = asText(prompt);
 			for (const { ref, sha256, image } of recent.attachments) {
@@ -1387,6 +1438,10 @@ ${candidateGuide(candidates)}`;
 		total.calls += 1;
 	});
 
+	pi.on("agent_end", async (_event, ctx) => {
+		if (!state.dream) await showDreamStatus(ctx);
+	});
+
 	pi.on("turn_end", async (_event, ctx) => {
 		if (!DAYDREAMS || DAYDREAM_TURNS === 0 || state.dream) return;
 		if (++day.turns >= DAYDREAM_TURNS) await maybeDaydream(ctx);
@@ -1444,6 +1499,7 @@ ${candidateGuide(candidates)}`;
 			}
 			await registerWords(ctx);
 			await recordToolCatalog(ctx);
+			void showDreamStatus(ctx);
 			// Quitting between daydreams leaves the last turns undreamed: dream them now, beside this session's first turns.
 			if (DAYDREAMS && writable && await undreamedTurns()) void maybeDaydream(ctx, true);
 			if (DAYDREAMS && DAYDREAM_MINUTES > 0 && writable) {
