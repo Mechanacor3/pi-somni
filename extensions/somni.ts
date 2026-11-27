@@ -13,7 +13,7 @@
  *   - while running: record the user prompt (observation), each tool result
  *     (tool_result) and the assistant's text blocks (agent_output) into the
  *     hash-chained transcript. Tool results can attach bounded images.
- *   - tools: somni_recall (claims for a query), somni_search (exact transcript
+ *   - tools: somni_recall (claims for a query), somni_search (ranked transcript
  *     search), somni_note (add a cited claim while working).
  *   - /somni-dream [focus]: close the session, let the model propose a dream pass
  *     over recent transcript through the somni_dream tool, then reopen.
@@ -1090,7 +1090,9 @@ ${candidateGuide(candidates)}`;
 	pi.registerTool({
 		name: "somni_search",
 		label: "Somni search",
-		description: "Search your transcript text, run labels, and tags for an exact phrase. The transcript keeps what this " +
+		description: "Search your transcript text, run labels, and tags. Words are ranked: records holding the whole query " +
+			"first, then those matching the most of its words, newer first among equals. Wrap the query in double quotes " +
+			"for an exact phrase only. The transcript keeps what this " +
 			"session, earlier sessions and sub-agents saw, so search it when something you need has moved or is gone (a " +
 			"rotated log, a moved page) or was only seen by a sub-agent. Also finds evidence IDs and image digests; a " +
 			"record ID such as t000123 returns that record.",

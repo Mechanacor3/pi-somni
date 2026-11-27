@@ -475,6 +475,22 @@ class SomniStoreTest(unittest.TestCase):
         self.assertIn("Evidence transcript", report)
         self.assertIn("semantic proof", report)
 
+    def test_search_ranks_words_and_quotes_find_an_exact_phrase(self):
+        self.open_with_evidence("Kara asked Sarah whether Kestrel may post a funding announcement.")
+        self.memory.record("agent_output", "Sarah: no public funding announcement until Northstar signs off.")
+        self.memory.record("tool_result", "Weather in Oakland is sunny.")
+        self.memory.record("agent_output", "Morgan likes oat milk; the funding round is closed.")
+        # The words never appear together verbatim, yet both funding-announcement records are found, best first.
+        found = [r["id"] for r in self.memory.search("Sarah funding announcement approval", 10)]
+        self.assertEqual(found[:2], ["t000002", "t000001"])
+        self.assertNotIn("t000003", found)
+        # A record holding the whole query outranks any word match; equal matches put the newer first.
+        self.memory.record("agent_output", "Sarah funding announcement approval is pending.")
+        self.assertEqual(self.memory.search("Sarah funding announcement approval", 1)[0]["id"], "t000005")
+        self.assertEqual([r["id"] for r in self.memory.search('"funding announcement"', 10)],
+                         ["t000005", "t000002", "t000001"])
+        self.assertEqual(self.memory.search('"announcement approval is pending until"', 10), [])
+
     def test_condition_is_separate_from_chel_and_memento_files(self):
         memento = self.workspace / "memento"
         memento.mkdir()

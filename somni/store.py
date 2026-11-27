@@ -2272,9 +2272,32 @@ class SomniMemory:
             record = self._records_by_id.get(query.strip())
             if record is not None:
                 return [record]
-        needle = query.casefold()
-        return [record for record in self.transcript
-                if any(needle in value.casefold() for value in (record["text"], record.get("run_label", ""), *record.get("tags", [])))][:limit]
+        text = query.strip()
+        quoted = len(text) > 2 and text[0] == text[-1] == '"'
+        needle = (text[1:-1] if quoted else query).casefold()
+
+        def fields(record):
+            return (record["text"], record.get("run_label", ""), *record.get("tags", []))
+
+        exact = {record["seq"] for record in self.transcript if any(needle in value.casefold() for value in fields(record))}
+        if quoted:  # an exact phrase, as asked: newest first, since a limit should cut the oldest
+            return [record for record in reversed(self.transcript) if record["seq"] in exact][:limit]
+        # Words, ranked: records holding the whole query come first, then BM25 over each record's words, newer
+        # winning ties. Agents search in words ("Series B announcement approval"), which rarely appear together verbatim.
+        cache = self.__dict__.setdefault("_search_terms", {})  # seq -> (fields, terms): a session searches often
+
+        def terms(record):
+            key = fields(record)
+            hit = cache.get(record["seq"])
+            if hit is None or hit[0] != key:  # forgetting replaces a record's text
+                hit = cache[record["seq"]] = (key, _terms(" ".join(key)))
+            return hit[1]
+
+        ranked = {record["seq"]: score for score, record in
+                  _bm25([terms(record) for record in self.transcript], self.transcript, query)}
+        hits = [record for record in self.transcript if record["seq"] in exact or record["seq"] in ranked]
+        hits.sort(key=lambda r: (r["seq"] in exact, ranked.get(r["seq"], 0.0), r["seq"]), reverse=True)
+        return hits[:limit]
 
     def recall(self, query, limit=3):
         """Rank active claims for ``query``: lexical BM25 over claim text, then salience.

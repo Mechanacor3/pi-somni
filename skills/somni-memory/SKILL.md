@@ -37,8 +37,9 @@ Before each user prompt you get a short index, headed "Subject memory index". It
 - `somni_recall {"query": "..."}` returns the wiki pages and notes most relevant to a question.
   Use it before asking the user something they may already have told you: "which branch do
   we deploy from?", "how do they like commit messages?"
-- `somni_search {"query": "..."}` finds an exact phrase in past sessions and returns the
-  transcript IDs. Use it to check what was actually said or shown.
+- `somni_search {"query": "..."}` searches past sessions by words, best match first, and returns
+  the transcript records with their IDs. Use it to check what was actually said or shown. Put the
+  query in double quotes to find an exact phrase only.
 - When something you need is gone or has moved (a rotated log, a page moved elsewhere, a file
   someone deleted), or only a sub-agent saw it, search before saying you can't find it. The
   transcript keeps what this session, earlier sessions and sub-agents read.

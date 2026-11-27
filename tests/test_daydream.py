@@ -119,7 +119,7 @@ class DaydreamTest(unittest.TestCase):
         memory = SomniMemory(self.ws, "s").load()
         self.assertEqual([r["id"] for r in memory.search("t000002")], ["t000002"])
         self.assertEqual(memory.search("t000099"), [])  # unknown IDs fall back to a text search
-        self.assertEqual([r["id"] for r in memory.search('"echo":3')], ["t000003"])
+        self.assertEqual(memory.search('"echo":3')[0]["id"], "t000003")  # the exact match first, word matches after
 
     def test_daydream_backend_runs_beside_the_recording_owner(self):
         self.m.set_phase("closed")
