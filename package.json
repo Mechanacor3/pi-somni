@@ -10,7 +10,7 @@
     "bin/", "extensions/", "skills/", "somni/*.py", "somni/chel/*.py", "adapters/**/*.py",
     "evals/__init__.py", "evals/state_bench/__init__.py", "evals/state_bench/somni_state_bench.py",
     "README.md", "EVALUATION.md", "docs/everyday-use.md", "docs/settings.md", "docs/dreams.md",
-    "docs/action-words.md", "docs/long-sessions.md", "docs/headless.md", "docs/sleep-and-memory.md", "docs/memory-over-time.md", "docs/outcomes.md", "docs/sharing.md",
+    "docs/action-words.md", "docs/long-sessions.md", "docs/headless.md", "docs/sleep-and-memory.md", "docs/memory-over-time.md", "docs/outcomes.md", "docs/sharing.md", "docs/containers.md",
     "docs/images/somni-sheep.webp", "LICENSE"
   ],
   "bin": {"somni": "bin/somni"},

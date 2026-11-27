@@ -197,6 +197,9 @@ drafts with your name, paths or keys in them, and it only writes files, in `.pi/
   in a project, set `store.record: false` in its `.pi/somni.conf`.
 - To start fresh, close Pi and move the store directory (and `~/.somni`, for what Somni learned
   about you) somewhere private. The next session creates a new one.
+- To take your memory to a new machine, use `somni snapshot` there and `somni restore` here
+  (`--personal` for `~/.somni`). Copying the files one by one can leave the store unable to open;
+  see [moving memory](containers.md#moving-memory-snapshots).
 
 ## Checking that it helps
 

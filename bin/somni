@@ -4,6 +4,11 @@
     somni doctor [--cwd DIR] [--all] [--json]   check settings, runtime and the store
     somni outcome --text TEXT [--verdict pass|fail|mixed] [--by WHO] [--run-label LABEL] [--image FILE] [--cwd DIR]
                                                 record what happened afterwards, from outside the agent
+    somni snapshot --out FILE [--personal | --store DIR] [--cwd DIR]
+                                                save one memory store as a single file (safe while Pi records)
+    somni restore FILE [--personal | --store DIR] [--cwd DIR] [--replace]
+                                                restore a snapshot into a store, here or in another container
+    somni snapshot --show FILE                  describe a snapshot without restoring it
     somni config template                       print a commented config file with every setting
     somni config show [--cwd DIR]               print every setting's value and where it came from
     somni config table                          print the settings table in docs/settings.md
@@ -40,6 +45,67 @@ def outcome(argv):
     return 0
 
 
+def store_location(args):
+    """The store a snapshot command means: --store, the personal store, or this directory's project store."""
+    import os
+    from somni import config as C
+    values = {key: item["value"] for key, item in C.resolve(pathlib.Path(args.cwd).resolve(), dict(os.environ))["settings"].items()}
+    if args.personal:
+        path = values["personal.path"]
+        if path in ("none", ""):
+            raise SystemExit("somni: personal memory is off (personal.path is none)")
+        return pathlib.Path("~/.somni" if path == "auto" else path).expanduser(), "personal"
+    if args.store:
+        return pathlib.Path(args.store).expanduser(), args.subject or values["store.subject"]
+    return pathlib.Path(values["store.path"]), args.subject or values["store.subject"]
+
+
+def snapshot_command(argv, restoring):
+    import argparse
+    import json
+    import os
+    from somni import snapshot as N
+    from somni import store as S
+    ap = argparse.ArgumentParser(prog="somni restore" if restoring else "somni snapshot",
+                                 description="Restore a memory store from a snapshot." if restoring else
+                                 "Save one memory store as a single file: its records, notes, dreams, wiki and words.")
+    if restoring:
+        ap.add_argument("file", help="the snapshot (.tar.gz) to restore")
+        ap.add_argument("--replace", action="store_true", help="keep an existing store aside and restore over it")
+    else:
+        ap.add_argument("--out", help="the snapshot file to write (.tar.gz)")
+        ap.add_argument("--show", metavar="FILE", help="describe a snapshot instead of making one")
+    ap.add_argument("--cwd", default=os.getcwd(), help="the directory Pi starts in, which decides the store (default: here)")
+    ap.add_argument("--personal", action="store_true", help="the personal store (~/.somni) instead of the project's")
+    ap.add_argument("--store", help="the store directory (holding somni-v1/) instead of this directory's")
+    ap.add_argument("--subject", help="the store's subject, when --store names a store with another subject")
+    args = ap.parse_args(argv)
+    try:
+        if not restoring and args.show:
+            print(json.dumps(N.describe(pathlib.Path(args.show)), indent=2))
+            return 0
+        workspace, subject = store_location(args)
+        if restoring:
+            result = N.restore(pathlib.Path(args.file), workspace, S.SomniMemory, replace=args.replace)
+            print(json.dumps(result, indent=2))
+            if result["subject"] != subject and not args.personal:
+                print(f"somni: the restored store's subject is {result['subject']!r}; set store.subject to it "
+                      f"(SOMNI_SUBJECT={result['subject']}) so Pi opens it", file=sys.stderr)
+            return 0
+        if not args.out:
+            ap.error("--out is required")
+        if not (workspace / S.STORE_DIR).is_dir():
+            print(f"somni: no store at {workspace}", file=sys.stderr)
+            return 2
+        manifest = N.snapshot(S.SomniMemory(workspace, subject), pathlib.Path(args.out))
+        print(json.dumps({"snapshot": args.out, "subject": manifest["subject"], "state": manifest["state"],
+                          "files": len(manifest["files"])}, indent=2))
+        return 0
+    except (N.SnapshotError, S.MemoryError, OSError) as exc:
+        print(f"somni: {exc}", file=sys.stderr)
+        return 2
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -50,6 +116,8 @@ def main(argv):
         return doctor.main(rest)
     if command == "outcome":
         return outcome(rest)
+    if command in ("snapshot", "restore"):
+        return snapshot_command(rest, command == "restore")
     if command == "config":
         from somni import config
         if rest[:1] == ["show"]:

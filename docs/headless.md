@@ -20,6 +20,8 @@ replacement claim. For older passes that didn't record added and merged counts, 
 can be `null`. Claims inherit the union of run labels and tags from the records they cite.
 
 
+For containers, volumes and moving a store between machines, see [Containers](containers.md).
+
 Every setting is listed in [Settings](settings.md). Harnesses usually set them as environment
 variables, which override any config file; `SOMNI_CONFIG=none` ignores the files entirely.
 

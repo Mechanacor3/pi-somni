@@ -655,8 +655,12 @@ class SomniMemory:
         class Lock:
             def __enter__(inner):
                 path = self.store / "memory.lock"
-                if path.is_symlink() or not path.is_file():
-                    raise MemoryError("missing or unsafe store file: memory.lock")
+                if path.is_symlink():
+                    raise MemoryError("unsafe store file: memory.lock is a link")
+                if not path.is_file():
+                    raise MemoryError(f"{self.store} has no memory.lock: was it copied file by file? Copy tools "
+                                      "often skip empty files. Move stores with `somni snapshot` and "
+                                      "`somni restore`, or create an empty memory.lock there.")
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
                 try:
                     if not stat.S_ISREG(os.fstat(fd).st_mode):
