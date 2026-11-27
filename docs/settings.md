@@ -59,6 +59,7 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `dreams.lenient_image_evidence` | `SOMNI_LENIENT_IMAGE_EVIDENCE` | off | Keep a citation's `{ref}` when only its image is wrong, downgrading the claim to uncertain if needed |
 | `memory.forget_after_days` | `SOMNI_FORGET_AFTER_DAYS` | `30` | After a night dream, transcript records older than this keep only a stub: the start of their text, the quotes claims cite, and their place in the hash chain. See [Memory over time](memory-over-time.md). `0` keeps every record in full, and so does a value that isn't a number of days (0–36500) |
 | `memory.decay` | `SOMNI_MEMORY_DECAY` | `0.5` | How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation. `0` ranks claims by how often they were used, ignoring time (0–1) |
+| `merge.forgetting` | `SOMNI_MERGE_FORGETTING` | `wins` | What `somni merge` does with a shared record one side forgot. `wins` forgets it here too; `conflict` stops the merge and lists them; `keep` takes the whole text back from the side that still has it |
 | `wiki.link_style` | `SOMNI_LINK_STYLE` | `markdown` | Vault links: `markdown` (relative `[Title](path.md)`) or `wikilink` (Obsidian `[[slug\|Title]]`) |
 | `wiki.page_guide` | `SOMNI_PAGE_GUIDE` | practical playbook guidance | Replaces the default wiki-writing guidance |
 | `actions.enabled` | `SOMNI_ACTIONS` | off | [Action words](action-words.md): dreamed Python functions that call session tools, registered as Pi tools |

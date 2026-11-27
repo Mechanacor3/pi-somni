@@ -99,7 +99,8 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
   human sleep, and where the analogy breaks.
 - **[Headless runs](docs/headless.md).** Scripts and harnesses: one-shot dreams, run labels and tags, the store CLI.
 - **[Containers and moving memory](docs/containers.md).** What to mount and set, dreaming on a schedule, and
-  `somni snapshot` / `somni restore` to carry a store to another machine or container.
+  `somni snapshot` / `somni restore` to carry a store to another machine or container, and `somni merge` to bring
+  back what a copy learned on its own.
 
 **Does it help?** The real test is your own work: fewer repeat questions and fewer repeated mistakes.
 To measure it, we use the public STATE-Bench benchmark of multi-step service tasks as a stand-in for

@@ -475,6 +475,44 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertTrue(any(f"{total - 4} record(s) still wait for a dream" in m for m in shown), shown)
         self.assertRegex(status()[-1], r"somni: last dream \d+ turns? and under a day ago")
 
+    def test_the_dream_after_a_merge_is_asked_to_settle_claims_both_copies_changed(self):
+        from somni import merge as M
+        from somni import snapshot as N
+        self.pi.close()
+        self.upstream.script = plan_script({"Dream pass.": [[("somni_dream", {"proposal_json": json.dumps(
+            {"schema": 1, "operations": []})})]]})
+        store = self.work / ".pi" / "somni"
+        ours = SomniMemory(store, "pi").load()
+
+        def say(memory, text):
+            memory.set_phase("open")
+            ref, = memory.record_many([("ordinary_observation", f"USER: {text}")])
+            memory.set_phase("closed")
+            return ref
+        first = say(ours, "refunds go through the billing desk")
+        ours.dream({"schema": 1, "operations": [{"op": "add", "text": "Refunds go through billing.", "status": "verified",
+                                                 "salience": 3, "evidence": [{"ref": first, "quote": "billing desk"}]}]})
+        N.snapshot(ours, self.work / "base.tar.gz")
+        N.restore(self.work / "base.tar.gz", self.work / "fork", SomniMemory)
+        fork = SomniMemory(self.work / "fork", "pi").load()
+        for memory, text in ((ours, "refunds now go through the support queue"), (fork, "refunds now go through finance")):
+            ref = say(memory, text)
+            memory.dream({"schema": 1, "operations": [{"op": "update", "claim_id": "n000001", "text": text.capitalize() + ".",
+                                                       "evidence": [{"ref": ref, "quote": text}]}]})
+        N.snapshot(fork, self.work / "fork.tar.gz")
+        self.assertEqual(len(M.merge(store, "pi", self.work / "fork.tar.gz", label="laptop")["conflicts"]), 1)
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port)
+        self.pi.prompt("/somni-dream")
+        deadline = time.monotonic() + 60
+        sent = []
+        while time.monotonic() < deadline and not sent:
+            sent = [json.dumps(r["messages"]) for r in self.upstream.requests if "Dream pass." in json.dumps(r["messages"])]
+            time.sleep(0.3)
+        sent = sent[0]
+        self.assertIn("A merge brought in what another copy of this memory learned (laptop)", sent)
+        self.assertIn("- n000002: Refunds now go through the support queue.", sent)
+        self.assertIn("vs n000003: Refunds now go through finance.", sent)
+
     @unittest.skipUnless(BINARY, "the daydream worker starts the host Pi binary")
     def test_turns_left_undreamed_at_quit_are_dreamed_when_the_next_session_starts(self):
         self.pi.close()

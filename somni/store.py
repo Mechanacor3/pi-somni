@@ -2062,7 +2062,10 @@ class SomniMemory:
         return next_claim
 
     def _commit_dream(self, proposal_bytes, prepared, next_claim, rejected, *, author="dream", snapshot=None, usage=None,
-                      downgrades=(), forgot=None, backlog=False):
+                      downgrades=(), forgot=None, backlog=False, merge=None):
+        """Commit one pass. ``merge`` (somni/merge.py) is {"records": encoded imported records, "count", "head": the
+        transcript after them, "bound" and "bound_head": where the pass reviewed through, "report": what it records}: the
+        imported records, the claim changes and the pass are then one atomic commit."""
         words = [body for op, body in prepared if op == "action"]
         prepared = [(op, body) for op, body in prepared if op != "action"]
         wiki_events = []
@@ -2089,6 +2092,8 @@ class SomniMemory:
         pass_number = self.state["dream_count"] + 1
         count = self.state["transcript_count"] if snapshot is None else snapshot
         head = self.state["transcript_head"] if snapshot is None else _record_hash(self.transcript[snapshot - 1])
+        if merge is not None:
+            count, head = merge["bound"], merge["bound_head"]
         dream = {"schema": SCHEMA, "seq": pass_number, "transcript_count": count, "at": at,
                  "transcript_head": head, "operation_count": len(prepared),
                  "proposal_sha256": sha(proposal_bytes), "input_bytes": len(proposal_bytes),
@@ -2118,6 +2123,8 @@ class SomniMemory:
             dream["operation_count"] += page_ops
         if rejected:
             dream["rejected"] = rejected
+        if merge is not None:
+            dream["merge"] = merge["report"]
         note_bytes = [_encode_log_record(event) for event in note_events]
         wiki_bytes = [_encode_log_record(event) for event in wiki_events]
         entries = {}
@@ -2129,10 +2136,13 @@ class SomniMemory:
                 os.close(os.open(wiki_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             entries["wiki.jsonl"] = wiki_bytes
         entries["dreams.jsonl"] = [_encode_log_record(dream)]
+        if merge is not None and merge["records"]:
+            entries = {"transcript.jsonl": merge["records"], **entries}
         self._commit_logs(entries, {
             **self.state, "note_events": note_seq, "notes_head": notes_head, "next_claim": next_claim,
             "dream_count": pass_number, "dreams_head": sha(dream),
             **({"wiki_events": wiki_seq, "wiki_head": wiki_head} if wiki_bytes else {}),
+            **({"transcript_count": merge["count"], "transcript_head": merge["head"]} if merge is not None else {}),
         })
 
     # --- Time and strength ---
@@ -2227,10 +2237,33 @@ class SomniMemory:
         """Unverified claims that daydreams added since the last offline dream: tonight's dream checks them."""
         ids = []
         for dream in reversed(self.dreams):
+            if dream.get("author") == "merge":
+                continue
             if not dream.get("live"):
                 break
             ids = dream.get("added_ids", []) + ids
         return [c for c in self.claims_by_id(ids[-limit:]) if c["status"] == "uncertain"]
+
+    def merge_conflicts(self, limit=32):
+        """Claims merges brought in beside a version of their own (both sides changed one claim) and that are both
+        still active: the next dream settles each. Merges since the last ordinary dream."""
+        out = []
+        for dream in reversed(self.dreams):
+            if dream.get("author") != "merge":
+                break
+            for conflict in (dream.get("merge") or {}).get("conflicts", []):
+                ours, theirs = self.claims.get(conflict.get("ours")), self.claims.get(conflict.get("imported_as"))
+                if conflict.get("kind") != "both_changed" or not ours:
+                    continue
+                current = ours
+                while current["state"] != "active" and current.get("superseded_by") in self.claims:
+                    current = self.claims[current["superseded_by"]]
+                if current["state"] != "active" or (theirs is not None and theirs["state"] != "active"):
+                    continue
+                out.append({"from": dream["merge"].get("from"), "detail": conflict.get("detail", ""),
+                            "ours": {"id": current["id"], "text": current["text"]},
+                            **({"theirs": {"id": theirs["id"], "text": theirs["text"]}} if theirs else {})})
+        return out[:limit]
 
     def search(self, query, limit=20):
         if not isinstance(query, str) or not query.strip() or len(query) > 256 or not 1 <= limit <= 50:
@@ -3292,6 +3325,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         return memory.load().claims_by_id(args.get("ids", []))
     elif method == "day_lessons":
         return memory.load().day_lessons()
+    elif method == "merge_conflicts":
+        return memory.load().merge_conflicts()
     elif method == "recall":
         memory.load()
         query, limit = args["query"], args["limit"]
@@ -3370,7 +3405,8 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         memory.load()
         last = memory.dreams[-1] if memory.dreams else None
         tail = memory.transcript[last["transcript_count"] if last else 0:]
-        return {"undreamed": len(tail), "last_at": last.get("at") if last else None,
+        dreamt = next((d for d in reversed(memory.dreams) if d.get("author") != "merge"), None)  # a merge isn't a dream
+        return {"undreamed": len(tail), "last_at": dreamt.get("at") if dreamt else None,
                 "undreamed_turns": sum(r["source"] == "ordinary_observation" and r["text"].startswith("USER:") and
                                        not any(t == "contributor" or t.startswith("contributor:") for t in r.get("tags", ()))
                                        for r in tail)}

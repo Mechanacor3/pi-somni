@@ -9,6 +9,8 @@
     somni restore FILE [--personal | --store DIR] [--cwd DIR] [--replace]
                                                 restore a snapshot into a store, here or in another container
     somni snapshot --show FILE                  describe a snapshot without restoring it
+    somni merge SOURCE [--personal | --store DIR] [--cwd DIR] [--forgetting wins|conflict|keep] [--dry-run]
+                                                bring what a fork learned (a snapshot or a store) into this store
     somni config template                       print a commented config file with every setting
     somni config show [--cwd DIR]               print every setting's value and where it came from
     somni config table                          print the settings table in docs/settings.md
@@ -106,6 +108,42 @@ def snapshot_command(argv, restoring):
         return 2
 
 
+def merge_command(argv):
+    import argparse
+    import json
+    import os
+    from somni import config as C
+    from somni import merge as M
+    ap = argparse.ArgumentParser(prog="somni merge", description="Merge what another copy of this memory learned "
+                                 "(a snapshot file or a store directory) into this store, like a git merge of forks.")
+    ap.add_argument("source", help="the other side: a snapshot (.tar.gz) or a directory holding somni-v1/")
+    ap.add_argument("--cwd", default=os.getcwd(), help="the directory Pi starts in, which decides the store (default: here)")
+    ap.add_argument("--personal", action="store_true", help="merge into the personal store (~/.somni)")
+    ap.add_argument("--store", help="the store directory (holding somni-v1/) to merge into")
+    ap.add_argument("--subject", help="the store's subject, when --store names a store with another subject")
+    ap.add_argument("--forgetting", choices=M.FORGETTING,
+                    help="a shared record one side forgot: wins (forget it here too), conflict (stop and list them), "
+                         "keep (take the whole text back). Default: the merge.forgetting setting")
+    ap.add_argument("--dry-run", action="store_true", help="report what the merge would do; write nothing")
+    ap.add_argument("--unrelated", action="store_true", help="merge a store that shares no history with this one")
+    ap.add_argument("--label", help="what the merge pass calls the other side (default: the source's name)")
+    args = ap.parse_args(argv)
+    try:
+        forgetting = args.forgetting or C.resolve(pathlib.Path(args.cwd).resolve(), dict(os.environ))[
+            "settings"]["merge.forgetting"]["value"]
+        workspace, subject = store_location(args)
+        report = M.merge(workspace, subject, pathlib.Path(args.source), forgetting=forgetting,
+                         unrelated=args.unrelated, dry_run=args.dry_run, label=args.label)
+        print(json.dumps(report, indent=2))
+        return 0
+    except (M.MergeError, OSError) as exc:
+        print(f"somni: {exc}", file=sys.stderr)
+        return 2
+    except C.ConfigError as exc:
+        print(f"somni: {exc}", file=sys.stderr)
+        return 2
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -118,6 +156,8 @@ def main(argv):
         return outcome(rest)
     if command in ("snapshot", "restore"):
         return snapshot_command(rest, command == "restore")
+    if command == "merge":
+        return merge_command(rest)
     if command == "config":
         from somni import config
         if rest[:1] == ["show"]:

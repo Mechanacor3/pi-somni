@@ -200,6 +200,8 @@ drafts with your name, paths or keys in them, and it only writes files, in `.pi/
 - To take your memory to a new machine, use `somni snapshot` there and `somni restore` here
   (`--personal` for `~/.somni`). Copying the files one by one can leave the store unable to open;
   see [moving memory](containers.md#moving-memory-snapshots).
+- If both machines went on learning, `somni merge` brings one's lessons into the other: see
+  [merging forks](containers.md#merging-forks).
 
 ## Checking that it helps
 

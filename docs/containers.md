@@ -2,8 +2,8 @@
 
 Somni runs the same inside a container as on a laptop: a Pi with the extension, a Python 3 for the backend, and a
 directory that holds the store. This page covers what to mount and what to set, how to dream when nobody is at the
-keyboard, and how to carry memory from one container to another. For scripted runs in general, see
-[Headless runs](headless.md).
+keyboard, how to carry memory from one container to another, and how to merge what copies learned apart. For
+scripted runs in general, see [Headless runs](headless.md).
 
 ## What a container needs
 
@@ -90,6 +90,52 @@ somni restore /backup/assistant-2026-11-27.tar.gz --store /memory
 - **Personal memory.** `--personal` snapshots or restores the personal store instead of the project's.
 
 Without `--store`, both commands use the store that Pi would use in `--cwd` (default: the current directory).
+
+## Merging forks
+
+A store restored from a snapshot is a fork: from then on, each copy learns on its own. `somni merge` brings what
+another copy learned back into this one, the way git merges branches. It needs both copies to come from the same
+snapshot, and it doesn't use git.
+
+```sh
+# the container's copy went on learning; bring it home
+somni snapshot --store /memory --out /backup/worker-1.tar.gz        # in the worker
+somni merge /backup/worker-1.tar.gz --store /memory --dry-run       # here: what would happen
+somni merge /backup/worker-1.tar.gz --store /memory
+```
+
+The other side can be a snapshot file or a store directory. What the merge does:
+
+- **It finds the base.** The two transcripts share a start, the records they had when they forked, and then
+  diverge. Records are compared by their place in the hash chain, so a record one side has since forgotten still
+  counts as shared.
+- **Nothing new over there:** "up to date". **Nothing new here:** a fast-forward. This store becomes a copy of the
+  other, and the old one is kept beside it.
+- **Otherwise the merge brings in the other side's new records.** Each one becomes a copy here that names the
+  record it came from. Then every claim is compared three ways: as it was at the base, here, and over there.
+  - A claim only one side changed takes that change: an update, a correction or a retraction.
+  - A claim only the other side has comes in, with its citations pointing at the copies.
+  - A claim both sides changed is a **conflict**. The other side's version comes in beside this one's, and the
+    next `/somni-dream` is shown both and settles them with the evidence. Nothing is lost while they wait.
+- **It is one pass.** The copied records, the claim changes and a pass entry (author `merge`) are one atomic commit.
+  The entry says where they came from and lists the conflicts. Merging the same fork again later brings only what's
+  new since.
+
+**Forgetting** has three modes (`--forgetting`, or the `merge.forgetting` setting):
+
+| Mode | A shared record one side forgot |
+|---|---|
+| `wins` (default) | is forgotten here too. Forgetting is how a store stays small and drops detail nobody cited. |
+| `conflict` | stops the merge with a list of those records, so you choose `wins` or `keep` for this merge. |
+| `keep` | gets its whole text back from the side that still has it, checked against the record's chain hash. A store that forgets will forget it again at a later night unless forgetting is off there (`SOMNI_FORGET_AFTER_DAYS=0`). |
+
+**Dream before you merge.** It's like git asking for a clean working tree first. When both sides have dreamed, the
+copied records count as reviewed: their lessons came along as claims. If this store has records no dream has
+reviewed yet, the next dream reviews those and every copied record, which takes more passes. The report says so.
+
+Not merged yet: wiki pages and action words. The report counts the other side's changes to them. Both stores must
+have the same subject, and no session may be recording into this store while it merges. `--unrelated` merges a
+store that shares no history with this one: everything in it comes in as new.
 
 ## Freezing memory for an evaluation
 

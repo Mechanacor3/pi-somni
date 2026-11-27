@@ -108,6 +108,10 @@ SETTINGS = (
     Setting("memory.decay", "SOMNI_MEMORY_DECAY", "number", 0.5,
             "How fast a claim fades when it isn't seen or used: the decay rate in ACT-R's base-level activation. "
             "`0` ranks claims by how often they were used, ignoring time", 0, 1.0),
+    Setting("merge.forgetting", "SOMNI_MERGE_FORGETTING", "enum", "wins",
+            "What `somni merge` does with a shared record one side forgot. `wins` forgets it here too; `conflict` stops "
+            "the merge and lists them; `keep` takes the whole text back from the side that still has it",
+            choices=("wins", "conflict", "keep")),
     Setting("wiki.link_style", "SOMNI_LINK_STYLE", "enum", "markdown",
             "Vault links: `markdown` (relative `[Title](path.md)`) or `wikilink` (Obsidian `[[slug|Title]]`)",
             choices=("markdown", "wikilink")),

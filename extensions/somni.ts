@@ -172,6 +172,7 @@ type Strength = { level: "fresh" | "fading" | "faint"; activation: number; last_
 type PastVersion = { id: string; text: string; until_ref?: string; until?: string | null };
 type RelatedClaim = { id: string; text: string; status: string; refs: string[]; strength: Strength; history?: PastVersion[];
 	standing?: boolean };
+type MergeConflict = { from: string; detail: string; ours: { id: string; text: string }; theirs?: { id: string; text: string } };
 type Recent = { records: TranscriptRecord[]; attachments: { ref: string; sha256: string; image: ImageContent }[];
 	reviewed_through?: string; claims?: RelatedClaim[]; through?: number; remaining?: number };
 
@@ -1296,7 +1297,13 @@ ${candidateGuide(candidates)}`;
 				`each against the records: correct it to a verified claim with exact quotes when they support it, merge ` +
 				`duplicates, and retract what they don't support (a lookup that found nothing is not a fact). Then add what ` +
 				`they missed.\n${lessons.map((c) => `- ${c.id}: ${c.text} [${c.refs.join(", ")}]`).join("\n")}\n\n` : "";
-			const prompt = dayGuide + `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
+			// A merge brought in another copy's version of claims this one changed too: tonight decides between them.
+			const conflicts = DAYDREAM_CHILD ? [] : await getBackend().request<MergeConflict[]>("merge_conflicts");
+			const mergeGuide = conflicts.length ? `A merge brought in what another copy of this memory learned (${[...new Set(conflicts.map((c) => c.from))].join(", ")}). ` +
+				`Both copies changed these claims. Settle each with the evidence: keep the one the records support ` +
+				`(correct or retract the other), merge them if both hold, or update one if the world changed between them.\n` +
+				`${conflicts.map((c) => `- ${c.ours.id}: ${c.ours.text}` + (c.theirs ? `\n  vs ${c.theirs.id}: ${c.theirs.text}` : ` (${c.detail})`)).join("\n")}\n\n` : "";
+			const prompt = dayGuide + mergeGuide + `Dream pass. Review these transcript records and call somni_dream once with a proposal ` +
 				`(add/correct/update/merge/retract claims; use an empty operations array if nothing should change). ` +
 				`For 'verified', cite an exact quote from the record or cite a screenshot you viewed as ` +
 				`{"ref":"t000001","image_sha256":"<digest>"}. Use somni_image for images not attached here. ` +
