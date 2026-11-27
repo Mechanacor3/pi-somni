@@ -105,6 +105,25 @@ class DreamRobustness(unittest.TestCase):
             with self.subTest(reason), self.assertRaisesRegex(SomniError, reason):
                 self.m.dream({"schema": 1, "operations": [operation]})
 
+    def test_an_update_without_a_status_keeps_the_old_one_when_its_evidence_still_proves_it(self):
+        self.m.dream({"schema": 1, "operations": [self.claim([{"ref": self.plain, "quote": "no image"}])]})
+        quoted = {"op": "update", "claim_id": "n000001", "text": "Still no image.", "evidence": [
+            {"ref": self.plain, "quote": "here"}]}
+        bare = {**quoted, "op": "correct", "claim_id": "n000002", "evidence": [{"ref": self.plain}]}
+        self.m.dream({"schema": 1, "operations": [{**quoted, "op": "correct"}, bare]})
+        claims = self.m.load().claims
+        self.assertEqual((claims["n000002"]["status"], claims["n000003"]["status"]), ("verified", "uncertain"))
+
+    def test_unknown_or_missing_fields_are_named(self):
+        add = {**self.claim([{"ref": self.plain, "quote": "no image"}]), "confidence": "high"}
+        with self.assertRaisesRegex(SomniError, r"add has unknown field\(s\): confidence; it takes evidence, gist"):
+            self.m.dream({"schema": 1, "operations": [add]})
+        self.m.dream({"schema": 1, "operations": [self.claim([{"ref": self.plain, "quote": "no image"}])]})
+        with self.assertRaisesRegex(SomniError, "update needs the claim_id"):
+            self.m.dream({"schema": 1, "operations": [{**self.claim([{"ref": self.plain}]), "op": "update"}]})
+        with self.assertRaisesRegex(SomniError, "retract takes exactly claim_id, reason and evidence; missing evidence"):
+            self.m.dream({"schema": 1, "operations": [{"op": "retract", "claim_id": "n000001", "reason": "wrong"}]})
+
     def test_malformed_proposals_say_what_shape_is_expected(self):
         with self.assertRaisesRegex(SomniError, r"not valid JSON .*nothing committed"):
             self.request("dream", {"proposal_json": '{"schema": 1, "operations": ['}, set())

@@ -1987,14 +1987,23 @@ class SomniMemory:
             replacing = op in {"correct", "update"}
             if replacing:
                 allowed.add("claim_id")
-            if set(operation) - allowed or (replacing and "claim_id" not in operation):
-                raise MemoryError("dream claim operation has unknown fields")
+            if set(operation) - allowed:
+                raise MemoryError(f"{op} has unknown field(s): {', '.join(sorted(map(str, set(operation) - allowed)))}; "
+                                  f"it takes {', '.join(sorted(allowed - {'op'}))}")
+            if replacing and "claim_id" not in operation:
+                raise MemoryError(f"{op} needs the claim_id of the claim it replaces")
             replaces = operation.get("claim_id") if replacing else None
             if replacing and (not isinstance(replaces, str) or not CLAIM_ID.fullmatch(replaces)
                     or replaces not in simulated or simulated[replaces]["state"] != "active"):
                 raise MemoryError(f"{'correction' if op == 'correct' else 'update'} targets an invalid or non-active claim")
             claim_id = f"n{next_claim:06d}"
-            claim = {"id": claim_id, "text": operation.get("text"), "status": operation.get("status"),
+            status = operation.get("status")
+            if status is None and replaces is not None:
+                # An update or correction that leaves out status keeps the old claim's, if its evidence still proves it.
+                proved = all(isinstance(item, dict) and (item.get("quote") or item.get("image_sha256"))
+                             for item in operation.get("evidence") or [None])
+                status = simulated[replaces]["status"] if proved else "uncertain"
+            claim = {"id": claim_id, "text": operation.get("text"), "status": status,
                      "salience": operation.get("salience", 3), "evidence": operation.get("evidence"),
                      "links": operation.get("links", [])}
             if "gist" in operation:
@@ -2032,7 +2041,11 @@ class SomniMemory:
             next_claim += 1
         elif op == "retract":
             if set(operation) != {"op", "claim_id", "reason", "evidence"}:
-                raise MemoryError("retraction has invalid fields")
+                expected = {"op", "claim_id", "reason", "evidence"}
+                missing, extra = sorted(expected - set(operation)), sorted(map(str, set(operation) - expected))
+                raise MemoryError("retract takes exactly claim_id, reason and evidence"
+                                  + (f"; missing {', '.join(missing)}" if missing else "")
+                                  + (f"; unknown {', '.join(extra)}" if extra else ""))
             claim_id = operation["claim_id"]
             if (not isinstance(claim_id, str) or not CLAIM_ID.fullmatch(claim_id)
                     or claim_id not in simulated or simulated[claim_id]["state"] != "active"):
