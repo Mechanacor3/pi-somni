@@ -17,6 +17,8 @@ Layers (all under `<workspace>/somni-v1/`):
                     "representations"): markdown written by dreaming, each citing the
                     active claims it rests on and linking (with [[slug]] wikilinks)
                     only to pages that exist at the end of the pass.
+  journal.jsonl     a daily journal: notes about one day (local time) written from that day's
+                    whole transcript, each note citing the records it comes from.
   vault/            a readable Obsidian-style rendering of the wiki, regenerated after
                     every dream: one note per page with frontmatter and backlinks,
                     index.md, and claims.md with each claim's exact evidence quotes.
@@ -97,6 +99,13 @@ MAX_PAGE_BYTES = 6_144
 WIKILINK = re.compile(rf"\[\[({SLUG_PATH})(?:\|([^\]\n]{{1,160}}))?\]\]")
 CLAIM_CITE = re.compile(r"\[(n[0-9]{6})\]")
 VAULT_DIR = "vault"
+JOURNAL_DIR = "journal"  # vault/journal/yyyy/mm/dd.md; no wiki page may live there
+JOURNAL_DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+RECORD_CITE = re.compile(r"\[(t[0-9]{6})\]")
+MAX_JOURNAL_BYTES = 8_192
+JOURNAL_DAY_BYTES = 393_216  # what one journal pass reads of its day, about 100k tokens
+JOURNAL_RECORD_MIN = 400  # each record's excerpt when the day is too long to read whole
+MAX_JOURNAL_CLAIMS = 80
 ACTIONS_DIR = "actions"
 ACTION_OPS = frozenset({"define_action", "revise_action", "retire_action"})
 MAX_ACTION_FILE_BYTES = 16384
@@ -135,7 +144,7 @@ SUCCESS_CLAIM = re.compile(r"\b(done|fixed|finished|completed?|succeed(?:s|ed)?|
                            r"(?:tests?|checks?|it) pass|works|resolved|solved)\b|\u2705|\u2713", re.I)
 STATUSES = {"verified", "uncertain"}
 FILES = ("manifest.json", "state.json", "transcript.jsonl", "notes.jsonl", "dreams.jsonl", "memory.lock")
-VERIFIED_FILES = (*FILES, "wiki.jsonl", ".transaction.json")
+VERIFIED_FILES = (*FILES, "wiki.jsonl", "journal.jsonl", ".transaction.json")
 VERIFY_AFTER_ACCESSES = 128
 VERIFY_AFTER_SECONDS = 60
 LOG_STATE = {
@@ -143,6 +152,7 @@ LOG_STATE = {
     "notes.jsonl": ("note_events", "notes_head"),
     "dreams.jsonl": ("dream_count", "dreams_head"),
     "wiki.jsonl": ("wiki_events", "wiki_head"),
+    "journal.jsonl": ("journal_events", "journal_head"),
 }
 
 
@@ -211,6 +221,30 @@ def _now():
 
 def _stamp(moment):
     return moment.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _local_day(stamp):
+    """The local calendar day (the machine's time zone, TZ) of a UTC timestamp, as YYYY-MM-DD."""
+    moment = _parse_time(stamp)
+    return moment.astimezone().date().isoformat() if moment else ""
+
+
+def _today():
+    return _now().astimezone().date().isoformat()
+
+
+def _journal_note(day):
+    return f"{JOURNAL_DIR}/{day[:4]}/{day[5:7]}/{day[8:]}"
+
+
+def _check_day(day):
+    if not isinstance(day, str) or not JOURNAL_DATE.fullmatch(day):
+        raise SomniError("a journal day is a date such as 2026-11-27")
+    try:
+        _dt.date.fromisoformat(day)
+    except ValueError:
+        raise SomniError(f"{day} is not a calendar date") from None
+    return day
 
 
 def _env_number(name, default, low, high):
@@ -748,6 +782,9 @@ class SomniMemory:
         wiki_path = self.store / "wiki.jsonl"
         wiki = _read_log(wiki_path) if os.path.lexists(wiki_path) else []
         self._check_chain(wiki, "wiki", state.get("wiki_events", 0), state.get("wiki_head", ZERO_HASH))
+        diary_path = self.store / "journal.jsonl"
+        diary = _read_log(diary_path) if os.path.lexists(diary_path) else []
+        self._check_chain(diary, "journal", state.get("journal_events", 0), state.get("journal_head", ZERO_HASH))
         records = {record["id"]: record for record in transcript}
         claims = self._replay_notes(notes, records, self._limit("max_claims"))
         expected_next = max([int(key[1:]) for key in claims] + [0]) + 1
@@ -759,6 +796,8 @@ class SomniMemory:
         self._image_store_bytes = None
         self.wiki_log = wiki
         self.pages = self._replay_wiki(wiki, claims)
+        self.journal_log = diary
+        self.journal = self._replay_journal(diary, records)
         if os.path.lexists(journal):
             self._clear_transaction(journal)
         return self
@@ -1156,6 +1195,112 @@ class SomniMemory:
         return pages
 
     @staticmethod
+    def _replay_journal(events, records):
+        entries = {}
+        for event in events:
+            entry = event.get("entry") if event.get("op") == "entry" else None
+            if not isinstance(entry, dict) or not JOURNAL_DATE.fullmatch(str(entry.get("date"))):
+                raise MemoryError("invalid journal event")
+            if any(ref not in records for ref in entry.get("records", [])):
+                raise MemoryError("journal entry cites an unknown record")
+            entries[entry["date"]] = entry
+        return entries
+
+    # --- The daily journal: notes about one day, from that day's whole transcript (see docs/journal.md). ---
+
+    def records_of_day(self, day):
+        return [r for r in self.transcript if _local_day(r["at"]) == day]
+
+    def journal_day(self, day, budget=JOURNAL_DAY_BYTES):
+        """What a journal pass reads: the day's records (whole, or evenly clipped when the day is long), the claims
+        dreamed from it or written that day, and the entry it would replace. `day` may be "today" or "yesterday"."""
+        if day in ("today", "yesterday"):
+            moment = _now().astimezone() - _dt.timedelta(days=day == "yesterday")
+            day = moment.date().isoformat()
+        _check_day(day)
+        with self._locked():
+            self._load_locked()
+            records = self.records_of_day(day)
+            size = sum(len(r["text"].encode("utf-8")) for r in records)
+            cap = None if size <= budget else max(JOURNAL_RECORD_MIN, budget // max(1, len(records)))
+            excerpts = [r if cap is None else {**r, "text": _clip_record(r["text"], cap, b" [excerpt truncated]")}
+                        for r in records]
+            ids = {r["id"] for r in records}
+            claims = [{"id": c["id"], "text": c["text"], "state": c["state"], "status": c["status"]}
+                      for c in self.claims.values()
+                      if _local_day(c.get("created_at", "")) == day or any(e["ref"] in ids for e in c["evidence"])]
+            return {"date": day, "today": _today(), "records": excerpts, "clipped_to": cap, "bytes": size,
+                    "claims": claims[-MAX_JOURNAL_CLAIMS:], "entry": self.journal.get(day)}
+
+    def journal_days(self, limit=7):
+        """Past days (local time) that have records, newest first, up to `limit`: whether each has a journal entry and
+        whether records were added to that day after it was written."""
+        if type(limit) is not int or not 1 <= limit <= 366:
+            raise MemoryError("journal day limit must be 1-366")
+        with self._locked():
+            self._load_locked()
+            today, last = _today(), {}
+            for record in self.transcript:
+                day = _local_day(record["at"])
+                if day and day < today:
+                    last[day] = record["seq"]
+            out = []
+            for day in sorted(last, reverse=True)[:limit]:
+                entry = self.journal.get(day)
+                out.append({"date": day, "journal": entry is not None,
+                            "stale": entry is not None and entry["through"] < last[day]})
+            return out
+
+    def write_journal(self, day, body):
+        """Write (or rewrite) the journal entry for `day`. Its notes cite the records they come from as [tXXXXXX], and
+        every cited record must be from that day; [nXXXXXX] cites a claim."""
+        _check_day(day)
+        if not isinstance(body, str) or not body.strip():
+            raise MemoryError("a journal entry needs a body: notes about the day")
+        body = body.strip()
+        if len(body.encode("utf-8")) > MAX_JOURNAL_BYTES:
+            raise MemoryError(f"a journal entry is at most {MAX_JOURNAL_BYTES} bytes")
+        with self._locked():
+            self._load_locked()
+            if day > _today():
+                raise MemoryError(f"{day} hasn't happened yet (today is {_today()})")
+            records = {r["id"]: r for r in self.records_of_day(day)}
+            if not records:
+                raise MemoryError(f"nothing was recorded on {day} (days are local time)")
+            cited = list(dict.fromkeys(RECORD_CITE.findall(body)))
+            if not cited:
+                raise MemoryError("cite the records each note comes from, as [t000123]; an entry must cite at least "
+                                  "one record from its day")
+            for ref in cited:
+                if ref not in records:
+                    other = self._records_by_id.get(ref)
+                    raise MemoryError(f"{ref} is from {_local_day(other['at'])}, not {day}" if other
+                                      else f"{ref} is not a record in this memory")
+            claims = list(dict.fromkeys(CLAIM_CITE.findall(body)))
+            for ref in claims:
+                if ref not in self.claims:
+                    raise MemoryError(f"{ref} is not a claim in this memory")
+            uncited = [line for line in body.splitlines() if line.strip() and not line.lstrip().startswith("#")
+                       and not RECORD_CITE.search(line) and not CLAIM_CITE.search(line)]
+            previous = self.journal.get(day)
+            entry = {"date": day, "body": body, "records": cited, "claims": claims,
+                     "through": max(r["seq"] for r in records.values()),
+                     "version": previous["version"] + 1 if previous else 1}
+            seq = self.state.get("journal_events", 0) + 1
+            event = {"schema": SCHEMA, "seq": seq, "op": "entry", "entry": entry, "at": _stamp(_now()),
+                     "prev_sha256": self.state.get("journal_head", ZERO_HASH)}
+            path = self.store / "journal.jsonl"
+            if not os.path.lexists(path):
+                os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            self._commit_logs({"journal.jsonl": [_encode_log_record(event)]},
+                              {**self.state, "journal_events": seq, "journal_head": sha(event)})
+            self._load_locked(force=True)
+            self.write_vault()
+            return {"date": day, "version": entry["version"], "records_that_day": len(records),
+                    "records_cited": len(cited), "claims_cited": len(claims), "uncited_lines": len(uncited),
+                    "path": f"{VAULT_DIR}/{_journal_note(day)}.md"}
+
+    @staticmethod
     def _broken_wiki_links(pages):
         for slug, page in pages.items():
             for target in page["links"]:
@@ -1173,6 +1318,8 @@ class SomniMemory:
                               f"optionally a folder path such as topic/page, at most {MAX_PAGE_DEPTH} deep")
         if slug in RESERVED_PAGES:
             raise MemoryError(f"page slug {slug!r} is reserved for the vault's own {slug}.md")
+        if slug == JOURNAL_DIR or slug.startswith(JOURNAL_DIR + "/"):
+            raise MemoryError("the journal/ folder holds the daily journal; give the page another slug")
         if not isinstance(title, str) or not title.strip() or len(title) > 160:
             raise MemoryError("page title must be 1-160 characters")
         if not isinstance(body, str) or not body.strip() or len(body.encode("utf-8")) > MAX_PAGE_BYTES:
@@ -1250,6 +1397,16 @@ class SomniMemory:
                 lines.append(f"- {link(slug, 'claims', ref, ref)}{state}: {c['text'] if c else ''}")
             files[f"{slug}.md"] = "\n".join(lines) + "\n"
 
+        for day, entry in sorted(self.journal.items()):
+            note = _journal_note(day)
+            text = CLAIM_CITE.sub(lambda m: link(note, "claims", m.group(1), m.group(1))
+                                  if m.group(1) in claims else m.group(0), entry["body"])
+            weekday = _dt.date.fromisoformat(day).strftime("%A")
+            fm = ["---", f"title: \"Journal {day}\"", f"date: {day}", f"version: {entry['version']}",
+                  "records: [" + ", ".join(entry["records"]) + "]", "claims: [" + ", ".join(entry["claims"]) + "]",
+                  "tags: [somni, journal]", "---", ""]
+            files[f"{note}.md"] = "\n".join(fm + [f"# {weekday}, {day}", "", text, ""]) + "\n"
+
         tree = {"pages": [], "folders": {}}
         for slug, page in self.pages.items():
             node = tree
@@ -1268,6 +1425,10 @@ class SomniMemory:
                  f"{len(self.pages)} pages, {sum(c['state'] == 'active' for c in claims.values())} active claims. "
                  f"Pages trace to {link('index', 'claims', 'claims')} and their transcript quotes and images.", ""]
         index += tree_lines(tree)
+        if self.journal:
+            days = sorted(self.journal, reverse=True)
+            index += ["", "## Journal", "", f"{len(days)} day(s), newest first.", ""]
+            index += [f"- {link('index', _journal_note(day), day)}" for day in days[:31]]
         files["index.md"] = "\n".join(index) + "\n"
         transcript = {r["id"]: r for r in self.transcript}
         cl = ["---", "title: Claims", "tags: [somni, claims]", "---", "", "# Claims", "",
@@ -2948,6 +3109,7 @@ class SomniMemory:
             "note_bytes": note_bytes, "note_tokens_estimate": token_estimate(b"x" * note_bytes),
             "dream_passes": len(self.dreams), "dream_input_bytes": dream_input,
             "wiki_pages": len(self.pages), "wiki_links": sum(len(p["links"]) for p in self.pages.values()),
+            "journal_days": len(self.journal), "journal_last": max(self.journal, default=None),
             "dream_input_tokens_estimate": sum(item["input_tokens_estimate"] for item in self.dreams),
             "local_memory_processing_usd": 0,
         }
@@ -2978,6 +3140,7 @@ class SomniMemory:
                                                if claim["state"] == "active")),
             "past_claims": sum(claim["state"] == "past" for claim in self.claims.values()),
             "outcomes": self.outcome_counts(),
+            "journal": {"days": len(self.journal), "last": max(self.journal, default=None)},
             **({"word_use": use} if (use := self.word_use()) else {}),
         }
 
@@ -3274,7 +3437,7 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         raise MemoryError("a daydream may only read memory and submit its pass")
     # A second Pi on the store may append records: a contributor (such as a sub-agent) or a peer (another session of
     # the user's, which may also save notes). The owner keeps the phase, dreams and the wiki.
-    if method in {"phase", "record", "note", "dream", "recent", "wiki"} and not writable \
+    if method in {"phase", "record", "note", "dream", "recent", "wiki", "journal"} and not writable \
             and not (contributor and method == "record") and not (peer and method == "note"):
         raise MemoryError("Somni memory changes require the session that owns recording")
     if method == "phase":
@@ -3487,6 +3650,12 @@ def _handle_request(memory, method, args, *, writable, context=None, image_bytes
         return memory.cache_dream_read(args, head=daydream)
     elif method == "dream_cache_take":
         return memory.cached_dream_reads(args.get("kind"), args.get("max_age_seconds", 3600), head=daydream)
+    elif method == "journal_day":
+        return memory.journal_day(args["date"])
+    elif method == "journal_days":
+        return memory.journal_days(args.get("limit", 7))
+    elif method == "journal":
+        return memory.write_journal(args["date"], args["body"])
     elif method == "wiki":
         # With python -I, explicitly add this package's root for the formatter.
         root = str(pathlib.Path(__file__).resolve().parent.parent)

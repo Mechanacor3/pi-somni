@@ -84,6 +84,8 @@ in Obsidian. `SOMNI_LINK_STYLE=wikilink` renders Obsidian `[[wikilinks]]` instea
 way. The vault is a view; edits there are not read back. Stale pages remain visible in the vault for repair while
 recall and the injected index skip them.
 
+Days get their own notes too: see [the daily journal](journal.md).
+
 ## The injected index
 
 Before each Pi turn, Somni injects a small memory index ranked against the current user prompt. Standing claims

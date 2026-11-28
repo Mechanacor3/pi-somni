@@ -758,6 +758,67 @@ class SomniPiEndToEnd(unittest.TestCase):
         self.assertFalse(recall.get("isError"), recall)
         self.assertIn("$50 floor", json.dumps(recall["result"]))
 
+    def test_the_journal_writes_a_days_notes_and_refuses_a_record_from_another_day(self):
+        self.pi.close()
+        store = self.work / "journal-memory"
+        store.mkdir()
+        memory = SomniMemory.create(store, "pi", "test", "journal")
+        with patch.dict(os.environ, {"SOMNI_NOW": "2026-01-04T09:00:00Z"}):
+            memory.set_phase("open")
+            memory.record("ordinary_observation", "USER: rename the deploy branch to release")
+        with patch.dict(os.environ, {"SOMNI_NOW": "2026-01-05T09:00:00Z"}):
+            memory.record("ordinary_observation", "USER: the docs live at https://docs.example.test/v2/start")
+            memory.record("agent_output", "AGENT: Pointed support at the v2 start page.")
+            memory.set_phase("closed")
+        self.upstream.script = plan_script({"Journal pass for": [
+            [("somni_journal", {"date": "2026-01-05", "body": "Renamed the branch [t000001]."})],
+            [("somni_journal", {"date": "2026-01-05", "body": "## Docs\n- Support now points at "
+                                "https://docs.example.test/v2/start [t000002] [t000003]."})]],
+            "Anything else": []})
+        env = {"SOMNI_WORKSPACE": store.name, "SOMNI_NOW": "2026-01-05T18:00:00Z", "TZ": "UTC", "SOMNI_JOURNAL": "off"}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=env)
+        self.pi.prompt("/somni-journal")
+        self.pi.read(lambda r: r.get("type") == "agent_settled")
+        messages = [text_of(m.get("content")) for m in self.upstream.requests[-1]["messages"]]
+        prompt = next(m for m in messages if m.startswith("Journal pass for"))
+        self.assertIn("Journal pass for Monday, 2026-01-05.", prompt)
+        self.assertIn("The day isn't over", prompt)
+        self.assertIn("[t000002] (ordinary_observation) USER: the docs live at https://docs.example.test/v2/start", prompt)
+        self.assertNotIn("rename the deploy branch", prompt)
+        first, second = [e for e in self.pi.tool_ends() if e["toolName"] == "somni_journal"]
+        self.assertTrue(first["isError"], first)
+        self.assertIn("t000001 is from 2026-01-04, not 2026-01-05", text_of(first["result"]["content"]))
+        self.assertFalse(second.get("isError"), second)
+        memory = SomniMemory(store, "pi").load()
+        self.assertEqual(memory.journal["2026-01-05"]["records"], ["t000002", "t000003"])
+        self.assertEqual(memory.state["phase"], "open")
+        note = store / "somni-v1" / "vault" / "journal" / "2026" / "01" / "05.md"
+        self.assertIn("https://docs.example.test/v2/start [t000002] [t000003]", note.read_text())
+        self.pi.prompt("Anything else?")  # recording goes on after the pass
+        self.assertGreater(SomniMemory(store, "pi").load().state["transcript_count"], 3)
+
+    def test_a_day_left_without_a_journal_gets_one_in_the_background_next_session(self):
+        self.pi.close()
+        self.upstream.script = plan_script({
+            "What is the fee": [[("lookup_fee", {"cabin": "economy", "price": 300})]],
+            "Journal pass for": [[("somni_journal", {"date": "2026-01-05", "body": "Quoted the economy cancellation "
+                                                     "fee; it has a $50 floor [t000001] [t000002]."})]],
+            "Anything else": []})
+        day1 = {"SOMNI_NOW": "2026-01-05T09:00:00Z", "TZ": "UTC", "SOMNI_JOURNAL": "on"}
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env=day1)
+        self.pi.prompt("What is the fee to cancel economy fare 300?")
+        self.pi.close()  # closed without a journal
+        store = self.work / ".pi" / "somni"
+        self.assertEqual(SomniMemory(store, "pi").load().journal, {})
+        self.pi = PiSession("extensions/somni.ts", self.work, self.upstream.port, env={**day1, "SOMNI_NOW": "2026-01-06T09:00:00Z"})
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not SomniMemory(store, "pi").load().journal:
+            time.sleep(0.5)
+        memory = SomniMemory(store, "pi").load()
+        self.assertEqual(list(memory.journal), ["2026-01-05"], "the next session did not write yesterday's journal")
+        self.assertTrue((store / "somni-v1" / "vault" / "journal" / "2026" / "01" / "05.md").is_file())
+        self.assertEqual(memory.dreams, [])  # a journal is not a dream pass
+
     def test_a_changed_fact_is_dated_in_the_dream_and_recalled_as_past(self):
         self.pi.close()
         store = self.work / "time-memory"

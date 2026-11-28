@@ -54,6 +54,7 @@ with what is most relevant. The design follows Anthropic's essay
 |---|---|
 | `/somni-dream [focus]` | Consolidate recent sessions into claims |
 | `/somni-wiki [goal]` | Gather claims into linked wiki pages |
+| `/somni-journal [day]` | Write the day's journal: notes about one day from its whole transcript |
 | `/somni-share <topic>` | Draft a skill for other people from what memory learned about a topic, with its evidence |
 | `/somni-doctor [all]` | Check settings, the store and features offline, without a model call |
 
@@ -64,6 +65,7 @@ with what is most relevant. The design follows Anthropic's essay
 | `somni_image` | Load image evidence by transcript ID and SHA-256 |
 | `somni_note` | Add a cited claim while working |
 | `somni_dream` | Submit a consolidation pass during `/somni-dream` or `/somni-wiki` |
+| `somni_journal` | Save the day's journal entry during `/somni-journal` |
 | `somni_share` | Write a shared skill (SKILL.md and EVIDENCE.md) when the user asks for one |
 
 Two skills come with the package. `somni-memory` tells the agent how to use the index, when to recall, and what is
@@ -76,6 +78,8 @@ worth a note. `somni-action-words` covers action words. Pi lists a skill only wh
   `/somni-doctor` reports problems with their file and line.
 - **[Dreams and the wiki](docs/dreams.md).** Budgets, gists, image evidence, merges, failed and interrupted dreams,
   and how the index is ranked.
+- **[The daily journal](docs/journal.md).** One note per day, written from that day's whole transcript: what you
+  worked on, decided, and left open, each note citing its records. Days Pi closed on get theirs in the background.
 - **[Memory over time](docs/memory-over-time.md).** Dated records; a fact that changed is kept as history (`update`)
   rather than treated as a mistake; claims fade from fresh to faint unless they are used; and after a month, old raw
   transcript keeps only a stub with its cited quotes.

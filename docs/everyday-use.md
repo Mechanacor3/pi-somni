@@ -70,6 +70,8 @@ setting also has an environment variable, which wins over the files, for scripts
    [daydreams](#long-sessions-optional). Pi's footer shows how long it has been, for example
    `somni: last dream 14 turns and 2 days ago`. Skip a few days and the next `/somni-dream`
    works through the backlog oldest first; see [a backlog](dreams.md#a-backlog).
+   Each day also gets a [journal](journal.md) entry: notes about what happened, written from the whole day.
+   Run `/somni-journal` for today; a day Pi closed on gets its entry in the background next time.
 4. **Organize now and then.** Once a week, or after a big piece of work, run `/somni-wiki`.
    It gathers the notes into linked pages, one subject per page, like a small team wiki. Give it
    a goal if you like: `/somni-wiki onboarding a new teammate`.

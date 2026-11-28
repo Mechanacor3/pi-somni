@@ -161,6 +161,14 @@ SETTINGS = (
             default_text="lessons from the newest records: what you said, facts found, steps that worked or failed"),
     Setting("daydreams.command", "SOMNI_DAYDREAM_COMMAND", "str", "", "Command used to start the daydream's Pi",
             default_text="the running Pi"),
+    Setting("journal.auto", "SOMNI_JOURNAL", "enum", "auto",
+            "Write the [daily journal](journal.md) in the background for recent past days that have none. `auto` does "
+            "it in interactive Pi, `on` in every mode, `off` leaves it to `/somni-journal`",
+            choices=("auto", "on", "off")),
+    Setting("journal.catch_up_days", "SOMNI_JOURNAL_CATCH_UP_DAYS", "int", 3,
+            "How many of the most recent past days with records the background catch-up looks at", 1, 31),
+    Setting("journal.timeout_seconds", "SOMNI_JOURNAL_TIMEOUT_SECONDS", "number", 600,
+            "Stop a background journal pass that runs longer", 30, 7200),
 )
 BY_KEY = {s.key: s for s in SETTINGS}
 BY_ENV = {s.env: s for s in SETTINGS}
@@ -172,6 +180,7 @@ ENV_ONLY = {
     "SOMNI_TAGS": "JSON array of up to eight printable tags, each up to 96 UTF-8 bytes",
     "SOMNI_DAYDREAM": "Set by Somni in a daydream worker",
     "SOMNI_DAYDREAM_FORK_OF": "Set by Somni in a forked daydream worker: the parent session's ID",
+    "SOMNI_JOURNAL_WORKER": "Set by Somni in a background journal worker",
     "SOMNI_STORE": "Path to an alternative `store.py` (development)",
     "SOMNI_NOW": "Fixed current time (ISO 8601), for tests and benchmarks that simulate days",
     "SOMNI_SESSION_ROLE": "`peer` or `contributor`: how this session records when another session owns the memory. Default: `peer` for interactive Pi (your own words count, it may save notes), `contributor` otherwise (sub-agents, scripts)",

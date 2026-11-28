@@ -76,10 +76,11 @@ the next dream updates the old note and keeps it as history.
 
 ## Dreams
 
-The user runs `/somni-dream` to turn recent sessions into notes, and `/somni-wiki` to organize
-the notes into pages. During those commands, follow the dream prompt. Keep what will help with
-this user's work later: preferences, corrections, project facts and conventions, and steps and
-checks that worked or failed.
+The user runs `/somni-dream` to turn recent sessions into notes, `/somni-wiki` to organize
+the notes into pages, and `/somni-journal` to write a day's journal (saved with `somni_journal`).
+During those commands, follow the prompt. In dreams, keep what will help with this user's work
+later: preferences, corrections, project facts and conventions, and steps and checks that worked
+or failed.
 
 ## Settings and problems
 

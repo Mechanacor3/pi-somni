@@ -81,11 +81,15 @@ It changes nothing. A store with an interrupted write is reported, not repaired;
 | `daydreams.max_reads` | `SOMNI_DAYDREAM_MAX_READS` | `6` | Somni evidence reads per daydream (at most `dreams.max_reads`) (1–64) |
 | `daydreams.focus` | `SOMNI_DAYDREAM_FOCUS` | lessons from the newest records: what you said, facts found, steps that worked or failed | Focus text passed to the daydream's `/somni-dream` |
 | `daydreams.command` | `SOMNI_DAYDREAM_COMMAND` | the running Pi | Command used to start the daydream's Pi |
+| `journal.auto` | `SOMNI_JOURNAL` | `auto` | Write the [daily journal](journal.md) in the background for recent past days that have none. `auto` does it in interactive Pi, `on` in every mode, `off` leaves it to `/somni-journal` |
+| `journal.catch_up_days` | `SOMNI_JOURNAL_CATCH_UP_DAYS` | `3` | How many of the most recent past days with records the background catch-up looks at (1–31) |
+| `journal.timeout_seconds` | `SOMNI_JOURNAL_TIMEOUT_SECONDS` | `600` | Stop a background journal pass that runs longer (30–7200) |
 | | `SOMNI_CONFIG` | unset | Config file to read instead of the user and project files; `none` reads none |
 | | `SOMNI_RUN_LABEL` | unset | Label on each recorded event, up to 96 UTF-8 bytes |
 | | `SOMNI_TAGS` | unset | JSON array of up to eight printable tags, each up to 96 UTF-8 bytes |
 | | `SOMNI_DAYDREAM` | unset | Set by Somni in a daydream worker |
 | | `SOMNI_DAYDREAM_FORK_OF` | unset | Set by Somni in a forked daydream worker: the parent session's ID |
+| | `SOMNI_JOURNAL_WORKER` | unset | Set by Somni in a background journal worker |
 | | `SOMNI_STORE` | unset | Path to an alternative `store.py` (development) |
 | | `SOMNI_NOW` | unset | Fixed current time (ISO 8601), for tests and benchmarks that simulate days |
 | | `SOMNI_SESSION_ROLE` | unset | `peer` or `contributor`: how this session records when another session owns the memory. Default: `peer` for interactive Pi (your own words count, it may save notes), `contributor` otherwise (sub-agents, scripts) |

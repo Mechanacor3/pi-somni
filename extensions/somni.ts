@@ -17,6 +17,8 @@
  *     search), somni_note (add a cited claim while working).
  *   - /somni-dream [focus]: close the session, let the model propose a dream pass
  *     over recent transcript through the somni_dream tool, then reopen.
+ *   - /somni-journal [YYYY-MM-DD|yesterday]: the daily journal, notes about one day written from that day's whole
+ *     transcript (vault/journal/yyyy/mm/dd.md); a session catches up on recent days that have none, in the background.
  *   - /somni-wiki [goal]: dreaming that builds representations: the model gathers
  *     claims not yet on any page into linked wiki pages ([[slug]] links, [nXXXXXX]
  *     citations). The store renders a readable Obsidian vault in somni-v1/vault/.
@@ -132,7 +134,14 @@ const DAYDREAM_FOCUS = process.env.SOMNI_DAYDREAM_FOCUS?.trim() || "what will he
 	"agent could not find is not a fact, so never turn a failed lookup into a claim. Keep the pass small; leave wiki " +
 	"pages to the night dream";
 const AUTH_ERROR = /\b(401|403)\b|unauthori[sz]ed|authenticat|token expired|credential|not logged in|api key/i;
-const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try"]);
+const DREAM_TOOLS = new Set(["somni_recall", "somni_search", "somni_image", "somni_dream", "somni_action_try", "somni_journal"]);
+const SUBMIT_TOOLS = new Set(["somni_dream", "somni_journal"]);
+// The daily journal. auto: a session that owns recording in interactive Pi writes the journal for recent past days that
+// have none, in the background; on: in every mode; off: only /somni-journal writes it.
+const JOURNAL_MODE = ["auto", "on", "off"].includes((process.env.SOMNI_JOURNAL ?? "").trim())
+	? (process.env.SOMNI_JOURNAL as string).trim() : "auto";
+const JOURNAL_CATCH_UP_DAYS = Math.floor(envNumber("SOMNI_JOURNAL_CATCH_UP_DAYS", 3, 1, 31));
+const JOURNAL_TIMEOUT_MS = envNumber("SOMNI_JOURNAL_TIMEOUT_SECONDS", 600, 30, 7200) * 1000;
 // Dream budgets. Every Somni tool result in a dream ends with what is left of them.
 const DREAM_MAX_READS = Math.floor(Math.min(envNumber("SOMNI_DREAM_MAX_READS", 16, 1, 64),
 	DAYDREAM_CHILD ? envNumber("SOMNI_DAYDREAM_MAX_READS", 6, 1, 64) : 64));
@@ -275,7 +284,10 @@ function callTimeline(calls: CallTiming[]) {
 	return shown.join(", ") + (calls.length > shown.length ? `, ... ${calls.length - shown.length} more` : "");
 }
 type ActionStep = { call?: { tool: string; args: Record<string, unknown> }; result?: unknown };
-type DreamKind = "dream" | "wiki" | "daydream" | "deepsleep";
+type DreamKind = "dream" | "wiki" | "daydream" | "deepsleep" | "journal";
+type JournalDay = { date: string; today: string; records: TranscriptRecord[]; clipped_to: number | null; bytes: number;
+	claims: { id: string; text: string; state: string; status: string }[];
+	entry: { body: string; version: number } | null };
 type DreamRun = { reads: number; submissions: number; submitting: boolean; result?: DreamResult; error?: string;
 	kind: DreamKind; started?: boolean; providerError?: string; exhausted?: string; resumed?: number;
 	live?: boolean; // other sessions are recording: the pass is bound to the head it saw, and the phase stays open
@@ -309,6 +321,32 @@ const day = {
 	lessons: "", // the claims the announced pass added, shown to the model with its notice
 	catchUp: false, // the running or last daydream reviews turns an earlier session left undreamed
 };
+const journalJob = {
+	child: undefined as ChildProcess | undefined,
+	tried: new Set<string>(), // days this process already tried to catch up
+	checked: "", // the local day of the last check, so a session that runs past midnight checks again
+};
+
+/** The journal prompt: everything recorded on the day, the claims dreamed from it, and the entry it may replace. */
+export function journalPrompt(day: JournalDay) {
+	const weekday = new Date(`${day.date}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+	const time = (at?: string) => at ? new Date(at).toTimeString().slice(0, 5) : "--:--";
+	const records = day.records.map((r) => `${time(r.at)} ${describeRecord(r)}`).join("\n");
+	const claims = day.claims.map((c) => `- ${c.id} (${c.status}, ${c.state}): ${c.text}`).join("\n");
+	const clipped = day.clipped_to ? ` The day was long (${Math.round(day.bytes / 1024)} KB), so each record is clipped to ` +
+		`${day.clipped_to} bytes; somni_search "t000123" reads one whole.` : "";
+	const partial = day.date === day.today ? " The day isn't over: write up what happened so far." : "";
+	const previous = day.entry ? `\n\nThis day already has an entry (version ${day.entry.version}). Write it again whole, ` +
+		`keeping what still holds:\n${day.entry.body}` : "";
+	return `Journal pass for ${weekday}, ${day.date}. Below is everything recorded that day (local times).${clipped}${partial} ` +
+		"Write the day's journal entry: plain markdown notes about the day, not a playbook. Say what was worked on and " +
+		"why, what was decided, what happened (what failed too), what was learned, and what was left open. Keep the " +
+		"exact items the day turned on (names, numbers, links, commands) where the records show them. End each note " +
+		"with the records it comes from, as [t000123]; cite only records from this day. Cite a claim as [n000123] where " +
+		"a note restates it. Keep it under about 6 KB. Then call somni_journal once with " +
+		`{"date": "${day.date}", "body": "..."}.${previous}\n\n## Records\n${records}` +
+		(claims ? `\n\n## Claims dreamed from this day\n${claims}` : "");
+}
 
 /** The claims a live pass added, one line each, for the hidden notice: the session can use them right away. */
 async function passLessons(pass: any) {
@@ -645,14 +683,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startDream(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
-			kind: "dream" | "wiki" | "deepsleep"): Promise<DreamRun | undefined> {
+			kind: "dream" | "wiki" | "deepsleep" | "journal"): Promise<DreamRun | undefined> {
 		const headless = ctx.mode === "print" || ctx.mode === "json";
 		let run: DreamRun | undefined;
 		try {
 			await refreshRole(ctx);
 			const backend = requireWriteAccess();
 			if (state.dream || !ctx.isIdle()) throw new Error("Wait for the current Pi turn to settle first.");
-			run = { submitting: false, reads: 0, submissions: 0, kind: DAYDREAM_CHILD ? "daydream" : kind };
+			run = { submitting: false, reads: 0, submissions: 0, kind: DAYDREAM_CHILD && kind !== "journal" ? "daydream" : kind };
 			state.dream = run;
 			const loaded = await load();
 			if (loaded === undefined) {
@@ -663,18 +701,20 @@ export default function (pi: ExtensionAPI) {
 			// A daydream worker leaves the phase alone: the owning session is still recording. So does deep sleep,
 			// which records its real tries and commits a live pass.
 			// So does a dream while other sessions of this memory are recording: it reviews the records up to now.
-			const others = !DAYDREAM_CHILD && kind !== "deepsleep" && RECORD
+			// The journal only reads the transcript and writes its own log, so recording goes on too.
+			const others = !DAYDREAM_CHILD && kind !== "deepsleep" && kind !== "journal" && RECORD
 				? (await backend.request<{ others?: number }>("role", {})).others ?? 0 : 0;
 			if (others) {
 				run.live = true;
 				notify(ctx, `Somni: ${others} other Pi session(s) are recording in this memory, so this ${kind} reviews ` +
 					"the records up to now and they keep recording.");
-			} else if (!DAYDREAM_CHILD && kind !== "deepsleep") await backend.request("phase", { phase: "closed" });
+			} else if (!DAYDREAM_CHILD && kind !== "deepsleep" && kind !== "journal") await backend.request("phase", { phase: "closed" });
 			// A triggered custom message starts the turn before waitForIdle checks Pi's state.
 			run.started = true;
 			pi.sendMessage({ customType: "somni-dream-input", content, display: false }, { triggerTurn: true });
 			await ctx.waitForIdle();
-			if (!run.result) throw new Error(run.error ?? "The dream ended without a committed pass. The model must call somni_dream.");
+			if (!run.result) throw new Error(run.error ?? (kind === "journal" ? "The journal pass ended without an entry. The model must call somni_journal."
+				: "The dream ended without a committed pass. The model must call somni_dream."));
 		} catch (error) {
 			if (headless) process.exitCode = 1;
 			if (run?.started && !run.result) await recordFailure(failureOf(run, error as Error), run.kind, run);
@@ -708,7 +748,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function submitCommand(ctx: ExtensionCommandContext, load: () => Promise<string | (TextContent | ImageContent)[] | undefined>,
-			kind: "dream" | "wiki" | "deepsleep") {
+			kind: "dream" | "wiki" | "deepsleep" | "journal") {
 		const task = kind === "dream" && !DAYDREAM_CHILD ? dreamBacklog(ctx, load) : startDream(ctx, load, kind);
 		if (ctx.mode === "json" || ctx.mode === "print") return task;
 		// RPC clients get the handled reply first and can then wait for agent_settled.
@@ -1190,6 +1230,32 @@ ${candidateGuide(candidates)}`;
 	});
 
 	pi.registerTool({
+		name: "somni_journal",
+		label: "Somni journal",
+		description: "Only during /somni-journal: save the day's journal entry, markdown notes about the day. End each " +
+			"note with the records it comes from as [t000123] (records from that day only); cite a claim as [n000123]. " +
+			"An entry that cites a record from another day, or none at all, is refused with the reason; fix it and resubmit.",
+		parameters: Type.Object({ date: Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }), body: Type.String({ maxLength: 8192 }) }),
+		async execute(_id: string, params: { date: string; body: string }) {
+			const backend = requireWriteAccess();
+			const run = state.dream;
+			if (!run || run.kind !== "journal") throw new Error("journal entries are written only during /somni-journal");
+			if (run.result || run.submitting) throw new Error("Only one journal entry can be saved per pass.");
+			run.submitting = true;
+			try {
+				const out = await backend.request<any>("journal", params);
+				run.result = out;
+				return { content: asText(out), details: out };
+			} catch (error) {
+				run.error = (error as Error).message;
+				throw error;
+			} finally {
+				run.submitting = false;
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "somni_share",
 		label: "Somni share",
 		description:
@@ -1411,6 +1477,70 @@ ${candidateGuide(candidates)}`;
 		},
 	});
 
+	pi.registerCommand("somni-journal", {
+		description: "Write the daily journal from a day's whole transcript: `/somni-journal [YYYY-MM-DD|yesterday]` (default today)",
+		handler: (args, ctx) => submitCommand(ctx, async () => {
+			const day = await getBackend().request<JournalDay>("journal_day", { date: args?.trim() || "today" });
+			if (!day.records.length) {
+				notify(ctx, `Somni: nothing was recorded on ${day.date}, so there is no journal to write.`);
+				return undefined;
+			}
+			return journalPrompt(day);
+		}, "journal"),
+	});
+
+	/**
+	 * Catch up on the journal: a cold child Pi writes the entry for the oldest recent past day that has none, then the
+	 * next, one at a time. Runs at session start and again once the local date changes.
+	 */
+	async function maybeJournal(ctx: ExtensionContext) {
+		if (DAYDREAM_CHILD || JOURNAL_MODE === "off" || (JOURNAL_MODE === "auto" && ctx.mode !== "tui")) return;
+		if (journalJob.child || !RECORD || !state.writable || !state.backend) return;
+		let days: { date: string; journal: boolean }[];
+		try {
+			days = await getBackend().request("journal_days", { limit: JOURNAL_CATCH_UP_DAYS });
+		} catch {
+			return;
+		}
+		journalJob.checked = new Date().toDateString();
+		const due = days.filter((d) => !d.journal && !journalJob.tried.has(d.date)).map((d) => d.date).sort()[0];
+		if (!due) return;
+		journalJob.tried.add(due);
+		const model = process.env.SOMNI_DAYDREAM_MODEL || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+		const invocation = piInvocation(["--mode", "json", "--no-session", "--no-approve", "--no-extensions", "--no-builtin-tools",
+			"--no-mcp", "--no-skills", "--no-prompt-templates", "--no-context-files", "-e", fileURLToPath(import.meta.url),
+			...(model ? ["--model", model] : []),
+			...(process.env.SOMNI_DAYDREAM_THINKING ? ["--thinking", process.env.SOMNI_DAYDREAM_THINKING] : []),
+			"-p", `/somni-journal ${due}`]);
+		let stderr = "";
+		const child = spawn(invocation.command, invocation.args, {
+			cwd: ctx.cwd, shell: false, stdio: ["ignore", "ignore", "pipe"],
+			env: { ...process.env, SOMNI_DAYDREAM: "1", SOMNI_JOURNAL_WORKER: "1", SOMNI_RECORD: "0", SOMNI_WORKSPACE: state.workspace },
+		});
+		journalJob.child = child;
+		child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
+		const timeout = setTimeout(() => child.kill("SIGTERM"), JOURNAL_TIMEOUT_MS);
+		child.on("error", (error) => { stderr += ` ${error.message}`; });
+		child.on("close", async (code, signal) => {
+			clearTimeout(timeout);
+			if (journalJob.child === child) journalJob.child = undefined;
+			let written = false;
+			try {
+				const after = await getBackend().request<{ date: string; journal: boolean }[]>("journal_days", { limit: JOURNAL_CATCH_UP_DAYS });
+				written = after.some((d) => d.date === due && d.journal);
+			} catch {
+				// Reported below as not written.
+			}
+			if (written) {
+				notify(ctx, `Somni wrote the journal for ${due} in the background (vault/journal/${due.slice(0, 4)}/${due.slice(5, 7)}/${due.slice(8)}.md).`);
+				void maybeJournal(ctx);
+			} else {
+				notify(ctx, `Somni could not write the journal for ${due} (${signal ? `stopped by ${signal}` : `exit ${code}`}). ` +
+					clip(stderr.trim().split("\n").slice(-3).join(" "), 300) + " Run /somni-journal " + due + " to try again.");
+			}
+		});
+	}
+
 	pi.registerCommand("somni-wiki", {
 		description: "Gather claims into linked wiki pages (dreaming that builds representations)",
 		handler: (args, ctx) => submitCommand(ctx, async () => {
@@ -1449,6 +1579,7 @@ ${candidateGuide(candidates)}`;
 
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!state.dream) await showDreamStatus(ctx);
+		if (!state.dream && journalJob.checked && journalJob.checked !== new Date().toDateString()) void maybeJournal(ctx);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
@@ -1511,6 +1642,8 @@ ${candidateGuide(candidates)}`;
 			void showDreamStatus(ctx);
 			// Quitting between daydreams leaves the last turns undreamed: dream them now, beside this session's first turns.
 			if (DAYDREAMS && writable && await undreamedTurns()) void maybeDaydream(ctx, true);
+			// A day that ended without a journal (Pi closed, or the day passed in a long session) gets one now.
+			if (writable) void maybeJournal(ctx);
 			if (DAYDREAMS && DAYDREAM_MINUTES > 0 && writable) {
 				if (day.timer) clearInterval(day.timer);
 				day.timer = setInterval(() => { if (lastCtx && !state.dream) void maybeDaydream(lastCtx); }, DAYDREAM_MINUTES * 60_000);
@@ -1529,6 +1662,7 @@ ${candidateGuide(candidates)}`;
 		if (day.timer) clearInterval(day.timer);
 		day.timer = undefined;
 		day.child?.kill("SIGTERM");
+		journalJob.child?.kill("SIGTERM");
 		const backend = state.backend;
 		state.backend = undefined;
 		state.writable = state.contributor = state.peer = false;
@@ -1613,7 +1747,11 @@ ${candidateGuide(candidates)}`;
 		if (!DREAM_TOOLS.has(event.toolName) || run.result || run.submitting) {
 			return { block: true, reason: "Offline dreams may only inspect Somni evidence and submit one pass." };
 		}
-		if (event.toolName === "somni_dream") {
+		if ((event.toolName === "somni_journal") !== (run.kind === "journal") && SUBMIT_TOOLS.has(event.toolName)) {
+			return { block: true, reason: run.kind === "journal" ? "A journal pass submits with somni_journal."
+				: "somni_journal is only for /somni-journal; submit this pass with somni_dream." };
+		}
+		if (SUBMIT_TOOLS.has(event.toolName)) {
 			if (++run.submissions > DREAM_MAX_SUBMISSIONS) {
 				run.exhausted = "submission";
 				return { block: true, reason: `Dream submission limit reached (${DREAM_MAX_SUBMISSIONS}); this dream ends without a pass.` };
@@ -1629,7 +1767,7 @@ ${candidateGuide(candidates)}`;
 	pi.on("tool_result", async (event) => {
 		const run = state.dream;
 		if (!run || event.parentToolCallId || !DREAM_TOOLS.has(event.toolName)) return;
-		if (DREAM_CACHE_SECONDS && !event.isError && event.toolName !== "somni_dream") {
+		if (DREAM_CACHE_SECONDS && !event.isError && !SUBMIT_TOOLS.has(event.toolName)) {
 			const text = (event.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
 			const shown = event.toolName === "somni_image" ? [event.details as { ref: string; sha256: string }] : [];
 			try {
@@ -1649,8 +1787,8 @@ ${candidateGuide(candidates)}`;
 		const left = Math.max(0, DREAM_MAX_SUBMISSIONS - run.submissions);
 		let line = `[dream budget left: ${images}reads ${Math.max(0, DREAM_MAX_READS - Math.min(run.reads, DREAM_MAX_READS))}/` +
 			`${DREAM_MAX_READS}, submissions ${left}/${DREAM_MAX_SUBMISSIONS}]`;
-		if (event.toolName === "somni_dream" && event.isError) {
-			line += left ? ` Nothing was committed. Fix or drop the rejected operations and resubmit; ${left} attempt${left === 1 ? "" : "s"} left.`
+		if (SUBMIT_TOOLS.has(event.toolName) && event.isError) {
+			line += left ? ` Nothing was committed. Fix ${event.toolName === "somni_journal" ? "the entry" : "or drop the rejected operations"} and resubmit; ${left} attempt${left === 1 ? "" : "s"} left.`
 				: " No attempts left; this dream ends without a pass.";
 		} else if (run.reads >= DREAM_MAX_READS && !run.result) {
 			line += " No reads left: submit the pass now.";
