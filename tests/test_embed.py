@@ -28,10 +28,16 @@ def toy_vector(text):
 
 class Endpoint(BaseHTTPRequestHandler):
     requests = []
+    max_chars = None  # like a model's token limit: longer inputs are refused with a 500
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         Endpoint.requests.append(body)
+        if Endpoint.max_chars and any(len(t) > Endpoint.max_chars for t in body["input"]):
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         data = [{"index": i, "embedding": toy_vector(t)} for i, t in enumerate(body["input"])]
         out = json.dumps({"data": data}).encode()
         self.send_response(200)
@@ -110,6 +116,20 @@ class EmbedSearchTest(unittest.TestCase):
         text_of = lambda r: r["text"]  # noqa: E731
         report = E.warm(self.memory.load(), text_of)
         self.assertEqual((report["records"], report["chunks"], report["pruned"]), (3, 3, 1))
+
+    def test_a_chunk_too_long_for_the_model_is_shortened_and_cached_whole(self):
+        long_text = "Funding post: " + "id-7f3a9c " * 140
+        self.memory.record("agent_output", long_text)
+        Endpoint.max_chars = 1000
+        try:
+            report = E.warm(self.memory.load(), lambda r: r["text"])
+            self.assertEqual(report["records"], 4)
+            self.assertTrue(all(len(t) <= 1000 for t in Endpoint.requests[-1]["input"]))
+            Endpoint.requests.clear()
+            self.assertEqual(self.ids("funding raise")[0], "t000004")
+            self.assertEqual([body["input"] for body in Endpoint.requests], [["query: funding raise"]])
+        finally:
+            Endpoint.max_chars = None
 
     def test_long_records_are_embedded_in_overlapping_chunks(self):
         pieces = E.chunks("x" * (E.CHUNK_CHARS * 2))

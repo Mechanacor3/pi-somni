@@ -21,6 +21,7 @@ import operator
 import os
 import sqlite3
 import sys
+import urllib.error
 import urllib.request
 from array import array
 
@@ -29,6 +30,7 @@ CHUNK_OVERLAP = 200
 MAX_CHUNKS = 8  # per record; the start of a long tool output is where its subject is
 BATCH = 32
 TIMEOUT_SECONDS = 60
+MIN_CHARS = 200  # below this a rejected text is an endpoint fault, not a length
 CANDIDATES = 50  # the closest records that enter the fused ranking
 _warned = set()
 
@@ -83,6 +85,19 @@ class Index:
             raise ValueError("the embeddings endpoint returned fewer vectors than texts")
         return vectors
 
+    def _fit(self, texts):
+        """Vectors for `texts`, shortening any text the endpoint rejects. A chunk of dense text (URLs, IDs, code) can
+        run past a small model's token limit; its start is kept, since a record's subject comes first. The cache
+        still keys the vector by the whole chunk."""
+        try:
+            return self._request(texts)
+        except urllib.error.HTTPError:
+            if len(texts) > 1:
+                return [self._fit([text])[0] for text in texts]
+            if len(texts[0]) < MIN_CHARS:
+                raise
+            return self._fit([texts[0][:len(texts[0]) * 2 // 3]])
+
     def vectors(self, texts):
         keys = [self.key(t) for t in texts]
         unknown = [k for k in dict.fromkeys(keys) if k not in self.memo]
@@ -96,7 +111,7 @@ class Index:
         todo = list({k: t for k, t in zip(keys, texts) if k not in self.memo}.items())
         for i in range(0, len(todo), BATCH):
             part = todo[i:i + BATCH]
-            found = self._request([t for _, t in part])
+            found = self._fit([t for _, t in part])
             with self.db:
                 self.db.executemany("INSERT OR REPLACE INTO vectors VALUES (?, ?)",
                                     [(k, v.tobytes()) for (k, _), v in zip(part, found)])
