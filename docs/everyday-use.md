@@ -31,6 +31,9 @@ the agent saw in your sessions, which can include file contents and command outp
 echo ".pi/somni/" >> .gitignore
 ```
 
+The defaults suit coding in interactive Pi. For other kinds of work, start from one of the
+[example setups](setups.md): a coding helper, a life coach, or a game-playing agent.
+
 Then run `/somni-doctor` in Pi. It checks your settings, the Python backend and the memory store
 without calling a model, and says what to fix.
 

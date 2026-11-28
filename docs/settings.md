@@ -1,5 +1,8 @@
 # Settings and `somni doctor`
 
+For starting points by kind of work (a coding helper, a life coach, a game-playing agent), see
+[example setups](setups.md).
+
 Settings live in a YAML-style file. `~/.config/somni/somni.conf` (or `$XDG_CONFIG_HOME/somni/somni.conf`) holds your
 personal defaults, and `.pi/somni.conf` in the directory where you start Pi holds settings for one project:
 
