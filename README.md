@@ -60,7 +60,7 @@ with what is most relevant. The design follows Anthropic's essay
 | Tool | Purpose |
 |---|---|
 | `somni_recall` | Wiki pages, then claims, most relevant to a query |
-| `somni_search` | Exact phrase search over the transcript (to find evidence IDs) |
+| `somni_search` | Ranked word search over the transcript (to find evidence IDs); double quotes keep an exact phrase |
 | `somni_image` | Load image evidence by transcript ID and SHA-256 |
 | `somni_note` | Add a cited claim while working |
 | `somni_dream` | Submit a consolidation pass during `/somni-dream` or `/somni-wiki` |
